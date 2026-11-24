@@ -3,6 +3,7 @@ import {
   DRIVE_FOLDER_MIME_TYPE,
   DriveApiError,
   DriveClient,
+  MULTIPART_UPLOAD_MAX_BYTES,
   buildGoogleWebAuthUrl,
   clearAllCachedChromeAuthTokens,
   encodeSourceUrlProperty,
@@ -22,10 +23,12 @@ import {
 
 interface RecordedMultipart {
   method: string;
+  uploadType: 'multipart' | 'resumable';
   fileId?: string;
   metadata: Record<string, unknown>;
   contentType: string;
   contentBytes: Uint8Array;
+  declaredContentLength?: number;
 }
 
 const PNG_BYTES = new Uint8Array([
@@ -88,13 +91,25 @@ interface MockDriveFile {
 function createFakeDriveServer(options?: {
   onMultipartUpload?: (upload: RecordedMultipart) => Promise<void> | void;
   failNextUploads?: Array<{ status: number; retryAfter?: string; body?: string }>;
+  failUploadNames?: Record<string, { status: number; body?: string }>;
 }) {
   let idCounter = 0;
+  let resumableSessionCounter = 0;
   const files = new Map<string, MockDriveFile>();
   const uploadOrder: string[] = [];
   const uploads: RecordedMultipart[] = [];
   const queries: string[] = [];
   const queuedFailures = [...(options?.failNextUploads ?? [])];
+  const resumableSessions = new Map<
+    string,
+    {
+      method: 'POST' | 'PATCH';
+      existingId?: string;
+      metadata: Record<string, unknown>;
+      contentType: string;
+      declaredLength: number;
+    }
+  >();
 
   const addFile = (file: Omit<MockDriveFile, 'id'> & { id?: string }): MockDriveFile => {
     idCounter += 1;
@@ -166,6 +181,7 @@ function createFakeDriveServer(options?: {
             name: f.name,
             mimeType: f.mimeType,
             trashed: f.trashed,
+            appProperties: f.appProperties,
           })),
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
@@ -197,7 +213,90 @@ function createFakeDriveServer(options?: {
       );
     }
 
-    // Multipart create or update /upload/drive/v3/files(/:id)
+    // Resumable upload Step 2: PUT raw bytes to session URI
+    if (
+      method === 'PUT' &&
+      url.pathname.startsWith('/upload/drive/v3/resumable-sessions/')
+    ) {
+      const sessionId = url.pathname.slice('/upload/drive/v3/resumable-sessions/'.length);
+      const session = resumableSessions.get(sessionId);
+      if (!session) {
+        return new Response('Unknown resumable upload session', { status: 404 });
+      }
+      const rawBytes = new Uint8Array(init?.body as Uint8Array);
+      const putContentType = headers.get('content-type') ?? '';
+      expect(putContentType).toBe(session.contentType);
+      expect(rawBytes.byteLength).toBe(session.declaredLength);
+
+      const fileName = String(session.metadata.name);
+      const namedFailure = options?.failUploadNames?.[fileName];
+      if (namedFailure) {
+        return new Response(
+          namedFailure.body ??
+            JSON.stringify({ error: { message: `Forced upload error for ${fileName}` } }),
+          { status: namedFailure.status, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      const recorded: RecordedMultipart = {
+        method: session.method,
+        uploadType: 'resumable',
+        fileId: session.existingId,
+        metadata: session.metadata,
+        contentType: session.contentType,
+        contentBytes: rawBytes,
+        declaredContentLength: session.declaredLength,
+      };
+      await options?.onMultipartUpload?.(recorded);
+      uploads.push(recorded);
+      uploadOrder.push(fileName);
+      resumableSessions.delete(sessionId);
+
+      if (session.method === 'PATCH' && session.existingId) {
+        expect(session.metadata.parents).toBeUndefined();
+        const existing = files.get(session.existingId);
+        if (!existing) {
+          return new Response('Not found', { status: 404 });
+        }
+        existing.name = fileName;
+        existing.mimeType = session.contentType;
+        existing.content = rawBytes;
+        if (session.metadata.appProperties) {
+          existing.appProperties = {
+            ...existing.appProperties,
+            ...(session.metadata.appProperties as Record<string, string>),
+          };
+        }
+        return new Response(
+          JSON.stringify({
+            id: existing.id,
+            name: existing.name,
+            mimeType: existing.mimeType,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      const created = addFile({
+        name: fileName,
+        mimeType: session.contentType,
+        parents: (session.metadata.parents as string[]) ?? [],
+        trashed: false,
+        appProperties:
+          (session.metadata.appProperties as Record<string, string>) ?? {},
+        content: rawBytes,
+      });
+      return new Response(
+        JSON.stringify({
+          id: created.id,
+          name: created.name,
+          mimeType: created.mimeType,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+
+    // Multipart or Resumable Step 1 create/update /upload/drive/v3/files(/:id)
     if (
       (method === 'POST' || method === 'PATCH') &&
       url.pathname.startsWith('/upload/drive/v3/files')
@@ -216,18 +315,60 @@ function createFakeDriveServer(options?: {
         );
       }
 
-      const rawBody = init?.body as Uint8Array;
-      const parsed = parseMultipartBody(
-        rawBody,
-        headers.get('content-type') ?? '',
-      );
+      const uploadType = url.searchParams.get('uploadType');
       const isPatch = method === 'PATCH';
       const existingId = isPatch
         ? decodeURIComponent(url.pathname.slice('/upload/drive/v3/files/'.length))
         : undefined;
 
+      if (uploadType === 'resumable') {
+        const metadata = JSON.parse(String(init?.body ?? '{}')) as Record<
+          string,
+          unknown
+        >;
+        if (isPatch) {
+          expect(metadata.parents).toBeUndefined();
+        }
+        const xContentType = headers.get('x-upload-content-type') ?? '';
+        const xContentLength = Number(headers.get('x-upload-content-length') ?? 'NaN');
+        expect(xContentType.length).toBeGreaterThan(0);
+        expect(Number.isFinite(xContentLength)).toBe(true);
+
+        const sessionId = `session-${++resumableSessionCounter}`;
+        resumableSessions.set(sessionId, {
+          method,
+          existingId,
+          metadata,
+          contentType: xContentType,
+          declaredLength: xContentLength,
+        });
+        return new Response('', {
+          status: 200,
+          headers: {
+            Location: `${url.origin}/upload/drive/v3/resumable-sessions/${sessionId}`,
+          },
+        });
+      }
+
+      const rawBody = init?.body as Uint8Array;
+      const parsed = parseMultipartBody(
+        rawBody,
+        headers.get('content-type') ?? '',
+      );
+
+      const fileName = String(parsed.metadata.name);
+      const namedFailure = options?.failUploadNames?.[fileName];
+      if (namedFailure) {
+        return new Response(
+          namedFailure.body ??
+            JSON.stringify({ error: { message: `Forced upload error for ${fileName}` } }),
+          { status: namedFailure.status, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
       const recorded: RecordedMultipart = {
         method,
+        uploadType: 'multipart',
         fileId: existingId,
         metadata: parsed.metadata,
         contentType: parsed.contentType,
@@ -236,7 +377,6 @@ function createFakeDriveServer(options?: {
       await options?.onMultipartUpload?.(recorded);
       uploads.push(recorded);
 
-      const fileName = String(parsed.metadata.name);
       uploadOrder.push(fileName);
 
       if (isPatch && existingId) {
@@ -249,6 +389,12 @@ function createFakeDriveServer(options?: {
         existing.name = fileName;
         existing.mimeType = parsed.contentType;
         existing.content = parsed.contentBytes;
+        if (parsed.metadata.appProperties) {
+          existing.appProperties = {
+            ...existing.appProperties,
+            ...(parsed.metadata.appProperties as Record<string, string>),
+          };
+        }
         return new Response(
           JSON.stringify({
             id: existing.id,
@@ -264,7 +410,8 @@ function createFakeDriveServer(options?: {
         mimeType: parsed.contentType,
         parents: (parsed.metadata.parents as string[]) ?? [],
         trashed: false,
-        appProperties: {},
+        appProperties:
+          (parsed.metadata.appProperties as Record<string, string>) ?? {},
         content: parsed.contentBytes,
       });
       return new Response(
@@ -914,5 +1061,241 @@ describe('DriveClient uploadArticle', () => {
         (globalThis as Record<string, unknown>).chrome = originalChrome;
       }
     }
+  });
+
+  it('automatically switches files > 4.5 MiB to uploadType=resumable (both POST create and PATCH update) while keeping <= 4.5 MiB on multipart', async () => {
+    const server = createFakeDriveServer();
+    const client = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: server.fetchImpl,
+      tokenProvider: async () => 'test-token',
+    });
+
+    const root = await client.ensureRootFolder({
+      rootFolderName: 'WebClips',
+      rootFolderId: null,
+    });
+
+    const largeBytes = new Uint8Array(MULTIPART_UPLOAD_MAX_BYTES + 1024);
+    largeBytes.set(PNG_BYTES, 0);
+    largeBytes[largeBytes.byteLength - 1] = 0x7f;
+
+    const smallBytes = new Uint8Array(PNG_BYTES);
+
+    const fetchedImages: FetchedImage[] = [
+      {
+        id: 'img-large',
+        originalUrl: 'https://cdn.example.com/hero.webp',
+        resolvedUrl: 'https://cdn.example.com/hero.webp',
+        sourceUrls: ['https://cdn.example.com/hero.webp'],
+        filename: '01-hero-hires.png',
+        mimeType: 'image/png',
+        bytes: largeBytes,
+        byteLength: largeBytes.byteLength,
+      },
+      {
+        id: 'img-small',
+        originalUrl: 'https://cdn.example.com/diagram.png',
+        resolvedUrl: 'https://cdn.example.com/diagram.png',
+        sourceUrls: ['https://cdn.example.com/diagram.png'],
+        filename: '02-diagram.png',
+        mimeType: 'image/png',
+        bytes: smallBytes,
+        byteLength: smallBytes.byteLength,
+      },
+    ];
+
+    // Run 1: POST create (large -> resumable, small -> multipart, README -> multipart)
+    const first = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page: makeSamplePage(),
+      fetchedImages,
+      clippedAt: '2026-11-24T04:00:00.000Z',
+    });
+
+    const firstLarge = server.uploads.find(
+      (u) => u.metadata.name === '01-hero-hires.png',
+    );
+    const firstSmall = server.uploads.find(
+      (u) => u.metadata.name === '02-diagram.png',
+    );
+    expect(firstLarge?.uploadType).toBe('resumable');
+    expect(firstLarge?.method).toBe('POST');
+    expect(firstLarge?.declaredContentLength).toBe(largeBytes.byteLength);
+    expect(firstLarge?.contentBytes.byteLength).toBe(largeBytes.byteLength);
+    expect(firstLarge?.contentBytes[0]).toBe(PNG_BYTES[0]);
+    expect(firstLarge?.contentBytes[largeBytes.byteLength - 1]).toBe(0x7f);
+    expect(firstSmall?.uploadType).toBe('multipart');
+    expect(first.uploadedImages).toHaveLength(2);
+    expect(first.readmeFileId).toBeTruthy();
+
+    // Run 2: PATCH update reuses file IDs via resumable PATCH for the >4.5 MiB image.
+    const second = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page: makeSamplePage(),
+      fetchedImages,
+      clippedAt: '2026-11-24T04:10:00.000Z',
+    });
+
+    const secondLarge = server.uploads
+      .slice(3)
+      .find((u) => u.metadata.name === '01-hero-hires.png');
+    expect(secondLarge?.uploadType).toBe('resumable');
+    expect(secondLarge?.method).toBe('PATCH');
+    expect(secondLarge?.fileId).toBe(first.uploadedImages[0].fileId);
+    expect(second.uploadedImages[0].fileId).toBe(first.uploadedImages[0].fileId);
+  });
+
+  it('degrades gracefully on single-image Drive upload errors so README.md ALWAYS uploads with remote URL fallback and warning, while still aborting on 401/AbortError', async () => {
+    const server = createFakeDriveServer({
+      failUploadNames: {
+        '02-diagram.png': {
+          status: 400,
+          body: JSON.stringify({ error: { message: 'Invalid image payload' } }),
+        },
+      },
+    });
+
+    const client = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: server.fetchImpl,
+      tokenProvider: async () => 'test-token',
+      sleep: async () => undefined,
+    });
+
+    const root = await client.ensureRootFolder({
+      rootFolderName: 'WebClips',
+      rootFolderId: null,
+    });
+
+    const fetchedImages: FetchedImage[] = [
+      {
+        id: 'img-1',
+        originalUrl: 'https://cdn.example.com/hero.webp',
+        resolvedUrl: 'https://cdn.example.com/hero.webp',
+        sourceUrls: ['https://cdn.example.com/hero.webp'],
+        filename: '01-hero.webp',
+        mimeType: 'image/webp',
+        bytes: WEBP_BYTES,
+        byteLength: WEBP_BYTES.byteLength,
+      },
+      {
+        id: 'img-2',
+        originalUrl: 'https://cdn.example.com/diagram.png',
+        resolvedUrl: 'https://cdn.example.com/diagram.png',
+        sourceUrls: ['https://cdn.example.com/diagram.png'],
+        filename: '02-diagram.png',
+        mimeType: 'image/png',
+        bytes: PNG_BYTES,
+        byteLength: PNG_BYTES.byteLength,
+      },
+    ];
+
+    const result = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page: makeSamplePage(),
+      fetchedImages,
+      clippedAt: '2026-11-24T04:00:00.000Z',
+    });
+
+    // README.md MUST still be uploaded even though 02-diagram.png failed!
+    expect(result.readmeFileId).toBeTruthy();
+    expect(server.uploadOrder).toEqual(['01-hero.webp', 'README.md']);
+    expect(result.uploadedImages).toHaveLength(1);
+    expect(result.uploadedImages[0].filename).toBe('01-hero.webp');
+    expect(result.failedImages).toHaveLength(1);
+    expect(result.failedImages[0].resolvedUrl).toBe('https://cdn.example.com/diagram.png');
+    expect(result.failedImages[0].reason).toMatch(/Drive upload failed/i);
+    expect(result.failedImages[0].status).toBe(400);
+
+    const readmeUpload = server.uploads.find((u) => u.metadata.name === 'README.md');
+    const readmeText = new TextDecoder().decode(readmeUpload!.contentBytes);
+    expect(readmeText).toContain('![Hero](./images/01-hero.webp)');
+    // Failed upload keeps original remote URL instead of a broken ./images/ link!
+    expect(readmeText).toContain('![Diagram](https://cdn.example.com/diagram.png)');
+    expect(readmeText).not.toContain('./images/02-diagram.png');
+    expect(readmeText).toContain('warnings:');
+    expect(readmeText).toContain('Image upload failed for https://cdn.example.com/diagram.png');
+
+    // Auth error (401) during image upload MUST still abort without uploading README.md.
+    const authFailServer = createFakeDriveServer({
+      failUploadNames: {
+        '02-diagram.png': {
+          status: 401,
+          body: JSON.stringify({ error: { message: 'Invalid Credentials' } }),
+        },
+      },
+    });
+    const authFailClient = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: authFailServer.fetchImpl,
+      tokenProvider: async () => 'expired-token',
+    });
+    const root2 = await authFailClient.ensureRootFolder({
+      rootFolderName: 'WebClips',
+      rootFolderId: null,
+    });
+
+    await expect(
+      authFailClient.uploadArticle({
+        rootFolderId: root2.folderId,
+        page: makeSamplePage(),
+        fetchedImages,
+      }),
+    ).rejects.toMatchObject({ status: 401, code: 'AUTH_REQUIRED' });
+    expect(authFailServer.uploadOrder).not.toContain('README.md');
+  });
+
+  it('deduplicates re-clipped images by appProperties.imageUrl even if a filename index shifts', async () => {
+    const server = createFakeDriveServer();
+    const client = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: server.fetchImpl,
+      tokenProvider: async () => 'test-token',
+    });
+
+    const root = await client.ensureRootFolder({
+      rootFolderName: 'WebClips',
+      rootFolderId: null,
+    });
+
+    const page = makeSamplePage();
+    const run1Img: FetchedImage = {
+      id: 'img-2',
+      originalUrl: 'https://cdn.example.com/hero.webp',
+      resolvedUrl: 'https://cdn.example.com/hero.webp',
+      sourceUrls: ['https://cdn.example.com/hero.webp'],
+      filename: '02-v2-e5c7.webp',
+      mimeType: 'image/webp',
+      bytes: WEBP_BYTES,
+      byteLength: WEBP_BYTES.byteLength,
+    };
+
+    const first = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page,
+      fetchedImages: [run1Img],
+    });
+
+    // Simulate index shifting from 02 -> 03 on Run 2 for the same image URL.
+    const run2Img: FetchedImage = {
+      ...run1Img,
+      id: 'img-3',
+      filename: '03-v2-e5c7.webp',
+    };
+
+    const second = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page,
+      fetchedImages: [run2Img],
+    });
+
+    // Must PATCH the existing file ID in place instead of creating a duplicate file!
+    expect(second.uploadedImages[0].fileId).toBe(first.uploadedImages[0].fileId);
+    const imagesInDrive = Array.from(server.files.values()).filter(
+      (f) => f.mimeType === 'image/webp',
+    );
+    expect(imagesInDrive).toHaveLength(1);
+    expect(imagesInDrive[0].name).toBe('03-v2-e5c7.webp');
   });
 });

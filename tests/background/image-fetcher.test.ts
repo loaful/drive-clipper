@@ -623,4 +623,51 @@ describe('fetchImages', () => {
     expect(history).toHaveLength(2);
     expect(history[1].removeRuleIds).toEqual(history[0].addRules?.map((r) => r.id));
   });
+
+  it('assigns deterministic, shift-proof filenames when image #1 fails on Run 1 and succeeds on Run 2', async () => {
+    const images: DiscoveredImage[] = [
+      makeImage(1, 'https://cdn.example/photo-a.jpg', 'photo'),
+      makeImage(2, 'https://cdn.example/photo-b.png', 'photo'),
+      makeImage(3, 'https://cdn.example/photo-c.webp', ''),
+    ];
+
+    let failFirstImage = true;
+    const fetchImpl: typeof fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/photo-a.jpg')) {
+        if (failFirstImage) {
+          return new Response('Temporary error', { status: 503 });
+        }
+        return makeBinaryResponse(JPEG_BYTES, 'image/jpeg');
+      }
+      if (url.endsWith('/photo-b.png')) {
+        return makeBinaryResponse(PNG_BYTES, 'image/png');
+      }
+      return makeBinaryResponse(WEBP_BYTES, 'image/webp');
+    });
+
+    // Run 1: Image #1 fails -> Images #2 and #3 must still keep their deterministic slots!
+    const run1 = await fetchImages(images, 'https://blog.example/post', {
+      fetchImpl,
+      dnr: null,
+    });
+    expect(run1.failed).toHaveLength(1);
+    expect(run1.succeeded.map((img) => [img.id, img.filename])).toEqual([
+      ['img-2', 'photo-2.png'],
+      ['img-3', 'image-03.webp'],
+    ]);
+
+    // Run 2: Image #1 succeeds -> Images #2 and #3 keep the EXACT SAME filenames!
+    failFirstImage = false;
+    const run2 = await fetchImages(images, 'https://blog.example/post', {
+      fetchImpl,
+      dnr: null,
+    });
+    expect(run2.failed).toHaveLength(0);
+    expect(run2.succeeded.map((img) => [img.id, img.filename])).toEqual([
+      ['img-1', 'photo.jpg'],
+      ['img-2', 'photo-2.png'],
+      ['img-3', 'image-03.webp'],
+    ]);
+  });
 });

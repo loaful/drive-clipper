@@ -22,6 +22,12 @@ import {
 
 export const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 export const DEFAULT_DRIVE_BASE_URL = 'https://www.googleapis.com';
+/**
+ * Google Drive API v3 rejects `uploadType=multipart` above 5 MB total payload
+ * (including JSON metadata and MIME boundaries). Switch to `uploadType=resumable`
+ * above 4.5 MiB so high-res images up to `maxImageSizeBytes` (15 MiB) upload cleanly.
+ */
+export const MULTIPART_UPLOAD_MAX_BYTES = Math.floor(4.5 * 1024 * 1024);
 const GOOGLE_OAUTH_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
 const WEB_AUTH_TOKEN_EXPIRY_SKEW_MS = 60_000;
@@ -30,6 +36,7 @@ const DEFAULT_WEB_AUTH_EXPIRES_IN_SECONDS = 3600;
 // Google Drive v3 appProperties limits each entry to 124 UTF-8 bytes (key + value).
 const DRIVE_APP_PROPERTY_MAX_BYTES = 124;
 const SOURCE_URL_PROPERTY_KEY = 'sourceUrl';
+const IMAGE_URL_PROPERTY_KEY = 'imageUrl';
 const DEFAULT_MAX_RETRIES = 4;
 const DEFAULT_BASE_RETRY_DELAY_MS = 250;
 const MAX_RETRY_AFTER_MS = 30_000;
@@ -91,6 +98,18 @@ interface DriveFileResource {
   name?: string;
   mimeType?: string;
   trashed?: boolean;
+  appProperties?: Record<string, string>;
+}
+
+export interface UploadFileParams {
+  name: string;
+  mimeType: string;
+  bytes: Uint8Array;
+  parentFolderId: string;
+  existingFileId?: string;
+  appProperties?: Record<string, string>;
+  interactive?: boolean;
+  signal?: AbortSignal;
 }
 
 interface DriveFileListResponse {
@@ -705,6 +724,13 @@ function createAbortError(): Error {
   return err;
 }
 
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) {
+    return true;
+  }
+  return error instanceof Error && error.name === 'AbortError';
+}
+
 /**
  * Minimal Google Drive API v3 client scoped strictly to `drive.file`.
  */
@@ -748,16 +774,16 @@ export class DriveClient {
     );
   }
 
-  private async requestJson<T>(
+  private async requestWithRetry(
     url: string,
     init: {
-      method: 'GET' | 'POST' | 'PATCH';
+      method: 'GET' | 'POST' | 'PATCH' | 'PUT';
       headers?: Record<string, string>;
       body?: BodyInit;
       interactive?: boolean;
       signal?: AbortSignal;
     },
-  ): Promise<T> {
+  ): Promise<Response> {
     const interactive = init.interactive ?? true;
     let token = await this.tokenProvider({ interactive });
     let refreshedAfter401 = false;
@@ -780,10 +806,7 @@ export class DriveClient {
       });
 
       if (response.ok) {
-        if (response.status === 204) {
-          return undefined as T;
-        }
-        return (await response.json()) as T;
+        return response;
       }
 
       const bodyText = await response.text().catch(() => '');
@@ -823,6 +846,23 @@ export class DriveClient {
         },
       );
     }
+  }
+
+  private async requestJson<T>(
+    url: string,
+    init: {
+      method: 'GET' | 'POST' | 'PATCH' | 'PUT';
+      headers?: Record<string, string>;
+      body?: BodyInit;
+      interactive?: boolean;
+      signal?: AbortSignal;
+    },
+  ): Promise<T> {
+    const response = await this.requestWithRetry(url, init);
+    if (response.status === 204) {
+      return undefined as T;
+    }
+    return (await response.json()) as T;
   }
 
   /**
@@ -1031,14 +1071,12 @@ export class DriveClient {
     return { folderId: created.id, reused: false };
   }
 
-  /**
-   * Lists non-trashed direct child files under `parentFolderId` indexed by name.
-   */
-  async listChildFilesByName(
+  private async listChildFiles(
     parentFolderId: string,
     options?: { interactive?: boolean; signal?: AbortSignal },
-  ): Promise<Map<string, string>> {
+  ): Promise<{ byName: Map<string, string>; byImageUrl: Map<string, string> }> {
     const byName = new Map<string, string>();
+    const byImageUrl = new Map<string, string>();
     const query =
       `'${escapeDriveQueryValue(parentFolderId)}' in parents ` +
       `and mimeType != '${DRIVE_FOLDER_MIME_TYPE}' ` +
@@ -1048,7 +1086,7 @@ export class DriveClient {
     do {
       const searchParams = new URLSearchParams({
         q: query,
-        fields: 'nextPageToken,files(id,name,trashed)',
+        fields: 'nextPageToken,files(id,name,trashed,appProperties)',
         spaces: 'drive',
         pageSize: '100',
       });
@@ -1066,37 +1104,55 @@ export class DriveClient {
       );
 
       for (const file of list.files ?? []) {
-        if (file.id && file.name && file.trashed !== true && !byName.has(file.name)) {
+        if (!file.id || file.trashed === true) {
+          continue;
+        }
+        if (file.name && !byName.has(file.name)) {
           byName.set(file.name, file.id);
+        }
+        const imageUrlKey = file.appProperties?.[IMAGE_URL_PROPERTY_KEY];
+        if (imageUrlKey && !byImageUrl.has(imageUrlKey)) {
+          byImageUrl.set(imageUrlKey, file.id);
         }
       }
 
       pageToken = list.nextPageToken;
     } while (pageToken);
 
+    return { byName, byImageUrl };
+  }
+
+  /**
+   * Lists non-trashed direct child files under `parentFolderId` indexed by name.
+   */
+  async listChildFilesByName(
+    parentFolderId: string,
+    options?: { interactive?: boolean; signal?: AbortSignal },
+  ): Promise<Map<string, string>> {
+    const { byName } = await this.listChildFiles(parentFolderId, options);
     return byName;
   }
 
   /**
-   * Uploads or updates a file via Drive API v3 `multipart/related`.
+   * Uploads or updates a file via Drive API v3 `multipart/related` (for files
+   * `<= MULTIPART_UPLOAD_MAX_BYTES`).
    */
-  async uploadMultipartFile(params: {
-    name: string;
-    mimeType: string;
-    bytes: Uint8Array;
-    parentFolderId: string;
-    existingFileId?: string;
-    interactive?: boolean;
-    signal?: AbortSignal;
-  }): Promise<{ id: string; name: string; mimeType: string }> {
+  async uploadMultipartFile(
+    params: UploadFileParams,
+  ): Promise<{ id: string; name: string; mimeType: string }> {
     const isUpdate = Boolean(params.existingFileId);
     // Drive v3 PATCH rejects `parents` in the metadata body; only POST includes it.
     const metadata: Record<string, unknown> = isUpdate
-      ? { name: params.name, mimeType: params.mimeType }
+      ? {
+          name: params.name,
+          mimeType: params.mimeType,
+          ...(params.appProperties ? { appProperties: params.appProperties } : {}),
+        }
       : {
           name: params.name,
           mimeType: params.mimeType,
           parents: [params.parentFolderId],
+          ...(params.appProperties ? { appProperties: params.appProperties } : {}),
         };
 
     const { body, contentTypeHeader } = buildMultipartRelatedBody({
@@ -1138,9 +1194,96 @@ export class DriveClient {
   }
 
   /**
+   * Uploads or updates a large file via Drive API v3 two-step `uploadType=resumable`
+   * protocol (required for payloads exceeding Google Drive's 5 MB multipart limit).
+   */
+  async uploadResumableFile(
+    params: UploadFileParams,
+  ): Promise<{ id: string; name: string; mimeType: string }> {
+    const isUpdate = Boolean(params.existingFileId);
+    const metadata: Record<string, unknown> = isUpdate
+      ? {
+          name: params.name,
+          mimeType: params.mimeType,
+          ...(params.appProperties ? { appProperties: params.appProperties } : {}),
+        }
+      : {
+          name: params.name,
+          mimeType: params.mimeType,
+          parents: [params.parentFolderId],
+          ...(params.appProperties ? { appProperties: params.appProperties } : {}),
+        };
+
+    const initEndpoint = isUpdate
+      ? `${this.uploadBaseUrl}/files/${encodeURIComponent(params.existingFileId!)}?uploadType=resumable&fields=id,name,mimeType`
+      : `${this.uploadBaseUrl}/files?uploadType=resumable&fields=id,name,mimeType`;
+
+    const initResponse = await this.requestWithRetry(initEndpoint, {
+      method: isUpdate ? 'PATCH' : 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': params.mimeType,
+        'X-Upload-Content-Length': String(params.bytes.byteLength),
+      },
+      body: JSON.stringify(metadata),
+      interactive: params.interactive,
+      signal: params.signal,
+    });
+
+    const rawLocation = initResponse.headers.get('location')?.trim();
+    if (!rawLocation) {
+      throw new DriveApiError(
+        `Resumable upload initiation for "${params.name}" returned no Location header.`,
+        { status: 500 },
+      );
+    }
+
+    const sessionUrl = new URL(rawLocation, initEndpoint).toString();
+    const uploadBody = new Uint8Array(params.bytes.byteLength);
+    uploadBody.set(params.bytes);
+
+    const uploaded = await this.requestJson<DriveFileResource>(sessionUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': params.mimeType,
+      },
+      body: uploadBody,
+      interactive: params.interactive,
+      signal: params.signal,
+    });
+
+    if (!uploaded.id) {
+      throw new DriveApiError(
+        `Resumable upload for "${params.name}" returned no file ID.`,
+        { status: 500 },
+      );
+    }
+
+    return {
+      id: uploaded.id,
+      name: uploaded.name ?? params.name,
+      mimeType: uploaded.mimeType ?? params.mimeType,
+    };
+  }
+
+  /**
+   * Automatically selects `uploadType=multipart` for payloads `<= 4.5 MiB`
+   * and `uploadType=resumable` for larger payloads.
+   */
+  async uploadFile(
+    params: UploadFileParams,
+  ): Promise<{ id: string; name: string; mimeType: string }> {
+    if (params.bytes.byteLength > MULTIPART_UPLOAD_MAX_BYTES) {
+      return this.uploadResumableFile(params);
+    }
+    return this.uploadMultipartFile(params);
+  }
+
+  /**
    * Uploads a clipped article with strict ordering:
    * 1. Find or create idempotent article folder (`appProperties.sourceUrl`).
    * 2. Upload ALL downloaded images into `images/` with bounded concurrency and await all.
+   *    Per-image non-auth upload failures degrade gracefully (keeping remote URL + warning).
    * 3. Rewrite Markdown links and generate YAML frontmatter.
    * 4. Upload `README.md` LAST.
    */
@@ -1169,7 +1312,13 @@ export class DriveClient {
     params.onProgress?.(0, totalUploads);
 
     // Phase 1: Upload all downloaded images and wait for every upload to finish.
-    const uploadedImages: UploadedImageInfo[] = new Array(
+    const uploadedSlots: Array<UploadedImageInfo | undefined> = new Array(
+      params.fetchedImages.length,
+    );
+    const succeededFetchedSlots: Array<FetchedImage | undefined> = new Array(
+      params.fetchedImages.length,
+    );
+    const uploadFailureSlots: Array<ImageFetchFailure | undefined> = new Array(
       params.fetchedImages.length,
     );
 
@@ -1181,12 +1330,15 @@ export class DriveClient {
         signal: params.signal,
       });
 
-      const existingImages = imagesFolder.reused
-        ? await this.listChildFilesByName(imagesFolder.folderId, {
+      const existingFiles = imagesFolder.reused
+        ? await this.listChildFiles(imagesFolder.folderId, {
             interactive,
             signal: params.signal,
           })
-        : new Map<string, string>();
+        : {
+            byName: new Map<string, string>(),
+            byImageUrl: new Map<string, string>(),
+          };
 
       let nextIndex = 0;
       const workerCount = Math.min(concurrency, params.fetchedImages.length);
@@ -1202,23 +1354,54 @@ export class DriveClient {
           nextIndex += 1;
 
           const image = params.fetchedImages[idx];
-          const uploaded = await this.uploadMultipartFile({
-            name: image.filename,
-            mimeType: image.mimeType,
-            bytes: image.bytes,
-            parentFolderId: imagesFolder.folderId,
-            existingFileId: existingImages.get(image.filename),
-            interactive,
-            signal: params.signal,
-          });
+          const encodedImageUrl = await encodeSourceUrlProperty(image.resolvedUrl);
+          const existingFileId =
+            existingFiles.byImageUrl.get(encodedImageUrl) ??
+            existingFiles.byName.get(image.filename);
 
-          uploadedImages[idx] = {
-            id: image.id,
-            filename: image.filename,
-            fileId: uploaded.id,
-            mimeType: image.mimeType,
-            resolvedUrl: image.resolvedUrl,
-          };
+          try {
+            const uploaded = await this.uploadFile({
+              name: image.filename,
+              mimeType: image.mimeType,
+              bytes: image.bytes,
+              parentFolderId: imagesFolder.folderId,
+              existingFileId,
+              appProperties: {
+                [IMAGE_URL_PROPERTY_KEY]: encodedImageUrl,
+              },
+              interactive,
+              signal: params.signal,
+            });
+
+            uploadedSlots[idx] = {
+              id: image.id,
+              filename: image.filename,
+              fileId: uploaded.id,
+              mimeType: image.mimeType,
+              resolvedUrl: image.resolvedUrl,
+            };
+            succeededFetchedSlots[idx] = image;
+          } catch (error) {
+            if (isAbortError(error, params.signal)) {
+              throw error;
+            }
+            if (
+              error instanceof DriveApiError &&
+              (error.code === 'AUTH_REQUIRED' || error.status === 401)
+            ) {
+              throw error;
+            }
+            const reason = error instanceof Error ? error.message : String(error);
+            const status = error instanceof DriveApiError ? error.status : undefined;
+            uploadFailureSlots[idx] = {
+              id: image.id,
+              originalUrl: image.originalUrl,
+              resolvedUrl: image.resolvedUrl,
+              sourceUrls: [...image.sourceUrls],
+              reason: `Drive upload failed: ${reason}`,
+              ...(status !== undefined ? { status } : {}),
+            };
+          }
 
           completedUploads += 1;
           params.onProgress?.(completedUploads, totalUploads);
@@ -1228,18 +1411,35 @@ export class DriveClient {
       await Promise.all(workers);
     }
 
+    const uploadedImages = uploadedSlots.filter(
+      (item): item is UploadedImageInfo => item !== undefined,
+    );
+    const succeededFetchedImages = succeededFetchedSlots.filter(
+      (item): item is FetchedImage => item !== undefined,
+    );
+    const uploadFailures = uploadFailureSlots.filter(
+      (item): item is ImageFetchFailure => item !== undefined,
+    );
+
     // Phase 2: Rewrite Markdown image links and build YAML frontmatter.
-    const failedImages = [...(params.failedImages ?? [])];
+    const downloadFailures = [...(params.failedImages ?? [])];
+    const failedImages = [...downloadFailures, ...uploadFailures];
     const rewriteResult = rewriteMarkdownImageUrls(
       params.page.markdown,
       params.page.url,
-      params.fetchedImages,
-      failedImages,
+      succeededFetchedImages,
+      downloadFailures,
     );
+
+    const uploadFailureWarnings = uploadFailures.map((failure) => {
+      const statusSuffix =
+        typeof failure.status === 'number' ? ` (HTTP ${failure.status})` : '';
+      return `Image upload failed for ${failure.resolvedUrl}${statusSuffix}: ${failure.reason}; kept original URL.`;
+    });
 
     const allWarnings = Array.from(
       new Set(
-        [...params.page.warnings, ...rewriteResult.warnings]
+        [...params.page.warnings, ...rewriteResult.warnings, ...uploadFailureWarnings]
           .map((w) => w.trim())
           .filter((w) => w.length > 0),
       ),
@@ -1288,7 +1488,7 @@ export class DriveClient {
       existingReadmeId = existingArticleFiles.get('README.md');
     }
 
-    const readmeFile = await this.uploadMultipartFile({
+    const readmeFile = await this.uploadFile({
       name: 'README.md',
       mimeType: 'text/markdown',
       bytes: textEncoder.encode(readmeContent),

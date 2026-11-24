@@ -42,6 +42,7 @@ export const MAX_CLIP_HISTORY_ITEMS = 10;
 export const MAX_CLIP_JOBS = 20;
 export const DEFAULT_MAX_CONCURRENT_JOBS = 2;
 export const DEFAULT_BADGE_CLEAR_DELAY_MS = 8_000;
+export const DEFAULT_KEEPALIVE_INTERVAL_MS = 15_000;
 export const ORPHANED_JOB_ERROR_MESSAGE =
   'Background worker restarted before upload finished. Re-open the tab and clip again.';
 
@@ -88,6 +89,10 @@ export interface ServiceWorkerDependencies {
   maxConcurrentJobs?: number;
   /** Delay in ms before auto-clearing the green "OK" badge back to "". Defaults to 8000. */
   badgeClearDelayMs?: number;
+  /** Interval in ms for MV3 Service Worker keepalive pings while active jobs remain. Defaults to 15000. */
+  keepaliveIntervalMs?: number;
+  /** Lightweight extension API ping invoked on each keepalive tick while active jobs remain. */
+  keepalivePing?: () => Promise<void>;
   now?: () => Date;
   createClipId?: () => string;
   imageFetchOptions?: Partial<ImageFetchOptions>;
@@ -425,6 +430,23 @@ async function defaultSetBadge(text: string, color: string): Promise<void> {
   }
 }
 
+async function defaultKeepalivePing(): Promise<void> {
+  if (typeof chrome === 'undefined') {
+    return;
+  }
+  try {
+    if (typeof chrome.runtime?.getPlatformInfo === 'function') {
+      await chrome.runtime.getPlatformInfo();
+      return;
+    }
+    if (typeof chrome.storage?.session?.get === 'function') {
+      await chrome.storage.session.get(STORAGE_KEYS.clipJobs);
+    }
+  } catch {
+    // Keepalive heartbeat is best-effort; never interrupt active clip jobs.
+  }
+}
+
 /**
  * Creates the Background Service Worker controller with injectable Chrome /
  * Drive / fetch dependencies for unit and E2E testing.
@@ -460,6 +482,11 @@ export function createServiceWorkerController(
     0,
     deps.badgeClearDelayMs ?? DEFAULT_BADGE_CLEAR_DELAY_MS,
   );
+  const keepaliveIntervalMs = Math.max(
+    1,
+    deps.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS,
+  );
+  const keepalivePing = deps.keepalivePing ?? defaultKeepalivePing;
 
   // Fallback in-memory session store only used outside Chrome when no storageSession is injected.
   let fallbackSessionStorage: StorageAreaLike | null = null;
@@ -696,9 +723,43 @@ export function createServiceWorkerController(
   let badgeChain: Promise<void> = Promise.resolve();
   let lastBadge: { text: string; color: string } | null = null;
   let okBadgeTimer: ReturnType<typeof setTimeout> | null = null;
+  let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
   const inFlightEffects = new Set<Promise<void>>();
   const idleWaiters = new Set<() => void>();
+
+  const stopKeepalive = (): void => {
+    if (keepaliveTimer !== null) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+  };
+
+  const syncKeepalive = (): void => {
+    if (liveJobIds.size === 0) {
+      stopKeepalive();
+      return;
+    }
+    if (keepaliveTimer !== null) {
+      return;
+    }
+    const timer = setInterval(() => {
+      if (liveJobIds.size === 0) {
+        stopKeepalive();
+        return;
+      }
+      void keepalivePing().catch(() => undefined);
+    }, keepaliveIntervalMs);
+    if (
+      typeof timer === 'object' &&
+      timer !== null &&
+      'unref' in timer &&
+      typeof (timer as { unref?: unknown }).unref === 'function'
+    ) {
+      (timer as { unref: () => void }).unref();
+    }
+    keepaliveTimer = timer;
+  };
 
   const trackEffect = (promise: Promise<void>): Promise<void> => {
     const tracked = promise.catch(() => undefined);
@@ -711,6 +772,9 @@ export function createServiceWorkerController(
   };
 
   const notifyIdleWaiters = (): void => {
+    if (liveJobIds.size === 0) {
+      stopKeepalive();
+    }
     if (
       liveJobIds.size === 0 &&
       pendingQueue.length === 0 &&
@@ -1016,6 +1080,7 @@ export function createServiceWorkerController(
       await recordClipHistory(result);
 
       liveJobIds.delete(jobId);
+      syncKeepalive();
       updateJobSync(jobId, {
         status: 'done',
         title: result.title,
@@ -1045,6 +1110,7 @@ export function createServiceWorkerController(
       const code = classifyErrorCode(error);
 
       liveJobIds.delete(jobId);
+      syncKeepalive();
       updateJobSync(jobId, {
         status: 'error',
         message,
@@ -1365,6 +1431,7 @@ export function createServiceWorkerController(
     };
 
     liveJobIds.add(clipId);
+    syncKeepalive();
     jobs.unshift(initialJob);
     await commitJobs('active-updated');
     await emitProgress({
@@ -1389,6 +1456,7 @@ export function createServiceWorkerController(
           : extractResponse.error;
 
         liveJobIds.delete(clipId);
+        syncKeepalive();
         updateJobSync(clipId, {
           status: 'error',
           message,
@@ -1414,6 +1482,7 @@ export function createServiceWorkerController(
     } catch (error) {
       const message = errorToMessage(error);
       liveJobIds.delete(clipId);
+      syncKeepalive();
       updateJobSync(clipId, {
         status: 'error',
         message,

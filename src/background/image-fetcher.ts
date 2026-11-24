@@ -572,15 +572,19 @@ function sanitizeBaseName(suggestedName: string, fallbackIndex: number): string 
   return cleaned;
 }
 
-function allocateUniqueFilename(
+/**
+ * Reserves a unique extensionless filename stem across all discovered images in
+ * original document order so an earlier download failure never shifts the
+ * filenames of subsequent images between re-clips.
+ */
+function allocateUniqueStem(
   baseName: string,
-  ext: string,
   usedLowercase: Set<string>,
 ): string {
-  let candidate = `${baseName}.${ext}`;
+  let candidate = baseName;
   let suffix = 2;
   while (usedLowercase.has(candidate.toLowerCase())) {
-    candidate = `${baseName}-${suffix}.${ext}`;
+    candidate = `${baseName}-${suffix}`;
     suffix += 1;
   }
   usedLowercase.add(candidate.toLowerCase());
@@ -904,7 +908,13 @@ export async function fetchImages(
 
     await Promise.all(workers);
 
-    const usedFilenames = new Set<string>();
+    // Pre-allocate deterministic stems across ALL discovered images in original order
+    // before inspecting fetch outcomes so a failed image never shifts later filenames.
+    const usedStems = new Set<string>();
+    const reservedStems = deduped.map((image, idx) =>
+      allocateUniqueStem(sanitizeBaseName(image.suggestedName, idx), usedStems),
+    );
+
     const succeeded: FetchedImage[] = [];
     const failed: ImageFetchFailure[] = [];
 
@@ -918,12 +928,7 @@ export async function fetchImages(
         continue;
       }
 
-      const baseName = sanitizeBaseName(outcome.image.suggestedName, i);
-      const filename = allocateUniqueFilename(
-        baseName,
-        outcome.format.ext,
-        usedFilenames,
-      );
+      const filename = `${reservedStems[i]}.${outcome.format.ext}`;
       succeeded.push({
         id: outcome.image.id,
         originalUrl: outcome.image.originalUrl,

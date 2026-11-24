@@ -986,4 +986,93 @@ describe('service-worker controller', () => {
     ).toBe(true);
     expect(badgeCalls[badgeCalls.length - 1]).toEqual(['!', '#dc2626']);
   });
+
+  it('runs MV3 keepalive heartbeat only while active clip jobs are in flight and stops cleanly when the queue drains to 0', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const sessionStorage = createMemoryStorage();
+    const keepalivePing = vi.fn(async () => undefined);
+
+    let releaseUpload!: () => void;
+    const uploadGate = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+
+    const driveClient = {
+      ensureRootFolder: vi.fn(async () => ({
+        folderId: 'root-1',
+        folderName: 'WebClips',
+        folderUrl: 'https://drive.google.com/drive/folders/root-1',
+        created: false,
+      })),
+      uploadArticle: vi.fn(async (params: UploadArticleParams) => {
+        await uploadGate;
+        return {
+          folderId: 'ka-folder',
+          folderUrl: 'https://drive.google.com/drive/folders/ka-folder',
+          folderName: params.folderName ?? '2026-11-24-ka',
+          readmeFileId: 'readme-ka',
+          title: params.page.title,
+          sourceUrl: params.page.url,
+          clippedAt: '2026-11-24T05:00:00.000Z',
+          uploadedImages: [],
+          failedImages: [],
+          warnings: [],
+          reusedFolder: false,
+        };
+      }),
+    } as unknown as DriveClient;
+
+    const controller = createServiceWorkerController({
+      driveClient,
+      storageSync: syncStorage,
+      storageLocal: localStorage,
+      storageSession: sessionStorage,
+      getManifest: () => makeConfiguredManifest(),
+      getAuthToken: async () => 'tok',
+      keepaliveIntervalMs: 15,
+      keepalivePing,
+      tabs: {
+        query: async () => [
+          { id: 42, url: 'https://example.com/long-article' } as chrome.tabs.Tab,
+        ],
+        get: async (tabId) =>
+          ({ id: tabId, url: 'https://example.com/long-article' }) as chrome.tabs.Tab,
+        sendMessage: async (): Promise<ContentResponseMessage> => ({
+          ok: true,
+          type: 'CONTENT_EXTRACTED_PAGE',
+          data: {
+            ...makeExtractedPage('https://example.com/long-article'),
+            images: [],
+          },
+        }),
+      },
+      scripting: { executeScript: async () => [] },
+      fetchImagesImpl: async () => ({ succeeded: [], failed: [] }),
+      emitPushMessage: async () => undefined,
+      setBadge: async () => undefined,
+    });
+
+    // Idle before any job starts: zero keepalive pings.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(keepalivePing).not.toHaveBeenCalled();
+
+    // Enqueue a long-running clip job: keepalive ticks repeatedly while active.
+    const accepted = await controller.handleMessage({
+      type: 'START_CLIP',
+      request: { tabId: 42, mode: 'full' },
+    });
+    expect(accepted.ok).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 65));
+    expect(keepalivePing.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    // Finish the job -> queue drains to 0 -> keepalive interval stops cleanly with no further ticks!
+    releaseUpload();
+    await controller.whenIdle();
+
+    const countAfterIdle = keepalivePing.mock.calls.length;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(keepalivePing.mock.calls.length).toBe(countAfterIdle);
+  });
 });
