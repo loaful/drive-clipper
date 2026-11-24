@@ -14,12 +14,21 @@ const SCREENSHOT_DIR =
 const REQUIRED_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const TEST_OAUTH_CLIENT_ID = '1234567890-e2eclient.apps.googleusercontent.com';
 const DRIVE_FOLDER_MIME = 'application/vnd.google-apps.folder';
+const MULTIPART_THRESHOLD_BYTES = Math.floor(4.5 * 1024 * 1024);
 
 // Minimal valid 2x2 PNG (not 1x1 so Chromium never misclassifies it as a tracking pixel)
 const VALID_PNG_BYTES = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP8z8AARAwMDAwAAwAB/wE+3gAAAABJRU5ErkJggg==',
   'base64',
 );
+
+// > 4.5 MiB valid PNG payload (header + padding) to exercise Drive uploadType=resumable
+const LARGE_RESUMABLE_PNG_BYTES = (() => {
+  const buf = Buffer.alloc(MULTIPART_THRESHOLD_BYTES + 8_192, 0x2a);
+  VALID_PNG_BYTES.copy(buf, 0);
+  buf[buf.byteLength - 1] = 0x7e;
+  return buf;
+})();
 
 // Minimal valid 2x2 lossless WebP (RIFF....WEBP VP8L)
 const VALID_WEBP_BYTES = Buffer.from(
@@ -46,12 +55,14 @@ const LAZY_SVG_PLACEHOLDER =
     '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" viewBox="0 0 1 1"></svg>',
   ).toString('base64');
 
-interface RecordedMultipartUpload {
+interface RecordedUpload {
   method: 'POST' | 'PATCH';
+  uploadType: 'multipart' | 'resumable';
   fileId?: string;
   metadata: Record<string, unknown>;
   contentType: string;
   contentBytes: Buffer;
+  declaredContentLength?: number;
 }
 
 interface MockDriveItem {
@@ -64,15 +75,32 @@ interface MockDriveItem {
   content?: Buffer;
 }
 
+interface ResumableSession {
+  method: 'POST' | 'PATCH';
+  fileId?: string;
+  metadata: Record<string, unknown>;
+  contentType: string;
+  declaredContentLength: number;
+}
+
+interface MockDriveServerOptions {
+  failUploadNames?: Record<string, { status: number; message: string }>;
+  beforeUpload?: (name: string) => Promise<void>;
+}
+
 interface MockDriveServerHandle {
   server: Server;
   baseUrl: string;
   files: Map<string, MockDriveItem>;
   folderCreations: MockDriveItem[];
   sourceUrlQueries: string[];
-  uploads: RecordedMultipartUpload[];
+  uploads: RecordedUpload[];
   uploadOrder: string[];
   close(): Promise<void>;
+}
+
+interface FixtureServerOptions {
+  beforeImageResponse?: (pathname: string) => Promise<void>;
 }
 
 interface FixtureServerHandle {
@@ -80,6 +108,10 @@ interface FixtureServerHandle {
   baseUrl: string;
   articleUrl: string;
   imageRequests: Array<{ path: string; referer: string | undefined; status: number }>;
+  state: {
+    shiftFirstImageStatus: number;
+    shiftArticleVariant: 'run1' | 'run2-recovered' | 'run3-prepended';
+  };
   close(): Promise<void>;
 }
 
@@ -87,6 +119,32 @@ interface StaticDistServerHandle {
   server: Server;
   baseUrl: string;
   close(): Promise<void>;
+}
+
+interface DeferredGate {
+  promise: Promise<void>;
+  release(): void;
+  readonly released: boolean;
+}
+
+function createGate(): DeferredGate {
+  let resolveFn!: () => void;
+  let released = false;
+  const promise = new Promise<void>((resolve) => {
+    resolveFn = resolve;
+  });
+  return {
+    promise,
+    release() {
+      if (!released) {
+        released = true;
+        resolveFn();
+      }
+    },
+    get released() {
+      return released;
+    },
+  };
 }
 
 function readRequestBody(req: IncomingMessage): Promise<Buffer> {
@@ -144,12 +202,18 @@ function parseMultipartRelated(
   return { metadata, contentType, contentBytes };
 }
 
-async function startFixtureServer(): Promise<FixtureServerHandle> {
+async function startFixtureServer(
+  options: FixtureServerOptions = {},
+): Promise<FixtureServerHandle> {
   const imageRequests: Array<{ path: string; referer: string | undefined; status: number }> = [];
+  const state: FixtureServerHandle['state'] = {
+    shiftFirstImageStatus: 500,
+    shiftArticleVariant: 'run1',
+  };
   let baseUrl = '';
   let articleUrl = '';
 
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const reqUrl = new URL(req.url ?? '/', baseUrl || 'http://127.0.0.1');
     const pathname = reqUrl.pathname;
 
@@ -220,6 +284,134 @@ async function startFixtureServer(): Promise<FixtureServerHandle> {
       return;
     }
 
+    if (pathname === '/articles/zhihu-unread') {
+      const html = `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>(20 封私信 / 17 条消息) 华硕 ProArt 显示器色彩评测</title>
+    <meta name="author" content="硬件评测室" />
+    <meta property="og:site_name" content="知乎" />
+  </head>
+  <body>
+    <main>
+      <article>
+        <h1>(20 封私信 / 17 条消息) 华硕 ProArt 显示器色彩评测</h1>
+        <p>这篇文章实测了华硕 ProArt 专业显示器的色准表现、均匀度与接口配置，并验证知乎未读前缀在标题和目录名中的自动清理逻辑。</p>
+      </article>
+    </main>
+  </body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    if (pathname === '/articles/year-2026') {
+      const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>(2026) Annual Systems Architecture Report</title>
+    <meta name="author" content="Systems Team" />
+  </head>
+  <body>
+    <main>
+      <article>
+        <h1>(2026) Annual Systems Architecture Report</h1>
+        <p>This report reviews distributed systems reliability benchmarks from 2026 and ensures legitimate four-digit year prefixes stay intact in both the Markdown title and Drive folder name.</p>
+      </article>
+    </main>
+  </body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    // Multi-tab queue articles on the SAME origin (each requiring its own distinct Referer!)
+    const queueMatch = /^\/articles\/queue-(\d+)$/.exec(pathname);
+    if (queueMatch) {
+      const idx = Number(queueMatch[1]);
+      const titles: Record<number, string> = {
+        1: '(20 封私信 / 17 条消息) 华硕 ProArt 桌面工作站配置笔记',
+        2: '(3) High-Res Resumable Media Architecture',
+        3: 'Resilient Drive Upload Fallback Guide',
+        4: 'Concurrent DNR Referer Isolation Deep Dive',
+        5: '(2026) Queue Scheduling Backpressure Design',
+        6: 'Unclipped Sixth Tab Ready for Submission',
+      };
+      const extraBody: Record<number, string> = {
+        1: `<p><img src="/media/queue-1-protected.jpg" alt="Tab 1 Protected" /></p>
+            <p><img src="/media/missing-404.png" alt="Tab 1 Missing 404" /></p>`,
+        2: `<p><img src="/media/queue-2-protected.jpg" alt="Tab 2 Protected" /></p>
+            <p><img src="/media/queue-2-large.png" alt="Tab 2 Large Resumable PNG" /></p>`,
+        3: `<p><img src="/media/queue-3-protected.jpg" alt="Tab 3 Protected" /></p>
+            <p><img src="/media/queue-3-upload-fail.png" alt="Tab 3 Drive Upload Failure" /></p>`,
+        4: `<p><img src="/media/queue-4-protected.jpg" alt="Tab 4 Protected" /></p>`,
+        5: `<p><img src="/media/queue-5-protected.jpg" alt="Tab 5 Protected" /></p>`,
+        6: `<p>Fresh tab not yet in the active clip queue.</p>`,
+      };
+      const title = titles[idx] ?? `Queue Tab ${idx}`;
+      const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>${title}</title>
+  </head>
+  <body>
+    <main>
+      <article>
+        <h1>${title}</h1>
+        <p>Multi-tab queue article #${idx} verifying concurrent background execution, single root folder creation, non-colliding DNR rules, and live Popup process list rendering.</p>
+        ${extraBody[idx] ?? ''}
+      </article>
+    </main>
+  </body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    // Shift-proof filename + prepended-image collision fixture
+    if (pathname === '/articles/shift-proof') {
+      let bodyImages = '';
+      if (state.shiftArticleVariant === 'run3-prepended') {
+        bodyImages = `
+          <p><img src="/media/prepend/photo.png" alt="Prepended Photo" /></p>
+          <p><img src="/media/first/photo.png" alt="Original First Photo" /></p>
+          <p><img src="/media/second/diagram.png" alt="Original Second Diagram" /></p>`;
+      } else {
+        bodyImages = `
+          <p><img src="/media/first/photo.png" alt="Original First Photo" /></p>
+          <p><img src="/media/second/diagram.png" alt="Original Second Diagram" /></p>`;
+      }
+      const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Shift Proof Image Filenames</title>
+  </head>
+  <body>
+    <main>
+      <article>
+        <h1>Shift Proof Image Filenames</h1>
+        <p>Verifies that image download failures and prepended images never shift filenames into duplicate Drive files or PATCH collisions.</p>
+        ${bodyImages}
+      </article>
+    </main>
+  </body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    if (pathname.startsWith('/media/')) {
+      await options.beforeImageResponse?.(pathname);
+    }
+
     if (pathname === '/media/lazy-hero.webp') {
       imageRequests.push({ path: pathname, referer: req.headers.referer, status: 200 });
       res.writeHead(200, {
@@ -258,6 +450,92 @@ async function startFixtureServer(): Promise<FixtureServerHandle> {
       return;
     }
 
+    const queueProtectedMatch = /^\/media\/queue-(\d+)-protected\.jpg$/.exec(pathname);
+    if (queueProtectedMatch) {
+      const idx = queueProtectedMatch[1];
+      const expectedArticleUrl = `${baseUrl}/articles/queue-${idx}`;
+      const referer = req.headers.referer;
+      const authorized = referer === expectedArticleUrl;
+      if (!authorized) {
+        imageRequests.push({ path: pathname, referer, status: 403 });
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(`Forbidden: expected Referer ${expectedArticleUrl}, got ${referer ?? 'none'}`);
+        return;
+      }
+      imageRequests.push({ path: pathname, referer, status: 200 });
+      res.writeHead(200, {
+        'Content-Type': 'image/jpeg',
+        'Content-Length': String(VALID_JPEG_BYTES.byteLength),
+      });
+      res.end(VALID_JPEG_BYTES);
+      return;
+    }
+
+    if (pathname === '/media/queue-2-large.png') {
+      imageRequests.push({ path: pathname, referer: req.headers.referer, status: 200 });
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': String(LARGE_RESUMABLE_PNG_BYTES.byteLength),
+      });
+      res.end(LARGE_RESUMABLE_PNG_BYTES);
+      return;
+    }
+
+    if (pathname === '/media/queue-3-upload-fail.png') {
+      imageRequests.push({ path: pathname, referer: req.headers.referer, status: 200 });
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': String(VALID_PNG_BYTES.byteLength),
+      });
+      res.end(VALID_PNG_BYTES);
+      return;
+    }
+
+    if (pathname === '/media/first/photo.png') {
+      if (state.shiftFirstImageStatus !== 200) {
+        imageRequests.push({
+          path: pathname,
+          referer: req.headers.referer,
+          status: state.shiftFirstImageStatus,
+        });
+        res.writeHead(state.shiftFirstImageStatus, {
+          'Content-Type': 'text/plain; charset=utf-8',
+        });
+        res.end('Temporary upstream error');
+        return;
+      }
+      const payload = Buffer.concat([VALID_PNG_BYTES, Buffer.from('FIRST')]);
+      imageRequests.push({ path: pathname, referer: req.headers.referer, status: 200 });
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': String(payload.byteLength),
+      });
+      res.end(payload);
+      return;
+    }
+
+    if (pathname === '/media/second/diagram.png') {
+      const payload = Buffer.concat([VALID_PNG_BYTES, Buffer.from('SECOND')]);
+      imageRequests.push({ path: pathname, referer: req.headers.referer, status: 200 });
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': String(payload.byteLength),
+      });
+      res.end(payload);
+      return;
+    }
+
+    if (pathname === '/media/prepend/photo.png') {
+      const payload = Buffer.concat([VALID_PNG_BYTES, Buffer.from('PREPENDED')]);
+      imageRequests.push({ path: pathname, referer: req.headers.referer, status: 200 });
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': String(payload.byteLength),
+      });
+      res.end(payload);
+      return;
+    }
+
     if (pathname === '/media/missing-404.png') {
       imageRequests.push({ path: pathname, referer: req.headers.referer, status: 404 });
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -289,6 +567,7 @@ async function startFixtureServer(): Promise<FixtureServerHandle> {
     baseUrl,
     articleUrl,
     imageRequests,
+    state,
     close: () =>
       new Promise<void>((resolve, reject) =>
         server.close((err) => (err ? reject(err) : resolve())),
@@ -296,19 +575,112 @@ async function startFixtureServer(): Promise<FixtureServerHandle> {
   };
 }
 
-async function startMockDriveServer(): Promise<MockDriveServerHandle> {
+async function startMockDriveServer(
+  options: MockDriveServerOptions = {},
+): Promise<MockDriveServerHandle> {
   let idSeq = 0;
+  let resumableSeq = 0;
   const files = new Map<string, MockDriveItem>();
   const folderCreations: MockDriveItem[] = [];
   const sourceUrlQueries: string[] = [];
-  const uploads: RecordedMultipartUpload[] = [];
+  const uploads: RecordedUpload[] = [];
   const uploadOrder: string[] = [];
+  const resumableSessions = new Map<string, ResumableSession>();
 
   const createItem = (item: Omit<MockDriveItem, 'id'>): MockDriveItem => {
     idSeq += 1;
     const stored: MockDriveItem = { id: `mock-drive-${idSeq}`, ...item };
     files.set(stored.id, stored);
     return stored;
+  };
+
+  const finalizeUpload = (params: {
+    method: 'POST' | 'PATCH';
+    uploadType: 'multipart' | 'resumable';
+    fileId?: string;
+    metadata: Record<string, unknown>;
+    contentType: string;
+    contentBytes: Buffer;
+    declaredContentLength?: number;
+    res: ServerResponse;
+  }): void => {
+    const { method, uploadType, fileId, metadata, contentType, contentBytes, res } = params;
+    const isPatch = method === 'PATCH';
+
+    if (isPatch && metadata.parents !== undefined) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: { message: 'The parents field is not directly writable on PATCH' },
+        }),
+      );
+      return;
+    }
+
+    const name = String(metadata.name);
+    const configuredFail = options.failUploadNames?.[name];
+    if (configuredFail) {
+      res.writeHead(configuredFail.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: configuredFail.message } }));
+      return;
+    }
+
+    uploads.push({
+      method,
+      uploadType,
+      fileId,
+      metadata,
+      contentType,
+      contentBytes,
+      ...(params.declaredContentLength !== undefined
+        ? { declaredContentLength: params.declaredContentLength }
+        : {}),
+    });
+    uploadOrder.push(name);
+
+    const incomingProps =
+      metadata.appProperties && typeof metadata.appProperties === 'object'
+        ? (metadata.appProperties as Record<string, string>)
+        : {};
+
+    if (isPatch && fileId) {
+      const existing = files.get(fileId);
+      if (!existing) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'File not found' } }));
+        return;
+      }
+      existing.name = name;
+      existing.mimeType = contentType;
+      existing.content = contentBytes;
+      existing.appProperties = { ...existing.appProperties, ...incomingProps };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: existing.id,
+          name: existing.name,
+          mimeType: existing.mimeType,
+        }),
+      );
+      return;
+    }
+
+    const created = createItem({
+      name,
+      mimeType: contentType,
+      parents: (metadata.parents as string[]) ?? [],
+      trashed: false,
+      appProperties: { ...incomingProps },
+      content: contentBytes,
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        id: created.id,
+        name: created.name,
+        mimeType: created.mimeType,
+      }),
+    );
   };
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -338,6 +710,7 @@ async function startMockDriveServer(): Promise<MockDriveServerHandle> {
           name: found.name,
           mimeType: found.mimeType,
           trashed: found.trashed,
+          appProperties: found.appProperties,
         }),
       );
       return;
@@ -381,6 +754,7 @@ async function startMockDriveServer(): Promise<MockDriveServerHandle> {
             name: f.name,
             mimeType: f.mimeType,
             trashed: f.trashed,
+            appProperties: f.appProperties,
           })),
         }),
       );
@@ -417,22 +791,50 @@ async function startMockDriveServer(): Promise<MockDriveServerHandle> {
       return;
     }
 
-    // POST or PATCH /upload/drive/v3/files(/:id)?uploadType=multipart
+    // PUT /upload/drive/v3/files?uploadType=resumable&upload_id=... (Step 2 of resumable upload)
+    if (
+      method === 'PUT' &&
+      reqUrl.pathname.startsWith('/upload/drive/v3/files') &&
+      reqUrl.searchParams.get('uploadType') === 'resumable'
+    ) {
+      const uploadId = reqUrl.searchParams.get('upload_id') ?? '';
+      const session = resumableSessions.get(uploadId);
+      if (!session) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Unknown resumable upload_id' } }));
+        return;
+      }
+      resumableSessions.delete(uploadId);
+      const raw = await readRequestBody(req);
+      const fileName = String(session.metadata.name ?? '');
+      await options.beforeUpload?.(fileName);
+      finalizeUpload({
+        method: session.method,
+        uploadType: 'resumable',
+        fileId: session.fileId,
+        metadata: session.metadata,
+        contentType: String(req.headers['content-type'] ?? session.contentType),
+        contentBytes: raw,
+        declaredContentLength: session.declaredContentLength,
+        res,
+      });
+      return;
+    }
+
+    // POST or PATCH /upload/drive/v3/files(/:id)?uploadType=resumable (Step 1 initiation)
     if (
       (method === 'POST' || method === 'PATCH') &&
-      reqUrl.pathname.startsWith('/upload/drive/v3/files')
+      reqUrl.pathname.startsWith('/upload/drive/v3/files') &&
+      reqUrl.searchParams.get('uploadType') === 'resumable'
     ) {
       const raw = await readRequestBody(req);
-      const parsed = parseMultipartRelated(
-        raw,
-        String(req.headers['content-type'] ?? ''),
-      );
+      const metadata = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
       const isPatch = method === 'PATCH';
       const fileId = isPatch
         ? decodeURIComponent(reqUrl.pathname.slice('/upload/drive/v3/files/'.length))
         : undefined;
 
-      if (isPatch && parsed.metadata.parents !== undefined) {
+      if (isPatch && metadata.parents !== undefined) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
@@ -442,53 +844,63 @@ async function startMockDriveServer(): Promise<MockDriveServerHandle> {
         return;
       }
 
-      const name = String(parsed.metadata.name);
-      uploads.push({
+      const contentType = String(req.headers['x-upload-content-type'] ?? 'application/octet-stream');
+      const declaredContentLength = Number(req.headers['x-upload-content-length'] ?? 0);
+
+      resumableSeq += 1;
+      const uploadId = `resumable-${resumableSeq}`;
+      resumableSessions.set(uploadId, {
         method,
         fileId,
-        metadata: parsed.metadata,
-        contentType: parsed.contentType,
-        contentBytes: parsed.contentBytes,
+        metadata,
+        contentType,
+        declaredContentLength,
       });
-      uploadOrder.push(name);
 
-      if (isPatch && fileId) {
-        const existing = files.get(fileId);
-        if (!existing) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'File not found' } }));
-          return;
-        }
-        existing.name = name;
-        existing.mimeType = parsed.contentType;
-        existing.content = parsed.contentBytes;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        Location: `https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=${uploadId}`,
+      });
+      res.end('');
+      return;
+    }
+
+    // POST or PATCH /upload/drive/v3/files(/:id)?uploadType=multipart
+    if (
+      (method === 'POST' || method === 'PATCH') &&
+      reqUrl.pathname.startsWith('/upload/drive/v3/files')
+    ) {
+      const raw = await readRequestBody(req);
+      if (raw.byteLength > 5 * 1024 * 1024) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
-            id: existing.id,
-            name: existing.name,
-            mimeType: existing.mimeType,
+            error: { message: 'Multipart upload exceeds Google Drive 5 MB limit' },
           }),
         );
         return;
       }
-
-      const created = createItem({
-        name,
-        mimeType: parsed.contentType,
-        parents: (parsed.metadata.parents as string[]) ?? [],
-        trashed: false,
-        appProperties: {},
-        content: parsed.contentBytes,
-      });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          id: created.id,
-          name: created.name,
-          mimeType: created.mimeType,
-        }),
+      const parsed = parseMultipartRelated(
+        raw,
+        String(req.headers['content-type'] ?? ''),
       );
+      const isPatch = method === 'PATCH';
+      const fileId = isPatch
+        ? decodeURIComponent(reqUrl.pathname.slice('/upload/drive/v3/files/'.length))
+        : undefined;
+
+      const fileName = String(parsed.metadata.name ?? '');
+      await options.beforeUpload?.(fileName);
+
+      finalizeUpload({
+        method,
+        uploadType: 'multipart',
+        fileId,
+        metadata: parsed.metadata,
+        contentType: parsed.contentType,
+        contentBytes: parsed.contentBytes,
+        res,
+      });
       return;
     }
 
@@ -561,95 +973,150 @@ async function startStaticDistServer(): Promise<StaticDistServerHandle> {
 
 interface DnrRuleSummary {
   id: number;
+  priority: number;
   urlFilter?: string;
+  regexFilter?: string;
   tabIds?: number[];
+  actionType?: string;
   requestHeaders?: Array<{ header: string; operation: string; value?: string }>;
 }
 
-function matchesDnrUrlFilter(url: string, urlFilter: string | undefined): boolean {
-  if (!urlFilter) {
+function matchesDnrRule(url: string, rule: DnrRuleSummary): boolean {
+  if (!rule.tabIds?.includes(-1)) {
+    return false;
+  }
+  if (rule.regexFilter) {
+    return new RegExp(rule.regexFilter).test(url);
+  }
+  if (!rule.urlFilter) {
     return true;
   }
-  if (urlFilter.startsWith('|')) {
-    return url.startsWith(urlFilter.slice(1));
+  let filter = rule.urlFilter;
+  const anchorStart = filter.startsWith('|');
+  if (anchorStart) {
+    filter = filter.slice(1);
   }
-  return url.includes(urlFilter);
+  const anchorEnd = filter.endsWith('|');
+  if (anchorEnd) {
+    filter = filter.slice(0, -1);
+  }
+  if (anchorStart && anchorEnd) {
+    return url === filter;
+  }
+  if (anchorStart) {
+    return url.startsWith(filter);
+  }
+  if (anchorEnd) {
+    return url.endsWith(filter);
+  }
+  return url.includes(filter);
+}
+
+interface RegisteredTabEntry {
+  tabId: number;
+  page: Page;
+  errors: string[];
 }
 
 /**
  * Wires real built `dist/background.js` inside a Chromium page with faithful
- * `chrome.*` bridges so Popup, Options, and the real `dist/content.js` on the
- * fixture article page communicate end to end while routing Drive calls to the
- * local mock Drive HTTP server and enforcing DNR Referer rules on real HTTP requests.
+ * multi-tab `chrome.*` bridges (`storage.sync/local/session`, `tabs`, `scripting`,
+ * `declarativeNetRequest`, `action`, `identity`, `runtime`) so Popup, Options,
+ * and real `dist/content.js` tabs communicate end to end.
  */
 async function createExtensionHarness(params: {
   context: BrowserContext;
   distBaseUrl: string;
   fixtureServer: FixtureServerHandle;
   driveServer: MockDriveServerHandle;
+  initialTabs?: Array<{ tabId: number; url: string }>;
+  ignoredConsoleUrls?: string[];
+  initialSessionStore?: Record<string, unknown>;
 }) {
   const { context, distBaseUrl, fixtureServer, driveServer } = params;
 
   const activeDnrRules = new Map<number, DnrRuleSummary>();
   const dnrUpdateLog: Array<{ addedIds: number[]; removedIds: number[] }> = [];
+  const dnrRuleIdCollisions: number[] = [];
   const syncStore: Record<string, unknown> = {};
   const localStore: Record<string, unknown> = {};
+  const sessionStore: Record<string, unknown> = {
+    ...(params.initialSessionStore ?? {}),
+  };
   const recordedAuthScopes: string[][] = [];
+  const badgeUpdates: Array<{ text: string; color?: string }> = [];
+  let keepalivePings = 0;
   let signedIn = true;
   let injectedContentCount = 0;
+  let activeTabId = 101;
+  const tabsById = new Map<number, RegisteredTabEntry>();
 
-  // 1. Open the real fixture article page in Chromium
-  const articlePage = await context.newPage();
-  const articleErrors: string[] = [];
-  articlePage.on('pageerror', (err) => articleErrors.push(err.message));
+  const openArticleTab = async (tabId: number, url: string): Promise<Page> => {
+    const page = await context.newPage();
+    const errors: string[] = [];
+    page.on('pageerror', (err) => errors.push(err.message));
 
-  await articlePage.addInitScript(() => {
-    const listeners: Array<
-      (
-        msg: unknown,
-        sender: unknown,
-        sendResponse: (response: unknown) => void,
-      ) => boolean | undefined
-    > = [];
-    const w = window as unknown as Record<string, unknown>;
-    w.__contentListeners = listeners;
-    w.chrome = {
-      runtime: {
-        onMessage: {
-          addListener: (
-            fn: (
-              msg: unknown,
-              sender: unknown,
-              sendResponse: (response: unknown) => void,
-            ) => boolean | undefined,
-          ) => {
-            listeners.push(fn);
+    await page.addInitScript(() => {
+      const listeners: Array<
+        (
+          msg: unknown,
+          sender: unknown,
+          sendResponse: (response: unknown) => void,
+        ) => boolean | undefined
+      > = [];
+      const w = window as unknown as Record<string, unknown>;
+      w.__contentListeners = listeners;
+      w.chrome = {
+        runtime: {
+          onMessage: {
+            addListener: (
+              fn: (
+                msg: unknown,
+                sender: unknown,
+                sendResponse: (response: unknown) => void,
+              ) => boolean | undefined,
+            ) => {
+              listeners.push(fn);
+            },
           },
         },
-      },
-    };
-  });
+      };
+    });
 
-  await articlePage.goto(fixtureServer.articleUrl, { waitUntil: 'networkidle' });
-  // Wait for the lazy <img> SVG placeholder to finish decoding in real Chromium
-  await articlePage.waitForFunction(() => {
-    const img = document.getElementById('lazy-img') as HTMLImageElement | null;
-    return Boolean(img && img.complete && img.naturalWidth > 0);
-  });
+    await page.goto(url, { waitUntil: 'networkidle' });
+    tabsById.set(tabId, { tabId, page, errors });
+    return page;
+  };
 
-  // 2. Open the background harness page and route Drive API + DNR image requests
+  const tabSpecs = params.initialTabs ?? [{ tabId: 101, url: fixtureServer.articleUrl }];
+  for (const spec of tabSpecs) {
+    await openArticleTab(spec.tabId, spec.url);
+  }
+  activeTabId = tabSpecs[0].tabId;
+
+  const firstArticlePage = tabsById.get(activeTabId)!.page;
+  if (tabSpecs[0].url === fixtureServer.articleUrl) {
+    await firstArticlePage.waitForFunction(() => {
+      const img = document.getElementById('lazy-img') as HTMLImageElement | null;
+      return Boolean(img && img.complete && img.naturalWidth > 0);
+    });
+  }
+
+  // Open the background harness page and route Drive API + DNR image requests
   const swPage = await context.newPage();
   const swErrors: string[] = [];
-  const expectedMissingImageUrl = `${fixtureServer.baseUrl}/media/missing-404.png`;
+  const expectedMissingImageUrls = new Set([
+    `${fixtureServer.baseUrl}/media/missing-404.png`,
+    ...(params.ignoredConsoleUrls ?? []),
+  ]);
   swPage.on('pageerror', (err) => swErrors.push(err.message));
   swPage.on('console', (msg) => {
     if (msg.type() === 'error') {
       const text = msg.text();
       const locUrl = msg.location().url;
-      // Chromium logs a network-layer console error whenever fetch() gets our intentional 404 fixture.
       if (
-        locUrl === expectedMissingImageUrl &&
-        text.includes('404')
+        expectedMissingImageUrls.has(locUrl) ||
+        (locUrl.includes('/upload/drive/v3/files') && text.includes('400'))
       ) {
         return;
       }
@@ -666,8 +1133,10 @@ async function createExtensionHarness(params: {
         status: 204,
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-          'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+          'Access-Control-Allow-Methods': 'GET, POST, PATCH, PUT, OPTIONS',
+          'Access-Control-Allow-Headers':
+            'Authorization, Content-Type, X-Upload-Content-Type, X-Upload-Content-Length',
+          'Access-Control-Expose-Headers': 'Location',
         },
       });
       return;
@@ -683,6 +1152,12 @@ async function createExtensionHarness(params: {
     if (reqHeaders['content-type']) {
       forwardHeaders['Content-Type'] = reqHeaders['content-type'];
     }
+    if (reqHeaders['x-upload-content-type']) {
+      forwardHeaders['X-Upload-Content-Type'] = reqHeaders['x-upload-content-type'];
+    }
+    if (reqHeaders['x-upload-content-length']) {
+      forwardHeaders['X-Upload-Content-Length'] = reqHeaders['x-upload-content-length'];
+    }
 
     const postBuf = req.postDataBuffer();
     const bodyInit = postBuf ? new Uint8Array(postBuf) : undefined;
@@ -692,14 +1167,19 @@ async function createExtensionHarness(params: {
       body: bodyInit,
     });
     const respBuf = Buffer.from(await upstream.arrayBuffer());
-    const respContentType = upstream.headers.get('content-type') ?? 'application/json';
+    const respHeaders: Record<string, string> = {
+      'Content-Type': upstream.headers.get('content-type') ?? 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Expose-Headers': 'Location',
+    };
+    const location = upstream.headers.get('location');
+    if (location) {
+      respHeaders.Location = location;
+    }
 
     await route.fulfill({
       status: upstream.status,
-      headers: {
-        'Content-Type': respContentType,
-        'Access-Control-Allow-Origin': '*',
-      },
+      headers: respHeaders,
       body: respBuf,
     });
   });
@@ -714,17 +1194,14 @@ async function createExtensionHarness(params: {
       forwardHeaders.Accept = reqHeaders.accept;
     }
 
-    // Only apply Referer if dist/background.js registered a matching active DNR rule for tabIds [-1]
-    for (const rule of activeDnrRules.values()) {
-      if (
-        rule.tabIds?.includes(-1) &&
-        matchesDnrUrlFilter(url, rule.urlFilter) &&
-        rule.requestHeaders
-      ) {
-        for (const mod of rule.requestHeaders) {
-          if (mod.operation === 'set' && mod.value !== undefined) {
-            forwardHeaders[mod.header] = mod.value;
-          }
+    const matchingRules = Array.from(activeDnrRules.values())
+      .filter((rule) => matchesDnrRule(url, rule) && Boolean(rule.requestHeaders))
+      .sort((a, b) => a.priority - b.priority);
+
+    for (const rule of matchingRules) {
+      for (const mod of rule.requestHeaders ?? []) {
+        if (mod.operation === 'set' && mod.value !== undefined) {
+          forwardHeaders[mod.header] = mod.value;
         }
       }
     }
@@ -751,27 +1228,65 @@ async function createExtensionHarness(params: {
 
   const uiPushSubscribers = new Set<Page>();
 
-  await swPage.exposeFunction('__e2eGetAuthToken', (details: { interactive?: boolean; scopes?: string[] }) => {
-    if (Array.isArray(details?.scopes)) {
-      recordedAuthScopes.push([...details.scopes]);
-    }
-    if (!signedIn) {
-      if (details?.interactive) {
-        signedIn = true;
-        return { token: 'mock-e2e-access-token' };
+  await swPage.exposeFunction(
+    '__e2eGetAuthToken',
+    (details: { interactive?: boolean; scopes?: string[] }) => {
+      if (Array.isArray(details?.scopes)) {
+        recordedAuthScopes.push([...details.scopes]);
       }
-      throw new Error('User is signed out');
-    }
-    return { token: 'mock-e2e-access-token' };
-  });
+      if (!signedIn) {
+        if (details?.interactive) {
+          signedIn = true;
+          return { token: 'mock-e2e-access-token' };
+        }
+        throw new Error('User is signed out');
+      }
+      return { token: 'mock-e2e-access-token' };
+    },
+  );
 
   await swPage.exposeFunction('__e2eClearAuth', () => {
     signedIn = false;
   });
 
+  await swPage.exposeFunction('__e2eGetPlatformInfo', () => {
+    keepalivePings += 1;
+    return { os: 'mac', arch: 'arm64', nacl_arch: 'arm' };
+  });
+
+  await swPage.exposeFunction('__e2eSetBadgeText', (details: { text: string }) => {
+    badgeUpdates.push({ text: details.text });
+  });
+
+  await swPage.exposeFunction(
+    '__e2eSetBadgeBgColor',
+    (details: { color: string }) => {
+      const latest = badgeUpdates[badgeUpdates.length - 1];
+      if (latest) {
+        latest.color = details.color;
+      }
+    },
+  );
+
+  await swPage.exposeFunction('__e2eDnrGetSessionRules', () => {
+    return Array.from(activeDnrRules.values()).map((r) => ({
+      id: r.id,
+      priority: r.priority,
+      action: {
+        type: r.actionType ?? 'modifyHeaders',
+        requestHeaders: r.requestHeaders ?? [],
+      },
+      condition: {
+        ...(r.urlFilter !== undefined ? { urlFilter: r.urlFilter } : {}),
+        ...(r.regexFilter !== undefined ? { regexFilter: r.regexFilter } : {}),
+        tabIds: r.tabIds ?? [-1],
+      },
+    }));
+  });
+
   await swPage.exposeFunction(
     '__e2eDnrUpdateSessionRules',
-    (options: { addRules?: DnrRuleSummary[]; removeRuleIds?: number[] }) => {
+    (options: { addRules?: unknown[]; removeRuleIds?: number[] }) => {
       const addedIds: number[] = [];
       const removedIds: number[] = [];
       if (options.removeRuleIds) {
@@ -781,16 +1296,27 @@ async function createExtensionHarness(params: {
         }
       }
       if (options.addRules) {
-        for (const rule of options.addRules) {
-          const cond = (rule as unknown as {
-            condition?: { urlFilter?: string; tabIds?: number[] };
-            action?: { requestHeaders?: Array<{ header: string; operation: string; value?: string }> };
-          });
+        for (const rawRule of options.addRules) {
+          const rule = rawRule as {
+            id: number;
+            priority?: number;
+            condition?: { urlFilter?: string; regexFilter?: string; tabIds?: number[] };
+            action?: {
+              type?: string;
+              requestHeaders?: Array<{ header: string; operation: string; value?: string }>;
+            };
+          };
+          if (activeDnrRules.has(rule.id)) {
+            dnrRuleIdCollisions.push(rule.id);
+          }
           activeDnrRules.set(rule.id, {
             id: rule.id,
-            urlFilter: cond.condition?.urlFilter,
-            tabIds: cond.condition?.tabIds,
-            requestHeaders: cond.action?.requestHeaders,
+            priority: rule.priority ?? 1,
+            urlFilter: rule.condition?.urlFilter,
+            regexFilter: rule.condition?.regexFilter,
+            tabIds: rule.condition?.tabIds,
+            actionType: rule.action?.type,
+            requestHeaders: rule.action?.requestHeaders,
           });
           addedIds.push(rule.id);
         }
@@ -799,35 +1325,63 @@ async function createExtensionHarness(params: {
     },
   );
 
-  await swPage.exposeFunction('__e2eStorageGet', (area: 'sync' | 'local', key: string) => {
-    const store = area === 'sync' ? syncStore : localStore;
-    return key in store ? { [key]: store[key] } : {};
-  });
+  const getStore = (area: 'sync' | 'local' | 'session'): Record<string, unknown> => {
+    if (area === 'sync') return syncStore;
+    if (area === 'local') return localStore;
+    return sessionStore;
+  };
+
+  await swPage.exposeFunction(
+    '__e2eStorageGet',
+    (area: 'sync' | 'local' | 'session', key: string) => {
+      const store = getStore(area);
+      return key in store ? { [key]: store[key] } : {};
+    },
+  );
 
   await swPage.exposeFunction(
     '__e2eStorageSet',
-    (area: 'sync' | 'local', items: Record<string, unknown>) => {
-      const store = area === 'sync' ? syncStore : localStore;
+    (area: 'sync' | 'local' | 'session', items: Record<string, unknown>) => {
+      const store = getStore(area);
       Object.assign(store, items);
     },
   );
 
-  await swPage.exposeFunction('__e2eTabsQuery', () => [
-    { id: 101, url: articlePage.url(), title: 'Drive Clipper End-to-End Architecture' },
+  await swPage.exposeFunction(
+    '__e2eStorageRemove',
+    (area: 'sync' | 'local' | 'session', key: string) => {
+      const store = getStore(area);
+      delete store[key];
+    },
+  );
+
+  const getTabMeta = async (tabId: number) => {
+    const entry = tabsById.get(tabId);
+    if (!entry) {
+      throw new Error(`Unknown tab ${tabId}`);
+    }
+    const title = await entry.page.title();
+    return { id: entry.tabId, url: entry.page.url(), title };
+  };
+
+  await swPage.exposeFunction('__e2eTabsQuery', async () => [
+    await getTabMeta(activeTabId),
   ]);
 
-  await swPage.exposeFunction('__e2eTabsGet', (tabId: number) => ({
-    id: tabId,
-    url: articlePage.url(),
-    title: 'Drive Clipper End-to-End Architecture',
-  }));
+  await swPage.exposeFunction('__e2eTabsGet', async (tabId: number) =>
+    getTabMeta(tabId),
+  );
 
   await swPage.exposeFunction(
     '__e2eExecuteScript',
     async (injection: { target: { tabId: number }; files?: string[] }) => {
+      const entry = tabsById.get(injection.target.tabId);
+      if (!entry) {
+        throw new Error(`Cannot executeScript on missing tab ${injection.target.tabId}`);
+      }
       for (const file of injection.files ?? []) {
         const scriptPath = path.join(DIST_DIR, file);
-        await articlePage.addScriptTag({ path: scriptPath });
+        await entry.page.addScriptTag({ path: scriptPath });
         injectedContentCount += 1;
       }
       return [];
@@ -836,8 +1390,12 @@ async function createExtensionHarness(params: {
 
   await swPage.exposeFunction(
     '__e2eTabsSendMessage',
-    async (_tabId: number, message: unknown) => {
-      return articlePage.evaluate((msg) => {
+    async (tabId: number, message: unknown) => {
+      const entry = tabsById.get(tabId);
+      if (!entry) {
+        throw new Error(`Cannot sendMessage to missing tab ${tabId}`);
+      }
+      return entry.page.evaluate((msg) => {
         const listeners = (
           window as unknown as {
             __contentListeners: Array<
@@ -906,6 +1464,8 @@ async function createExtensionHarness(params: {
             scopes: ['https://www.googleapis.com/auth/drive.file'],
           },
         }),
+        getPlatformInfo: () =>
+          (w.__e2eGetPlatformInfo as () => Promise<unknown>)(),
         onInstalled: { addListener: () => undefined },
         onMessage: {
           addListener: (
@@ -927,8 +1487,10 @@ async function createExtensionHarness(params: {
         onClicked: { addListener: () => undefined },
       },
       action: {
-        setBadgeText: async () => undefined,
-        setBadgeBackgroundColor: async () => undefined,
+        setBadgeText: (details: unknown) =>
+          (w.__e2eSetBadgeText as (d: unknown) => Promise<void>)(details),
+        setBadgeBackgroundColor: (details: unknown) =>
+          (w.__e2eSetBadgeBgColor as (d: unknown) => Promise<void>)(details),
       },
       identity: {
         getAuthToken: (details: unknown) =>
@@ -939,6 +1501,8 @@ async function createExtensionHarness(params: {
           (w.__e2eClearAuth as () => Promise<void>)(),
       },
       declarativeNetRequest: {
+        getSessionRules: () =>
+          (w.__e2eDnrGetSessionRules as () => Promise<unknown>)(),
         updateSessionRules: (opts: unknown) =>
           (w.__e2eDnrUpdateSessionRules as (o: unknown) => Promise<void>)(opts),
       },
@@ -954,6 +1518,14 @@ async function createExtensionHarness(params: {
             (w.__e2eStorageGet as (a: string, k: string) => Promise<unknown>)('local', key),
           set: (items: Record<string, unknown>) =>
             (w.__e2eStorageSet as (a: string, i: Record<string, unknown>) => Promise<void>)('local', items),
+        },
+        session: {
+          get: (key: string) =>
+            (w.__e2eStorageGet as (a: string, k: string) => Promise<unknown>)('session', key),
+          set: (items: Record<string, unknown>) =>
+            (w.__e2eStorageSet as (a: string, i: Record<string, unknown>) => Promise<void>)('session', items),
+          remove: (key: string) =>
+            (w.__e2eStorageRemove as (a: string, k: string) => Promise<void>)('session', key),
         },
       },
       tabs: {
@@ -1022,6 +1594,7 @@ async function createExtensionHarness(params: {
 
       w.chrome = {
         runtime: {
+          id: 'lliikkoebahbliapkdchhdahfodpcach',
           lastError: undefined,
           getManifest: () => ({
             manifest_version: 3,
@@ -1058,27 +1631,62 @@ async function createExtensionHarness(params: {
             void (w.__e2eOpenOptions as () => Promise<void>)();
           },
         },
+        identity: {
+          getRedirectURL: () =>
+            'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/',
+        },
       };
     }, TEST_OAUTH_CLIENT_ID);
   };
 
+  const openPopup = async (): Promise<{
+    page: Page;
+    consoleErrors: string[];
+    pageErrors: string[];
+  }> => {
+    const popupPage = await context.newPage();
+    await popupPage.setViewportSize({ width: 360, height: 640 });
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    popupPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    popupPage.on('pageerror', (err) => pageErrors.push(err.message));
+
+    await attachUiChromeBridge(popupPage);
+    await popupPage.goto(`${distBaseUrl}/popup.html`, { waitUntil: 'networkidle' });
+    return { page: popupPage, consoleErrors, pageErrors };
+  };
+
   return {
-    articlePage,
-    articleErrors,
+    articlePage: firstArticlePage,
+    tabsById,
+    setActiveTab(tabId: number) {
+      activeTabId = tabId;
+    },
+    getAllArticleErrors: () =>
+      Array.from(tabsById.values()).flatMap((entry) => entry.errors),
     swPage,
     swErrors,
     activeDnrRules,
     dnrUpdateLog,
+    dnrRuleIdCollisions,
     recordedAuthScopes,
+    badgeUpdates,
+    sessionStore,
+    getKeepalivePings: () => keepalivePings,
     getInjectedContentCount: () => injectedContentCount,
     sendToServiceWorker,
     attachUiChromeBridge,
+    openPopup,
     async close() {
       for (const p of uiPushSubscribers) {
         if (!p.isClosed()) await p.close();
       }
       if (!swPage.isClosed()) await swPage.close();
-      if (!articlePage.isClosed()) await articlePage.close();
+      for (const entry of tabsById.values()) {
+        if (!entry.page.isClosed()) await entry.page.close();
+      }
     },
   };
 }
@@ -1125,9 +1733,7 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
 
     for (const htmlFile of ['popup.html', 'options.html']) {
       const html = readFileSync(path.join(DIST_DIR, htmlFile), 'utf8');
-      // Zero remote <script src="http(s)://..."> or protocol-relative URLs
       expect(html).not.toMatch(/<script\b[^>]*\bsrc\s*=\s*["']?\s*(?:https?:|\/\/)/i);
-      // Zero inline <script> bodies
       const scripts = Array.from(html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi));
       expect(scripts.length).toBeGreaterThan(0);
       for (const [, body] of scripts) {
@@ -1160,20 +1766,11 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
         driveServer,
       });
 
-      // 1. Render built dist/popup.html in a 360px viewport wired to live dist/background.js
-      const popupPage = await context.newPage();
-      await popupPage.setViewportSize({ width: 360, height: 640 });
-      const popupConsoleErrors: string[] = [];
-      const popupPageErrors: string[] = [];
-      popupPage.on('console', (msg) => {
-        if (msg.type() === 'error') popupConsoleErrors.push(msg.text());
-      });
-      popupPage.on('pageerror', (err) => popupPageErrors.push(err.message));
-
-      await harness.attachUiChromeBridge(popupPage);
-      await popupPage.goto(`${distServer.baseUrl}/popup.html`, {
-        waitUntil: 'networkidle',
-      });
+      const {
+        page: popupPage,
+        consoleErrors: popupConsoleErrors,
+        pageErrors: popupPageErrors,
+      } = await harness.openPopup();
 
       await expect(popupPage.locator('#title-input')).toHaveValue(
         'Drive Clipper End-to-End Architecture',
@@ -1193,29 +1790,26 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       // Clear initial page-load image hits so imageRequests tracks only extension background fetches
       fixtureServer.imageRequests.length = 0;
 
-      // 2. Click "Clip to Google Drive" to run the REAL bundled pipeline end to end!
+      // Click "Clip to Google Drive" to run the REAL bundled pipeline end to end!
       await popupPage.locator('#clip-submit-btn').click();
-      await expect(popupPage.locator('#progress-status-label')).toHaveText('Saved', {
-        timeout: 20_000,
-      });
+      const firstRow = popupPage.locator('#clip-queue-list .queue-item').first();
+      await expect(firstRow).toHaveAttribute('data-status', 'done', { timeout: 20_000 });
+      await expect(firstRow.locator('.queue-item-detail')).toHaveText('Saved · 3 images');
 
       // Verify UI displays Drive link, 1 warning (for the broken 404 image), and updated history
-      const driveHref = await popupPage.locator('#result-drive-link').getAttribute('href');
+      const driveHref = await firstRow.locator('.queue-open-link').getAttribute('href');
       expect(driveHref).toMatch(/^https:\/\/drive\.google\.com\/drive\/folders\/mock-drive-\d+$/);
-      await expect(popupPage.locator('#warnings-details')).toBeVisible();
-      await expect(popupPage.locator('#warnings-summary')).toContainText('1 warning');
+      await expect(firstRow.locator('.queue-warnings')).toBeVisible();
+      await expect(firstRow.locator('.queue-warnings-summary')).toContainText('1 warning');
       await expect(popupPage.locator('#recent-clips-count')).toHaveText('1');
 
-      // Open warnings and recent clips for an informative Popup screenshot
-      await popupPage.locator('#warnings-summary').click();
+      // Open warnings and recent clips to verify rendering
+      await firstRow.locator('.queue-warnings-summary').click();
       await popupPage.locator('.recent-clips-summary').click();
-      await expect(popupPage.locator('#warnings-list li')).toHaveCount(1);
+      await expect(firstRow.locator('.queue-warnings-list li')).toHaveCount(1);
       await expect(popupPage.locator('#recent-clips-list .recent-clip-item')).toHaveCount(1);
 
-      const popupScreenshotPath = path.join(SCREENSHOT_DIR, 'popup-ui.png');
-      await popupPage.screenshot({ path: popupScreenshotPath, fullPage: true });
-
-      // 3. Assert all E2E pipeline invariants on the first clip
+      // Assert all E2E pipeline invariants on the first clip
       expect(harness.getInjectedContentCount()).toBeGreaterThanOrEqual(2);
       expect(harness.recordedAuthScopes.length).toBeGreaterThan(0);
       for (const scopes of harness.recordedAuthScopes) {
@@ -1223,6 +1817,7 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       }
 
       // DNR Referer rules were added during fetch and completely removed afterwards
+      expect(harness.dnrRuleIdCollisions).toEqual([]);
       expect(harness.dnrUpdateLog.some((e) => e.addedIds.length > 0)).toBe(true);
       expect(harness.dnrUpdateLog.some((e) => e.removedIds.length > 0)).toBe(true);
       expect(harness.activeDnrRules.size).toBe(0);
@@ -1254,7 +1849,7 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       ]);
       expect(driveServer.sourceUrlQueries.length).toBe(1);
 
-      // Exact upload order: 3 valid images (lazy .webp, duplicate .png once, anti-hotlink .jpg) BEFORE README.md
+      // Exact upload order: 3 valid images BEFORE README.md
       expect(driveServer.uploadOrder).toHaveLength(4);
       expect(driveServer.uploadOrder[3]).toBe('README.md');
       const uploadedImageNames = driveServer.uploadOrder.slice(0, 3);
@@ -1263,7 +1858,7 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       expect(uploadedImageNames.some((n) => n.endsWith('.png'))).toBe(true);
       expect(uploadedImageNames.some((n) => n.endsWith('.jpg'))).toBe(true);
 
-      // Verify uploaded binary payloads preserved original formats (no PNG re-encoding)
+      // Verify uploaded binary payloads preserved original formats
       const webpUpload = driveServer.uploads.find((u) =>
         String(u.metadata.name).endsWith('.webp'),
       )!;
@@ -1282,59 +1877,49 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       expect(pngUpload.contentType).toBe('image/png');
       expect(pngUpload.contentBytes.equals(VALID_PNG_BYTES)).toBe(true);
 
-      // Verify README.md content: frontmatter, Shadow DOM content, rewritten relative links, deduplicated refs, 404 graceful fallback
+      // Verify README.md content
       const readmeUpload = driveServer.uploads.find((u) => u.metadata.name === 'README.md')!;
       const readmeText = readmeUpload.contentBytes.toString('utf8');
-
-      // Normal + Shadow DOM content extracted cleanly; shadow <style> stripped
       expect(readmeText).toContain('Normal light-DOM article introduction');
       expect(readmeText).toContain('Critical architectural note rendered strictly inside an open Shadow DOM root');
       expect(readmeText).not.toContain('color: crimson');
-
-      // Lazy image resolved & rewritten
       const webpFilename = String(webpUpload.metadata.name);
       expect(readmeText).toContain(`./images/${webpFilename}`);
       expect(readmeText).not.toContain('data:image/svg+xml');
-
-      // Duplicate image rewritten at BOTH occurrences to the single uploaded filename
       const pngFilename = String(pngUpload.metadata.name);
       const dupRewrittenMatches = readmeText.match(
         new RegExp(`!\\[[^\\]]*\\]\\(\\./images/${pngFilename.replace('.', '\\.')}\\)`, 'g'),
       );
       expect(dupRewrittenMatches?.length).toBe(2);
-
-      // Anti-hotlink image rewritten
       const jpgFilename = String(jpgUpload.metadata.name);
       expect(readmeText).toContain(`./images/${jpgFilename}`);
-
-      // Broken 404 image keeps original remote URL + YAML frontmatter warning
       expect(readmeText).toContain(`${fixtureServer.baseUrl}/media/missing-404.png`);
       expect(readmeText).toContain('warnings:');
       expect(readmeText).toContain('HTTP 404');
 
-      // 4. Re-clip the EXACT same URL and verify folder reuse (idempotency via appProperties.sourceUrl)
+      // Re-clip the EXACT same URL and verify folder reuse (idempotency via appProperties.sourceUrl)
       const firstFolderCount = driveServer.folderCreations.length;
       const firstUploadCount = driveServer.uploads.length;
       const firstArticleFolderId = driveServer.folderCreations[1].id;
 
+      await expect(popupPage.locator('#clip-submit-btn')).toBeEnabled();
       await popupPage.locator('#clip-submit-btn').click();
-      await expect(popupPage.locator('#progress-badge')).toHaveText('Updated', {
+      const reclipRow = popupPage.locator('#clip-queue-list .queue-item').first();
+      await expect(reclipRow.locator('.queue-item-detail')).toHaveText('Updated · 3 images', {
         timeout: 20_000,
       });
 
       expect(driveServer.sourceUrlQueries.length).toBe(2);
-      // Zero new folders created on re-clip!
       expect(driveServer.folderCreations.length).toBe(firstFolderCount);
       const secondRunUploads = driveServer.uploads.slice(firstUploadCount);
       expect(secondRunUploads).toHaveLength(4);
-      // All 4 second-run uploads must PATCH existing files in place, with README.md strictly last
       expect(secondRunUploads.every((u) => u.method === 'PATCH')).toBe(true);
       expect(secondRunUploads[3].metadata.name).toBe('README.md');
-      const updatedHref = await popupPage.locator('#result-drive-link').getAttribute('href');
+      const updatedHref = await reclipRow.locator('.queue-open-link').getAttribute('href');
       expect(updatedHref).toBe(`https://drive.google.com/drive/folders/${firstArticleFolderId}`);
       expect(harness.activeDnrRules.size).toBe(0);
 
-      // 5. Render built dist/options.html in a 900px viewport wired to the SAME live dist/background.js
+      // Render built dist/options.html in a 900px viewport wired to the SAME live dist/background.js
       const optionsPage = await context.newPage();
       await optionsPage.setViewportSize({ width: 900, height: 960 });
       const optionsConsoleErrors: string[] = [];
@@ -1359,28 +1944,463 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       );
       await expect(optionsPage.locator('#drive-file-note')).toContainText('drive.file');
 
-      // Verify clean 900px options layout (no horizontal overflow)
       const optionsOverflow = await optionsPage.evaluate(
         () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
       );
       expect(optionsOverflow).toBeLessThanOrEqual(0);
 
-      // Verify interactive preference persistence in Options UI
       await optionsPage.locator('#default-tags-input').fill('engineering');
       await optionsPage.locator('#default-tags-input').press('Enter');
       await optionsPage.locator('#save-preferences-btn').click();
       await expect(optionsPage.locator('#preferences-feedback')).toHaveText('Preferences saved.');
 
-      const optionsScreenshotPath = path.join(SCREENSHOT_DIR, 'options-ui.png');
-      await optionsPage.screenshot({ path: optionsScreenshotPath, fullPage: true });
-
-      // Assert zero console/page errors across all Chromium pages
       expect(popupConsoleErrors).toEqual([]);
       expect(popupPageErrors).toEqual([]);
       expect(optionsConsoleErrors).toEqual([]);
       expect(optionsPageErrors).toEqual([]);
       expect(harness.swErrors).toEqual([]);
-      expect(harness.articleErrors).toEqual([]);
+      expect(harness.getAllArticleErrors()).toEqual([]);
+
+      await harness.close();
+    } finally {
+      await context.close();
+      await Promise.all([
+        fixtureServer.close(),
+        driveServer.close(),
+        distServer.close(),
+      ]);
+    }
+  });
+
+  test('strips Zhihu unread prefixes from extracted title & Drive folder name while preserving legitimate (2026) parentheticals', async ({
+    browser,
+  }) => {
+    const fixtureServer = await startFixtureServer();
+    const driveServer = await startMockDriveServer();
+    const distServer = await startStaticDistServer();
+    const context = await browser.newContext();
+
+    try {
+      const harness = await createExtensionHarness({
+        context,
+        distBaseUrl: distServer.baseUrl,
+        fixtureServer,
+        driveServer,
+        initialTabs: [
+          { tabId: 201, url: `${fixtureServer.baseUrl}/articles/zhihu-unread` },
+          { tabId: 202, url: `${fixtureServer.baseUrl}/articles/year-2026` },
+        ],
+      });
+
+      // Tab 201: Zhihu unread prefix stripped cleanly
+      harness.setActiveTab(201);
+      const popup1 = await harness.openPopup();
+      await expect(popup1.page.locator('#title-input')).toHaveValue(
+        '华硕 ProArt 显示器色彩评测',
+      );
+      await expect(popup1.page.locator('#folder-preview')).toContainText(
+        '-华硕-proart-显示器色彩评测',
+      );
+      await expect(popup1.page.locator('#folder-preview')).not.toContainText('私信');
+
+      await popup1.page.locator('#clip-submit-btn').click();
+      await expect(
+        popup1.page.locator('#clip-queue-list .queue-item').first(),
+      ).toHaveAttribute('data-status', 'done', { timeout: 15_000 });
+      await popup1.page.close();
+
+      // Tab 202: (2026) preserved intact
+      harness.setActiveTab(202);
+      const popup2 = await harness.openPopup();
+      await expect(popup2.page.locator('#title-input')).toHaveValue(
+        '(2026) Annual Systems Architecture Report',
+      );
+      await expect(popup2.page.locator('#folder-preview')).toContainText(
+        '-2026-annual-systems-architecture-report',
+      );
+
+      await popup2.page.locator('#clip-submit-btn').click();
+      await expect(
+        popup2.page.locator('#clip-queue-list .queue-item[data-status="done"]'),
+      ).toHaveCount(2, { timeout: 15_000 });
+      await popup2.page.close();
+
+      const folderNames = driveServer.folderCreations.map((f) => f.name);
+      expect(folderNames).toEqual([
+        'WebClips',
+        expect.stringMatching(/^\d{4}-\d{2}-\d{2}-华硕-proart-显示器色彩评测$/),
+        expect.stringMatching(/^\d{4}-\d{2}-\d{2}-2026-annual-systems-architecture-report$/),
+      ]);
+
+      const readmes = driveServer.uploads
+        .filter((u) => u.metadata.name === 'README.md')
+        .map((u) => u.contentBytes.toString('utf8'));
+      expect(readmes).toHaveLength(2);
+      expect(readmes[0]).toContain('title: "华硕 ProArt 显示器色彩评测"');
+      expect(readmes[0]).not.toContain('20 封私信');
+      expect(readmes[1]).toContain('title: "(2026) Annual Systems Architecture Report"');
+
+      expect(popup1.consoleErrors).toEqual([]);
+      expect(popup1.pageErrors).toEqual([]);
+      expect(popup2.consoleErrors).toEqual([]);
+      expect(popup2.pageErrors).toEqual([]);
+      expect(harness.swErrors).toEqual([]);
+      expect(harness.getAllArticleErrors()).toEqual([]);
+
+      await harness.close();
+    } finally {
+      await context.close();
+      await Promise.all([
+        fixtureServer.close(),
+        driveServer.close(),
+        distServer.close(),
+      ]);
+    }
+  });
+
+  test('runs multi-tab background Clip queue concurrently with single-flight WebClips creation, non-colliding DNR Referers, >4.5MB resumable upload, per-image upload failure fallback, live Popup Process List UI, and captures screenshot', async ({
+    browser,
+  }) => {
+    mkdirSync(SCREENSHOT_DIR, { recursive: true });
+
+    const tab3UploadGate = createGate();
+    const tab4DownloadGate = createGate();
+    let gateTab4Downloads = false;
+
+    const fixtureServer = await startFixtureServer({
+      beforeImageResponse: async (pathname) => {
+        if (gateTab4Downloads && pathname === '/media/queue-4-protected.jpg') {
+          await tab4DownloadGate.promise;
+        }
+      },
+    });
+    const driveServer = await startMockDriveServer({
+      failUploadNames: {
+        '02-queue-3-upload-fail.png': {
+          status: 400,
+          message: 'Simulated Drive upload rejection',
+        },
+      },
+      beforeUpload: async (name) => {
+        if (name === '01-queue-3-protected.jpg') {
+          await tab3UploadGate.promise;
+        }
+      },
+    });
+    const distServer = await startStaticDistServer();
+    const context = await browser.newContext();
+
+    try {
+      const harness = await createExtensionHarness({
+        context,
+        distBaseUrl: distServer.baseUrl,
+        fixtureServer,
+        driveServer,
+        initialTabs: [
+          { tabId: 301, url: `${fixtureServer.baseUrl}/articles/queue-1` },
+          { tabId: 302, url: `${fixtureServer.baseUrl}/articles/queue-2` },
+          { tabId: 303, url: `${fixtureServer.baseUrl}/articles/queue-3` },
+          { tabId: 304, url: `${fixtureServer.baseUrl}/articles/queue-4` },
+          { tabId: 305, url: `${fixtureServer.baseUrl}/articles/queue-5` },
+          { tabId: 306, url: `${fixtureServer.baseUrl}/articles/queue-6` },
+        ],
+      });
+
+      fixtureServer.imageRequests.length = 0;
+
+      // 1. Enqueue Tab 302 (done + >4.5 MiB resumable upload) and Tab 301 (done + Zhihu cleaned title + 404 warning) concurrently!
+      // Starting 302 slightly ahead places Tab 301 (with its warning badge) directly visible in the top 4 rows of the Process List.
+      const start2 = (await harness.sendToServiceWorker({
+        type: 'START_CLIP',
+        request: { tabId: 302, mode: 'full' },
+      })) as { ok: boolean; data?: { id: string; status: string } };
+      const start1 = (await harness.sendToServiceWorker({
+        type: 'START_CLIP',
+        request: { tabId: 301, mode: 'full' },
+      })) as { ok: boolean; data?: { id: string; status: string } };
+      expect(start1.ok).toBe(true);
+      expect(start2.ok).toBe(true);
+
+      // Wait until both Tab 301 and Tab 302 reach 'done'
+      await expect
+        .poll(
+          async () => {
+            const res = (await harness.sendToServiceWorker({
+              type: 'GET_CLIP_JOBS',
+            })) as { ok: boolean; data: Array<{ status: string }> };
+            return res.data.filter((j) => j.status === 'done').length;
+          },
+          { timeout: 20_000 },
+        )
+        .toBe(2);
+
+      // 2. Arm Tab 304 download gate now (after initial page loads finished), then enqueue
+      // Tab 303 (held in 'uploading'), Tab 304 (held in 'downloading'), and Tab 305 ('queued' behind maxConcurrentJobs=2)!
+      gateTab4Downloads = true;
+      for (const tabId of [303, 304, 305]) {
+        const res = (await harness.sendToServiceWorker({
+          type: 'START_CLIP',
+          request: { tabId, mode: 'full' },
+        })) as { ok: boolean };
+        expect(res.ok).toBe(true);
+      }
+
+      // Wait until exact multi-state queue snapshot is reached: 1 uploading, 1 downloading, 1 queued, 2 done
+      await expect
+        .poll(
+          async () => {
+            const res = (await harness.sendToServiceWorker({
+              type: 'GET_CLIP_JOBS',
+            })) as { ok: boolean; data: Array<{ status: string }> };
+            const counts: Record<string, number> = {};
+            for (const job of res.data) {
+              counts[job.status] = (counts[job.status] ?? 0) + 1;
+            }
+            return counts;
+          },
+          { timeout: 15_000 },
+        )
+        .toEqual({
+          done: 2,
+          uploading: 1,
+          downloading: 1,
+          queued: 1,
+        });
+
+      // 3. Reopen Popup on active Tab 303 (already clipping) -> verify hydration + duplicate-active-URL guard
+      harness.setActiveTab(303);
+      const popupTab3 = await harness.openPopup();
+      await expect(popupTab3.page.locator('#clip-submit-btn')).toBeDisabled();
+      await expect(popupTab3.page.locator('#clip-submit-hint')).toHaveText(
+        'Already clipping this page',
+      );
+      await expect(popupTab3.page.locator('#clip-queue-summary')).toHaveText(
+        '2 running · 1 queued',
+      );
+      await popupTab3.page.close();
+
+      // 4. Switch to unclipped Tab 306 & reopen Popup -> button is immediately enabled AND full 5-job Process List renders cleanly at 360px!
+      harness.setActiveTab(306);
+      const popupLive = await harness.openPopup();
+      await expect(popupLive.page.locator('#clip-submit-btn')).toBeEnabled();
+      await expect(popupLive.page.locator('#clip-queue-panel')).toBeVisible();
+      await expect(popupLive.page.locator('#clip-queue-summary')).toHaveText(
+        '2 running · 1 queued',
+      );
+      await expect(popupLive.page.locator('#clear-done-jobs-btn')).toBeVisible();
+      await expect(popupLive.page.locator('#clip-queue-list .queue-item')).toHaveCount(5);
+
+      await expect(
+        popupLive.page.locator('#clip-queue-list .queue-item[data-status="queued"]'),
+      ).toHaveCount(1);
+      await expect(
+        popupLive.page.locator('#clip-queue-list .queue-item[data-status="downloading"]'),
+      ).toHaveCount(1);
+      await expect(
+        popupLive.page.locator('#clip-queue-list .queue-item[data-status="uploading"]'),
+      ).toHaveCount(1);
+      await expect(
+        popupLive.page.locator('#clip-queue-list .queue-item[data-status="done"]'),
+      ).toHaveCount(2);
+
+      // Verify zero horizontal overflow at 360px width
+      const liveOverflow = await popupLive.page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(liveOverflow).toBeLessThanOrEqual(0);
+
+      // Capture full-window Popup screenshot showing active + queued + done + warning rows!
+      const queueScreenshotPath = path.join(SCREENSHOT_DIR, 'popup-multitab-queue.png');
+      await popupLive.page.screenshot({ path: queueScreenshotPath, fullPage: true });
+      expect(statSync(queueScreenshotPath).size).toBeGreaterThan(0);
+
+      // 5. Release both gates -> verify live CLIP_JOBS_UPDATED pushes drive all 5 jobs to 'done' without reopening Popup
+      tab3UploadGate.release();
+      tab4DownloadGate.release();
+
+      await expect(
+        popupLive.page.locator('#clip-queue-list .queue-item[data-status="done"]'),
+      ).toHaveCount(5, { timeout: 25_000 });
+      await expect(popupLive.page.locator('#clip-queue-summary')).toHaveText('5 saved');
+      await expect(popupLive.page.locator('#recent-clips-count')).toHaveText('5');
+
+      // 6. Verify single-flight ensureRootFolder: ONLY ONE 'WebClips' root folder created across 5 concurrent clips!
+      const rootFolders = driveServer.folderCreations.filter((f) => f.name === 'WebClips');
+      expect(rootFolders).toHaveLength(1);
+
+      // 7. Verify non-colliding DNR Referer rules across all 5 same-origin tabs
+      expect(harness.dnrRuleIdCollisions).toEqual([]);
+      expect(harness.activeDnrRules.size).toBe(0);
+      for (let i = 1; i <= 5; i += 1) {
+        const hits = fixtureServer.imageRequests.filter(
+          (r) => r.path === `/media/queue-${i}-protected.jpg` && r.status === 200,
+        );
+        expect(hits, `Tab ${i} protected image must succeed with its own Referer`).toHaveLength(1);
+        expect(hits[0].referer).toBe(`${fixtureServer.baseUrl}/articles/queue-${i}`);
+      }
+
+      // 8. Verify > 4.5 MiB image on Tab 302 used uploadType=resumable with exact intact bytes
+      const largeUpload = driveServer.uploads.find(
+        (u) => u.metadata.name === '02-queue-2-large.png',
+      );
+      expect(largeUpload).toBeDefined();
+      expect(largeUpload!.uploadType).toBe('resumable');
+      expect(largeUpload!.declaredContentLength).toBe(LARGE_RESUMABLE_PNG_BYTES.byteLength);
+      expect(largeUpload!.contentBytes.equals(LARGE_RESUMABLE_PNG_BYTES)).toBe(true);
+
+      // Small images stayed on multipart
+      const smallProtectedUpload = driveServer.uploads.find(
+        (u) => u.metadata.name === '01-queue-1-protected.jpg',
+      );
+      expect(smallProtectedUpload?.uploadType).toBe('multipart');
+
+      // 9. Verify per-image Drive upload failure on Tab 303 degraded gracefully AND still uploaded README.md with warning!
+      const tab3Readme = driveServer.uploads.find(
+        (u) =>
+          u.metadata.name === 'README.md' &&
+          u.contentBytes.toString('utf8').includes('Resilient Drive Upload Fallback Guide'),
+      );
+      expect(tab3Readme).toBeDefined();
+      const tab3ReadmeText = tab3Readme!.contentBytes.toString('utf8');
+      expect(tab3ReadmeText).toContain('./images/01-queue-3-protected.jpg');
+      expect(tab3ReadmeText).toContain(`${fixtureServer.baseUrl}/media/queue-3-upload-fail.png`);
+      expect(tab3ReadmeText).toContain('warnings:');
+      expect(tab3ReadmeText).toContain('Simulated Drive upload rejection');
+
+      // 10. Verify unified toolbar badge transitioned through active counts -> green OK
+      expect(
+        harness.badgeUpdates.some((b) => b.text === '2' || b.text === '3'),
+      ).toBe(true);
+      expect(
+        harness.badgeUpdates.some((b) => b.text === 'OK' && b.color === '#16a34a'),
+      ).toBe(true);
+
+      // 11. Verify single-job dismiss and Clear done in Popup UI
+      await popupLive.page.locator('#clip-queue-list [data-dismiss-job]').first().click();
+      await expect(popupLive.page.locator('#clip-queue-list .queue-item')).toHaveCount(4);
+
+      await popupLive.page.locator('#clear-done-jobs-btn').click();
+      await expect(popupLive.page.locator('#clip-queue-panel')).toBeHidden();
+
+      // Assert zero console/page errors across all pages
+      expect(popupTab3.consoleErrors).toEqual([]);
+      expect(popupTab3.pageErrors).toEqual([]);
+      expect(popupLive.consoleErrors).toEqual([]);
+      expect(popupLive.pageErrors).toEqual([]);
+      expect(harness.swErrors).toEqual([]);
+      expect(harness.getAllArticleErrors()).toEqual([]);
+
+      await harness.close();
+    } finally {
+      tab3UploadGate.release();
+      tab4DownloadGate.release();
+      await context.close();
+      await Promise.all([
+        fixtureServer.close(),
+        driveServer.close(),
+        distServer.close(),
+      ]);
+    }
+  });
+
+  test('keeps image filenames deterministic when an earlier image fails/recovers and avoids PATCH collisions when a new image is prepended on re-clip', async ({
+    browser,
+  }) => {
+    const fixtureServer = await startFixtureServer();
+    const driveServer = await startMockDriveServer();
+    const distServer = await startStaticDistServer();
+    const context = await browser.newContext();
+
+    try {
+      const harness = await createExtensionHarness({
+        context,
+        distBaseUrl: distServer.baseUrl,
+        fixtureServer,
+        driveServer,
+        initialTabs: [
+          { tabId: 401, url: `${fixtureServer.baseUrl}/articles/shift-proof` },
+        ],
+        ignoredConsoleUrls: [`${fixtureServer.baseUrl}/media/first/photo.png`],
+      });
+
+      const waitForAllDone = async (expectedCount: number) => {
+        await expect
+          .poll(
+            async () => {
+              const res = (await harness.sendToServiceWorker({
+                type: 'GET_CLIP_JOBS',
+              })) as { ok: boolean; data: Array<{ status: string }> };
+              return res.data.filter((j) => j.status === 'done').length;
+            },
+            { timeout: 15_000 },
+          )
+          .toBe(expectedCount);
+      };
+
+      // Run 1: image #1 fails (HTTP 500), image #2 succeeds -> MUST keep index 02 (`02-diagram.png`)!
+      fixtureServer.state.shiftFirstImageStatus = 500;
+      fixtureServer.state.shiftArticleVariant = 'run1';
+      await harness.sendToServiceWorker({
+        type: 'START_CLIP',
+        request: { tabId: 401, mode: 'full' },
+      });
+      await waitForAllDone(1);
+
+      const imagesFolder = driveServer.folderCreations.find((f) => f.name === 'images')!;
+      const run1ImageFiles = Array.from(driveServer.files.values()).filter((f) =>
+        f.parents.includes(imagesFolder.id),
+      );
+      expect(run1ImageFiles.map((f) => f.name)).toEqual(['02-diagram.png']);
+      const secondImgFileId = run1ImageFiles[0].id;
+
+      // Run 2: image #1 recovers (HTTP 200) -> image #1 gets `01-photo.png` (POST), image #2 PATCHes `02-diagram.png` in place (same fileId, zero duplicates)!
+      fixtureServer.state.shiftFirstImageStatus = 200;
+      await harness.sendToServiceWorker({
+        type: 'START_CLIP',
+        request: { tabId: 401, mode: 'full' },
+      });
+      await waitForAllDone(2);
+
+      const run2ImageFiles = Array.from(driveServer.files.values()).filter((f) =>
+        f.parents.includes(imagesFolder.id),
+      );
+      expect(run2ImageFiles.map((f) => f.name).sort()).toEqual([
+        '01-photo.png',
+        '02-diagram.png',
+      ]);
+      const run2Second = run2ImageFiles.find((f) => f.name === '02-diagram.png')!;
+      expect(run2Second.id).toBe(secondImgFileId);
+      const originalFirstFileId = run2ImageFiles.find((f) => f.name === '01-photo.png')!.id;
+
+      // Run 3: a brand-new image (`/media/prepend/photo.png`) is prepended as `01-photo.png`,
+      // shifting original `/media/first/photo.png` to `02-photo.png` and diagram to `03-diagram.png`!
+      // All 3 distinct images MUST exist in Drive without PATCH colliding on `originalFirstFileId`!
+      fixtureServer.state.shiftArticleVariant = 'run3-prepended';
+      await harness.tabsById.get(401)!.page.reload({ waitUntil: 'networkidle' });
+      await harness.sendToServiceWorker({
+        type: 'START_CLIP',
+        request: { tabId: 401, mode: 'full' },
+      });
+      await waitForAllDone(3);
+
+      const run3ImageFiles = Array.from(driveServer.files.values()).filter((f) =>
+        f.parents.includes(imagesFolder.id),
+      );
+      expect(run3ImageFiles.map((f) => f.name).sort()).toEqual([
+        '01-photo.png',
+        '02-photo.png',
+        '03-diagram.png',
+      ]);
+      // Original first photo was renamed/PATCHed in place to 02-photo.png; prepended photo got a distinct fileId!
+      const shiftedFirst = run3ImageFiles.find((f) => f.name === '02-photo.png')!;
+      const prependedFirst = run3ImageFiles.find((f) => f.name === '01-photo.png')!;
+      expect(shiftedFirst.id).toBe(originalFirstFileId);
+      expect(prependedFirst.id).not.toBe(originalFirstFileId);
+      expect(prependedFirst.content?.toString('utf8')).toContain('PREPENDED');
+      expect(shiftedFirst.content?.toString('utf8')).toContain('FIRST');
+
+      expect(harness.swErrors).toEqual([]);
+      expect(harness.getAllArticleErrors()).toEqual([]);
 
       await harness.close();
     } finally {
