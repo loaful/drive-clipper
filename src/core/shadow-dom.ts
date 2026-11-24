@@ -258,7 +258,6 @@ export function flattenShadowDom(
     sourceDoc.title || '',
   );
 
-  // Set <base href> in head if sourceDoc has a URL so relative links remain resolvable.
   const state: FlattenState = {
     targetDoc,
     deadline: now() + timeoutMs,

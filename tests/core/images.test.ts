@@ -47,6 +47,56 @@ describe('isTrackingPixel', () => {
     expect(isTrackingPixel(doc.getElementById('divider')!)).toBe(false);
     expect(isTrackingPixel(doc.getElementById('broken-404')!)).toBe(false);
   });
+
+  it('does not delete a lazy-loaded image whose SVG/GIF placeholder decoded to 1x1 natural dimensions', () => {
+    const doc = createDoc(`
+      <article>
+        <img id="lazy-1x1-svg"
+          src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'/%3E"
+          ${LIVE_IMG_ATTRS.currentSrc}="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'/%3E"
+          ${LIVE_IMG_ATTRS.naturalWidth}="1"
+          ${LIVE_IMG_ATTRS.naturalHeight}="1"
+          data-src="/img/lazy.webp"
+          alt="Lazy Photo">
+        <img id="lazy-1x1-gif"
+          src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+          ${LIVE_IMG_ATTRS.naturalWidth}="1"
+          ${LIVE_IMG_ATTRS.naturalHeight}="1"
+          data-original="/img/lazy-gif.png"
+          alt="Lazy Gif">
+        <img id="real-1x1-tracker"
+          src="https://track.example.com/pixel.gif"
+          ${LIVE_IMG_ATTRS.naturalWidth}="1"
+          ${LIVE_IMG_ATTRS.naturalHeight}="1">
+      </article>
+    `);
+
+    expect(isTrackingPixel(doc.getElementById('lazy-1x1-svg')!)).toBe(false);
+    expect(isTrackingPixel(doc.getElementById('lazy-1x1-gif')!)).toBe(false);
+    expect(isTrackingPixel(doc.getElementById('real-1x1-tracker')!)).toBe(true);
+
+    const meta = resolveDomImages(doc, BASE_URL);
+
+    expect(doc.getElementById('lazy-1x1-svg')?.getAttribute('src')).toBe(
+      'https://blog.example.com/img/lazy.webp',
+    );
+    expect(doc.getElementById('lazy-1x1-gif')?.getAttribute('src')).toBe(
+      'https://blog.example.com/img/lazy-gif.png',
+    );
+    expect(doc.getElementById('real-1x1-tracker')).toBeNull();
+
+    // Placeholder's 1x1 natural dimensions must not leak into DomImageMetadata
+    expect(meta.get('https://blog.example.com/img/lazy.webp')).toEqual({
+      alt: 'Lazy Photo',
+      width: undefined,
+      height: undefined,
+    });
+    expect(meta.get('https://blog.example.com/img/lazy-gif.png')).toEqual({
+      alt: 'Lazy Gif',
+      width: undefined,
+      height: undefined,
+    });
+  });
 });
 
 describe('resolveDomImages', () => {
@@ -219,6 +269,31 @@ describe('discoverImagesFromMarkdown & rewriteMarkdownImageUrls', () => {
     expect(rewritten.rewrittenCount).toBe(2);
     expect(rewritten.markdown).toBe(
       'Chart: ![Chart](./images/01-render.png) and again ![Chart 2](./images/01-render.png)',
+    );
+  });
+
+  it('ignores data-src and data-alt when parsing inline HTML <img> tags in Markdown', () => {
+    const md =
+      '<img data-src="https://wrong.example.com/ignored.png" src="https://cdn.example.com/real.png" data-alt="Wrong Alt" alt="Real Alt">';
+
+    const discovered = discoverImagesFromMarkdown(md, BASE_URL);
+    expect(discovered).toHaveLength(1);
+    expect(discovered[0]).toMatchObject({
+      resolvedUrl: 'https://cdn.example.com/real.png',
+      alt: 'Real Alt',
+    });
+
+    const rewritten = rewriteMarkdownImageUrls(md, BASE_URL, [
+      {
+        resolvedUrl: discovered[0].resolvedUrl,
+        originalUrl: discovered[0].originalUrl,
+        sourceUrls: discovered[0].sourceUrls,
+        filename: '01-real.png',
+      },
+    ]);
+    expect(rewritten.rewrittenCount).toBe(1);
+    expect(rewritten.markdown).toBe(
+      '<img data-src="https://wrong.example.com/ignored.png" src="./images/01-real.png" data-alt="Wrong Alt" alt="Real Alt">',
     );
   });
 });

@@ -221,13 +221,31 @@ function getLiveNaturalDimensions(img: Element): { width: number | null; height:
   return { width: w, height: h };
 }
 
+function hasNonPlaceholderLazyCandidate(img: Element): boolean {
+  for (const attr of LAZY_SRC_ATTRS) {
+    if (!isPlaceholderImageUrl(img.getAttribute(attr))) {
+      return true;
+    }
+  }
+  for (const attr of LAZY_SRCSET_ATTRS) {
+    if (selectBestSrcsetUrl(img.getAttribute(attr)) !== null) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Returns true if an `<img>` is a 1px tracking pixel based on explicit HTML/CSS
  * dimensions or known live natural dimensions. Broken/unloaded images (where
- * natural dimensions are 0/unknown and no explicit <=1px size is declared) are
- * never misclassified as tracking pixels.
+ * natural dimensions are 0/unknown and no explicit <=1px size is declared) and
+ * lazy-loaded images whose placeholder decoded to 1x1 are never misclassified
+ * as tracking pixels.
  */
-export function isTrackingPixel(img: Element): boolean {
+export function isTrackingPixel(
+  img: Element,
+  options?: { ignoreLiveNaturalDimensions?: boolean },
+): boolean {
   const explicit = getExplicitDimensions(img);
   if (explicit.width !== null || explicit.height !== null) {
     const w = explicit.width;
@@ -243,25 +261,35 @@ export function isTrackingPixel(img: Element): boolean {
     }
   }
 
-  const natural = getLiveNaturalDimensions(img);
-  if (
-    natural.width !== null &&
-    natural.height !== null &&
-    natural.width <= 1 &&
-    natural.height <= 1
-  ) {
-    return true;
+  const ignoreLiveNatural =
+    options?.ignoreLiveNaturalDimensions ??
+    (isPlaceholderImageUrl(img.getAttribute('src')) &&
+      hasNonPlaceholderLazyCandidate(img));
+
+  if (!ignoreLiveNatural) {
+    const natural = getLiveNaturalDimensions(img);
+    if (
+      natural.width !== null &&
+      natural.height !== null &&
+      natural.width <= 1 &&
+      natural.height <= 1
+    ) {
+      return true;
+    }
   }
 
   return false;
 }
 
-/**
- * Resolves the real download URL for an `<img>` element, checking live `currentSrc`,
- * lazy-load attributes (`data-src`, `data-original`, `data-lazy-src`, `data-srcset`),
- * `srcset`, and `src`, while rejecting SVG/blank placeholders.
- */
-export function resolveImageElementUrl(img: Element, baseUrl: string): string | null {
+interface ResolvedImageElement {
+  url: string | null;
+  usedLazyOverride: boolean;
+}
+
+function resolveImageElementDetails(
+  img: Element,
+  baseUrl: string,
+): ResolvedImageElement {
   const rawSrc = img.getAttribute('src') ?? '';
   const normalizedSrc = normalizeImageUrl(rawSrc, baseUrl);
 
@@ -292,24 +320,33 @@ export function resolveImageElementUrl(img: Element, baseUrl: string): string | 
   // Prefer an explicit lazy attribute when `src` is a placeholder or differs from the lazy URL
   // (e.g. Chromium populates `currentSrc` with the SVG or LQIP placeholder already in `src`).
   if (lazyResolved && (isPlaceholderImageUrl(rawSrc) || lazyResolved !== normalizedSrc)) {
-    return lazyResolved;
+    return { url: lazyResolved, usedLazyOverride: true };
   }
 
   // Otherwise prefer browser-resolved `currentSrc` (covers `<picture>` / responsive `srcset`).
   if (normalizedCurrentSrc) {
-    return normalizedCurrentSrc;
+    return { url: normalizedCurrentSrc, usedLazyOverride: false };
   }
 
   if (lazyResolved) {
-    return lazyResolved;
+    return { url: lazyResolved, usedLazyOverride: true };
   }
 
   const srcsetBest = normalizeImageUrl(selectBestSrcsetUrl(img.getAttribute('srcset')), baseUrl);
   if (srcsetBest) {
-    return srcsetBest;
+    return { url: srcsetBest, usedLazyOverride: false };
   }
 
-  return normalizedSrc;
+  return { url: normalizedSrc, usedLazyOverride: false };
+}
+
+/**
+ * Resolves the real download URL for an `<img>` element, checking live `currentSrc`,
+ * lazy-load attributes (`data-src`, `data-original`, `data-lazy-src`, `data-srcset`),
+ * `srcset`, and `src`, while rejecting SVG/blank placeholders.
+ */
+export function resolveImageElementUrl(img: Element, baseUrl: string): string | null {
+  return resolveImageElementDetails(img, baseUrl).url;
 }
 
 /**
@@ -324,14 +361,20 @@ export function resolveDomImages(
   const images = Array.from(root.querySelectorAll('img'));
 
   for (const img of images) {
-    if (isTrackingPixel(img)) {
+    const rawSrc = img.getAttribute('src') ?? '';
+    const { url: resolvedUrl, usedLazyOverride } = resolveImageElementDetails(
+      img,
+      baseUrl,
+    );
+    const ignoreLiveNatural =
+      usedLazyOverride || (resolvedUrl !== null && isPlaceholderImageUrl(rawSrc));
+
+    if (isTrackingPixel(img, { ignoreLiveNaturalDimensions: ignoreLiveNatural })) {
       img.remove();
       continue;
     }
 
-    const resolvedUrl = resolveImageElementUrl(img, baseUrl);
     if (!resolvedUrl) {
-      const rawSrc = img.getAttribute('src') ?? '';
       if (isPlaceholderImageUrl(rawSrc)) {
         img.remove();
       }
@@ -339,7 +382,9 @@ export function resolveDomImages(
     }
 
     const explicit = getExplicitDimensions(img);
-    const natural = getLiveNaturalDimensions(img);
+    const natural = ignoreLiveNatural
+      ? { width: null, height: null }
+      : getLiveNaturalDimensions(img);
     const width = natural.width ?? explicit.width ?? undefined;
     const height = natural.height ?? explicit.height ?? undefined;
     const alt = (img.getAttribute('alt') ?? '').trim();
@@ -533,7 +578,7 @@ function parseHtmlImgAt(markdown: string, start: number): MarkdownImageMatch | n
 
   const end = pos + 1;
   const rawMatch = markdown.slice(start, end);
-  const srcAttrMatch = /\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(rawMatch);
+  const srcAttrMatch = /(?<![-\w])src\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(rawMatch);
   if (!srcAttrMatch) {
     return null;
   }
@@ -542,11 +587,12 @@ function parseHtmlImgAt(markdown: string, start: number): MarkdownImageMatch | n
     return null;
   }
 
-  const valueOffsetInAttr = srcAttrMatch[0].indexOf(rawUrl);
+  const quoteOffset = srcAttrMatch[0].search(/["']/);
+  const valueOffsetInAttr = srcAttrMatch[0].indexOf(rawUrl, quoteOffset + 1);
   const htmlSrcValueStart = srcAttrMatch.index + valueOffsetInAttr;
   const htmlSrcValueEnd = htmlSrcValueStart + rawUrl.length;
 
-  const altAttrMatch = /\balt\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(rawMatch);
+  const altAttrMatch = /(?<![-\w])alt\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(rawMatch);
   const alt = (altAttrMatch?.[1] ?? altAttrMatch?.[2] ?? '').trim();
 
   return {
