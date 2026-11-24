@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Drive Clipper — Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="options-page" data-app="options">
+      <header class="page-header">
+        <div class="brand">
+          <svg class="brand-mark" viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="21" height="21" rx="6" fill="currentColor" />
+            <path d="M7 5.5h6.5L17 9v9.5a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z" fill="#ffffff" />
+            <path d="M13.5 5.5V8a1 1 0 0 0 1 1H17l-3.5-3.5Z" fill="#bfdbfe" />
+            <rect x="8.2" y="11" width="5.6" height="1.5" rx="0.75" fill="#2563eb" />
+            <rect x="8.2" y="14" width="6.8" height="1.5" rx="0.75" fill="#94a3b8" />
+          </svg>
+          <div>
+            <h1 class="page-title">Drive Clipper Settings</h1>
+            <p class="page-subtitle">
+              Manage Google Drive authentication, root folder tracking, default tags, and Markdown frontmatter.
+            </p>
+          </div>
+        </div>
+      </header>
+
+      <section class="card" aria-labelledby="auth-heading">
+        <div class="card-header">
+          <div>
+            <h2 id="auth-heading" class="card-title">Google Drive Account</h2>
+            <p class="card-description">
+              Authenticates through <code>chrome.identity</code> using only the minimal
+              <code>drive.file</code> scope.
+            </p>
+          </div>
+          <span id="auth-status-badge" class="status-pill status-pill--neutral" data-status="loading">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="auth-status-text">Checking...</span>
+          </span>
+        </div>
+
+        <div id="oauth-unconfigured-callout" class="callout callout--warn" hidden>
+          <p class="callout-title">Google OAuth Client ID is not configured</p>
+          <p class="callout-body">
+            This unpacked build still has the placeholder <code>client_id</code>. Copy
+            <code>config.local.example.json</code> to <code>config.local.json</code>, add your Chrome
+            Extension OAuth Client ID, run <code>npm run build</code>, and reload the extension in
+            <code>chrome://extensions</code>.
+          </p>
+        </div>
+
+        <div class="auth-meta-row">
+          <div class="meta-item">
+            <span class="meta-label">OAuth Scope</span>
+            <code class="meta-code">https://www.googleapis.com/auth/drive.file</code>
+          </div>
+        </div>
+
+        <div class="button-row">
+          <button type="button" id="sign-in-btn" class="btn btn--primary" hidden>
+            Sign in with Google
+          </button>
+          <button type="button" id="sign-out-btn" class="btn btn--secondary" hidden>
+            Sign out
+          </button>
+          <button type="button" id="reauth-btn" class="btn btn--ghost" hidden>
+            Sign out &amp; Re-auth
+          </button>
+        </div>
+
+        <p id="auth-feedback" class="feedback" hidden aria-live="polite"></p>
+      </section>
+
+      <section class="card" aria-labelledby="folder-heading">
+        <div class="card-header">
+          <div>
+            <h2 id="folder-heading" class="card-title">Root Folder</h2>
+            <p class="card-description">
+              Every clipped page creates a dated subfolder (<code>YYYY-MM-DD-&lt;slug&gt;</code>) inside this
+              extension-owned Drive folder.
+            </p>
+          </div>
+        </div>
+
+        <div class="field-grid">
+          <div class="field">
+            <label for="root-folder-name-input" class="field-label">Folder name</label>
+            <div class="input-action-row">
+              <input
+                id="root-folder-name-input"
+                type="text"
+                class="text-input"
+                placeholder="WebClips"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button type="button" id="create-switch-folder-btn" class="btn btn--secondary">
+                Create / Switch Folder
+              </button>
+            </div>
+          </div>
+
+          <div class="folder-id-panel">
+            <div class="folder-id-info">
+              <span class="meta-label">Persisted Root Folder ID</span>
+              <code id="root-folder-id-value" class="folder-id-code" data-testid="root-folder-id">
+                Not created yet
+              </code>
+            </div>
+            <a
+              id="open-root-folder-link"
+              class="btn btn--ghost btn--sm"
+              href="#"
+              target="_blank"
+              rel="noopener noreferrer"
+              hidden
+            >
+              <span>Open in Drive</span>
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M6.5 3.5h6v6m0-6-8 8" />
+              </svg>
+            </a>
+          </div>
+        </div>
+
+        <div class="callout callout--info" id="drive-file-note">
+          <p class="callout-title">Moving or renaming your folder in Google Drive</p>
+          <p class="callout-body">
+            Because Google Drive tracks folders by ID under the <code>drive.file</code> scope, you can freely
+            move or rename <strong>WebClips</strong> anywhere inside Google Drive without breaking future
+            clips. Use <strong>Create / Switch Folder</strong> only if you want to start saving into a brand
+            new extension-owned folder.
+          </p>
+        </div>
+
+        <p id="folder-feedback" class="feedback" hidden aria-live="polite"></p>
+      </section>
+
+      <form id="preferences-form" class="card" aria-labelledby="preferences-heading" novalidate>
+        <div class="card-header">
+          <div>
+            <h2 id="preferences-heading" class="card-title">Default Tags &amp; Frontmatter</h2>
+            <p class="card-description">
+              Choose default tags seeded into each clip and which metadata fields appear in YAML frontmatter.
+            </p>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="default-tags-input" class="field-label">Default tags</label>
+          <div id="default-tags-container" class="tag-input-box">
+            <input
+              id="default-tags-input"
+              type="text"
+              class="tag-text-input"
+              placeholder="Add default tags (comma or Enter)..."
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+          <p class="field-help">Press Enter or comma to add a tag. Click × or press Backspace to remove.</p>
+        </div>
+
+        <fieldset class="toggle-group">
+          <legend class="field-label">YAML frontmatter fields</legend>
+
+          <label class="toggle-row" for="fm-include-author">
+            <span class="toggle-copy">
+              <span class="toggle-title">Include author</span>
+              <span class="toggle-desc">Adds the extracted <code>author</code> field when available.</span>
+            </span>
+            <input id="fm-include-author" type="checkbox" class="toggle-input" />
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
+
+          <label class="toggle-row" for="fm-include-published">
+            <span class="toggle-copy">
+              <span class="toggle-title">Include published date</span>
+              <span class="toggle-desc">Adds the article <code>published</code> timestamp.</span>
+            </span>
+            <input id="fm-include-published" type="checkbox" class="toggle-input" />
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
+
+          <label class="toggle-row" for="fm-include-site">
+            <span class="toggle-copy">
+              <span class="toggle-title">Include site name</span>
+              <span class="toggle-desc">Adds the publisher or domain name as <code>site</code>.</span>
+            </span>
+            <input id="fm-include-site" type="checkbox" class="toggle-input" />
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
+
+          <label class="toggle-row" for="fm-include-images">
+            <span class="toggle-copy">
+              <span class="toggle-title">Include local images list</span>
+              <span class="toggle-desc">Lists uploaded <code>./images/*</code> filenames in <code>images</code>.</span>
+            </span>
+            <input id="fm-include-images" type="checkbox" class="toggle-input" />
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
+
+          <label class="toggle-row" for="fm-include-warnings">
+            <span class="toggle-copy">
+              <span class="toggle-title">Include fallback warnings</span>
+              <span class="toggle-desc">Records a <code>warnings</code> list if any image falls back to its remote URL.</span>
+            </span>
+            <input id="fm-include-warnings" type="checkbox" class="toggle-input" />
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
+        </fieldset>
+
+        <div class="card-footer">
+          <p id="preferences-feedback" class="feedback" hidden aria-live="polite"></p>
+          <button type="submit" id="save-preferences-btn" class="btn btn--primary">
+            Save preferences
+          </button>
+        </div>
+      </form>
+    </main>
+
+    <script src="options.js" defer></script>
+  </body>
+</html>
