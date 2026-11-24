@@ -1340,6 +1340,41 @@ export class DriveClient {
             byImageUrl: new Map<string, string>(),
           };
 
+      // Pre-resolve existing file IDs in two passes before spawning workers so an
+      // image matched by `appProperties.imageUrl` always claims its Drive file ID
+      // first, preventing a newly prepended image with the old filename from
+      // falling back to `byName` and PATCHing the same file ID concurrently.
+      const encodedImageUrls = await Promise.all(
+        params.fetchedImages.map((image) =>
+          encodeSourceUrlProperty(image.resolvedUrl),
+        ),
+      );
+      const resolvedExistingFileIds = new Array<string | undefined>(
+        params.fetchedImages.length,
+      );
+      const claimedFileIds = new Set<string>();
+
+      for (let i = 0; i < params.fetchedImages.length; i += 1) {
+        const matchedByUrl = existingFiles.byImageUrl.get(encodedImageUrls[i]);
+        if (matchedByUrl && !claimedFileIds.has(matchedByUrl)) {
+          resolvedExistingFileIds[i] = matchedByUrl;
+          claimedFileIds.add(matchedByUrl);
+        }
+      }
+
+      for (let i = 0; i < params.fetchedImages.length; i += 1) {
+        if (resolvedExistingFileIds[i] !== undefined) {
+          continue;
+        }
+        const matchedByName = existingFiles.byName.get(
+          params.fetchedImages[i].filename,
+        );
+        if (matchedByName && !claimedFileIds.has(matchedByName)) {
+          resolvedExistingFileIds[i] = matchedByName;
+          claimedFileIds.add(matchedByName);
+        }
+      }
+
       let nextIndex = 0;
       const workerCount = Math.min(concurrency, params.fetchedImages.length);
       const workers = Array.from({ length: workerCount }, async () => {
@@ -1354,10 +1389,8 @@ export class DriveClient {
           nextIndex += 1;
 
           const image = params.fetchedImages[idx];
-          const encodedImageUrl = await encodeSourceUrlProperty(image.resolvedUrl);
-          const existingFileId =
-            existingFiles.byImageUrl.get(encodedImageUrl) ??
-            existingFiles.byName.get(image.filename);
+          const encodedImageUrl = encodedImageUrls[idx];
+          const existingFileId = resolvedExistingFileIds[idx];
 
           try {
             const uploaded = await this.uploadFile({

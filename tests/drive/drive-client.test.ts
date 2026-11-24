@@ -1298,4 +1298,85 @@ describe('DriveClient uploadArticle', () => {
     expect(imagesInDrive).toHaveLength(1);
     expect(imagesInDrive[0].name).toBe('03-v2-e5c7.webp');
   });
+
+  it('prevents PATCH collision when a prepended new image reuses the old filename of a shifted existing image', async () => {
+    const server = createFakeDriveServer();
+    const client = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: server.fetchImpl,
+      tokenProvider: async () => 'test-token',
+    });
+
+    const root = await client.ensureRootFolder({
+      rootFolderName: 'WebClips',
+      rootFolderId: null,
+    });
+
+    const page = makeSamplePage({
+      markdown:
+        '# Gallery\n\n![New](https://cdn.example.com/url-b.png)\n\n![Old](https://cdn.example.com/url-a.webp)\n',
+    });
+
+    // Run 1: uploads urlA as 01-photo.webp -> Drive file F1 (appProperties.imageUrl = urlA).
+    const run1ImgA: FetchedImage = {
+      id: 'img-a',
+      originalUrl: 'https://cdn.example.com/url-a.webp',
+      resolvedUrl: 'https://cdn.example.com/url-a.webp',
+      sourceUrls: ['https://cdn.example.com/url-a.webp'],
+      filename: '01-photo.webp',
+      mimeType: 'image/webp',
+      bytes: WEBP_BYTES,
+      byteLength: WEBP_BYTES.byteLength,
+    };
+
+    const first = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page,
+      fetchedImages: [run1ImgA],
+    });
+    const fileIdA = first.uploadedImages[0].fileId;
+
+    // Run 2: prepends new urlB reusing filename "01-photo.webp", shifting urlA to "02-photo.webp".
+    const run2ImgB: FetchedImage = {
+      id: 'img-b',
+      originalUrl: 'https://cdn.example.com/url-b.png',
+      resolvedUrl: 'https://cdn.example.com/url-b.png',
+      sourceUrls: ['https://cdn.example.com/url-b.png'],
+      filename: '01-photo.webp',
+      mimeType: 'image/png',
+      bytes: PNG_BYTES,
+      byteLength: PNG_BYTES.byteLength,
+    };
+    const run2ImgA: FetchedImage = {
+      ...run1ImgA,
+      filename: '02-photo.webp',
+    };
+
+    const second = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page,
+      fetchedImages: [run2ImgB, run2ImgA],
+    });
+
+    expect(second.uploadedImages).toHaveLength(2);
+    const uploadedB = second.uploadedImages.find((img) => img.id === 'img-b')!;
+    const uploadedA = second.uploadedImages.find((img) => img.id === 'img-a')!;
+
+    // urlA must keep/PATCH F1 in place; urlB MUST create a brand-new file ID instead of clobbering F1!
+    expect(uploadedA.fileId).toBe(fileIdA);
+    expect(uploadedB.fileId).not.toBe(fileIdA);
+
+    const storedFiles = Array.from(server.files.values()).filter(
+      (f) => f.id === uploadedA.fileId || f.id === uploadedB.fileId,
+    );
+    expect(storedFiles).toHaveLength(2);
+    expect(server.files.get(uploadedA.fileId)?.name).toBe('02-photo.webp');
+    expect(Array.from(server.files.get(uploadedA.fileId)?.content ?? [])).toEqual(
+      Array.from(WEBP_BYTES),
+    );
+    expect(server.files.get(uploadedB.fileId)?.name).toBe('01-photo.webp');
+    expect(Array.from(server.files.get(uploadedB.fileId)?.content ?? [])).toEqual(
+      Array.from(PNG_BYTES),
+    );
+  });
 });
