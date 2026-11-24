@@ -4,7 +4,7 @@ Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Mar
 
 ## Multi-tab background queue & title cleanup
 
-- **Clip across tabs without waiting:** Clicking **Clip to Google Drive** runs fast page extraction while the tab is open, enqueues background image download and Google Drive upload (up to 2 concurrent jobs to avoid API rate-limit bursts), and immediately lets you switch tabs or close the popup.
+- **Clip across tabs without waiting:** Clicking **Clip to Google Drive** runs fast page extraction while the tab is open, enqueues background image download and Google Drive upload (up to 2 concurrent jobs to avoid API rate-limit bursts), keeps the MV3 service worker alive with a 15-second heartbeat until the queue drains, and immediately lets you switch tabs or close the popup.
 - **Unified Clip queue & toolbar badge:** Reopening the popup from any tab restores live job progress from `chrome.storage.session` (`clipJobs`) and streams updates in real time (`Queued`, `Extracting...`, `Downloading`, `Uploading`, `Saved` with `Open ↗` link and collapsible warnings, plus single-job dismiss and `Clear done`). The toolbar badge reflects queue state across both popup and context-menu clips: blue active count (`1`, `3`, …) while jobs run, green `OK` briefly when finished cleanly, and red `!` if any undismissed clip failed.
 - **Automatic unread-prefix title cleanup:** Default page titles strip leading notification counters such as Zhihu `(20 封私信 / 17 条消息) ...`, `(3) ...`, `(99+) ...`, and `[12] ...` before computing the article title and `YYYY-MM-DD-<slug>` folder name, while preserving legitimate parentheticals like `(2026) Annual Report` and `(Part 1) Guide` as well as any manual edits you type in the popup.
 
@@ -21,9 +21,9 @@ WebClips/
         └── 02-benchmark.png
 ```
 
-`README.md` starts with YAML frontmatter (`title`, `url`, `author`, `published`, `clipped`, `site`, `tags`, `images`, and optional `warnings`) followed by the extracted Markdown body. All downloaded images keep their original format (sniffed from `Content-Type` and magic bytes) and upload before `README.md`.
+`README.md` starts with YAML frontmatter (`title`, `url`, `author`, `published`, `clipped`, `site`, `tags`, `images`, and optional `warnings`) followed by the extracted Markdown body. All downloaded images keep their original format (sniffed from `Content-Type` and magic bytes) and upload before `README.md`, using `uploadType=multipart` for files up to 4.5 MiB and switching automatically to `uploadType=resumable` for larger images.
 
-If an individual image fails to download, the clip still completes. The Markdown keeps the original remote URL for that image and appends a warning to frontmatter. Re-clipping the same URL reuses the existing folder by matching `appProperties.sourceUrl` instead of creating duplicates.
+If an individual image fails to download or upload, the clip still completes and `README.md` always uploads. The Markdown keeps the original remote URL for that image and appends a warning to frontmatter. Re-clipping the same URL reuses the existing folder by matching `appProperties.sourceUrl` and updates images in place using shift-proof filenames and `appProperties.imageUrl` matching instead of creating duplicates.
 
 ## Five-minute Google Cloud OAuth setup
 
