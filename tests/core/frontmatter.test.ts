@@ -2,11 +2,76 @@ import { describe, expect, it } from 'vitest';
 import {
   buildArticleFolderName,
   buildFrontmatter,
+  cleanPageTitle,
   composeMarkdownDocument,
   formatClipDate,
   formatYamlString,
   slugifyTitle,
 } from '../../src/core/frontmatter.js';
+
+describe('cleanPageTitle', () => {
+  it('strips Zhihu and Chinese notification prefixes in ASCII and full-width brackets', () => {
+    expect(cleanPageTitle('(20 封私信 / 17 条消息) 华硕 ProArt 创 16 评测')).toBe(
+      '华硕 ProArt 创 16 评测',
+    );
+    expect(cleanPageTitle('(5 条消息) 如何看待 Chrome MV3 架构？')).toBe(
+      '如何看待 Chrome MV3 架构？',
+    );
+    expect(cleanPageTitle('（3 封私信 / 2 条通知）知乎专栏深度解析')).toBe(
+      '知乎专栏深度解析',
+    );
+    expect(cleanPageTitle('（99+ 条未读消息）飞书文档')).toBe('飞书文档');
+    expect(cleanPageTitle('[4 条提醒] 系统通知中心')).toBe('系统通知中心');
+  });
+
+  it('strips 1-3 digit and 99+ numeric unread counts with optional leading bullets', () => {
+    expect(cleanPageTitle('(3) Home / X')).toBe('Home / X');
+    expect(cleanPageTitle('(99+) Inbox - user@gmail.com')).toBe(
+      'Inbox - user@gmail.com',
+    );
+    expect(cleanPageTitle('(999+) All Mail')).toBe('All Mail');
+    expect(cleanPageTitle('[12] Alert - Dashboard')).toBe('Alert - Dashboard');
+    expect(cleanPageTitle('• (3) Slack - #engineering')).toBe(
+      'Slack - #engineering',
+    );
+    expect(cleanPageTitle('· [18] Notifications')).toBe('Notifications');
+    expect(cleanPageTitle('（8）微信读书')).toBe('微信读书');
+    expect(cleanPageTitle('(2 unread) Gmail')).toBe('Gmail');
+    expect(cleanPageTitle('(3) (5 条消息) 叠加通知标题')).toBe('叠加通知标题');
+  });
+
+  it('preserves legitimate parentheticals like 4-digit years, parts, RFCs, and labels', () => {
+    expect(cleanPageTitle('(2026) Annual Report')).toBe('(2026) Annual Report');
+    expect(cleanPageTitle('(1999) Classic Systems Paper')).toBe(
+      '(1999) Classic Systems Paper',
+    );
+    expect(cleanPageTitle('(Part 1) Guide to Distributed Storage')).toBe(
+      '(Part 1) Guide to Distributed Storage',
+    );
+    expect(cleanPageTitle('(RFC 9110) HTTP Semantics')).toBe(
+      '(RFC 9110) HTTP Semantics',
+    );
+    expect(cleanPageTitle('(Beta) Feature Flags')).toBe('(Beta) Feature Flags');
+    expect(cleanPageTitle('Article (3) Notes')).toBe('Article (3) Notes');
+    expect(cleanPageTitle('• Regular Bullet Heading')).toBe(
+      '• Regular Bullet Heading',
+    );
+    expect(cleanPageTitle('(3] Mismatched Bracket')).toBe(
+      '(3] Mismatched Bracket',
+    );
+    expect(cleanPageTitle('(3)')).toBe('(3)');
+    expect(cleanPageTitle('   ')).toBe('');
+  });
+
+  it('produces clean Drive folder names when combined with buildArticleFolderName', () => {
+    const cleaned = cleanPageTitle(
+      '(20 封私信 / 17 条消息) 华硕 ProArt 创 16',
+    );
+    expect(
+      buildArticleFolderName(cleaned, '2026-11-24T04:16:43.000Z'),
+    ).toBe('2026-11-24-华硕-proart-创-16');
+  });
+});
 
 describe('slugifyTitle', () => {
   it('normalizes ASCII punctuation, case, and whitespace', () => {

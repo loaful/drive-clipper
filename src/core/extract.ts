@@ -4,6 +4,7 @@ import Defuddle, {
   type DefuddleResponse,
 } from 'defuddle/full';
 import type { ClipMode, ExtractedPage, PageInfo } from '../types.js';
+import { cleanPageTitle } from './frontmatter.js';
 import {
   discoverImagesFromMarkdown,
   resolveDomImages,
@@ -78,11 +79,12 @@ function readFallbackMetadata(doc: Document, url: string): {
   site: string | null;
   description: string | null;
 } {
-  const title =
+  const rawTitle =
     doc.title?.trim() ||
     readMetaContent(doc, ['meta[property="og:title"]', 'meta[name="twitter:title"]']) ||
     doc.querySelector('h1')?.textContent?.trim() ||
     'Untitled';
+  const title = cleanPageTitle(rawTitle) || 'Untitled';
 
   const author = readMetaContent(doc, [
     'meta[name="author"]',
@@ -322,9 +324,13 @@ export async function extractPage(
   const markdown = markdownConverter(parsed.content || '', url).trim();
   const images = discoverImagesFromMarkdown(markdown, url, domMeta);
 
+  const parsedTitle = nonEmptyOrNull(parsed.title);
+
   return {
     url,
-    title: nonEmptyOrNull(parsed.title) ?? fallbackMeta.title,
+    title: parsedTitle
+      ? cleanPageTitle(parsedTitle) || fallbackMeta.title
+      : fallbackMeta.title,
     author: nonEmptyOrNull(parsed.author) ?? fallbackMeta.author,
     published: nonEmptyOrNull(parsed.published) ?? fallbackMeta.published,
     site: nonEmptyOrNull(parsed.site) ?? fallbackMeta.site,

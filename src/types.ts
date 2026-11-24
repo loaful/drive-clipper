@@ -12,6 +12,7 @@ export const STORAGE_KEYS = {
   settings: 'driveClipper.settings',
   history: 'driveClipper.history',
   webAuthToken: 'driveClipper.webAuthToken',
+  clipJobs: 'clipJobs',
 } as const;
 
 export type ClipMode = 'full' | 'selection';
@@ -121,6 +122,49 @@ export type ClipStage =
   | 'uploading'
   | 'done'
   | 'error';
+
+export type ClipJobStatus =
+  | 'extracting'
+  | 'queued'
+  | 'downloading'
+  | 'uploading'
+  | 'done'
+  | 'error';
+
+export type ActiveClipJobStatus =
+  | 'extracting'
+  | 'queued'
+  | 'downloading'
+  | 'uploading';
+
+export interface ClipJob {
+  id: string;
+  tabId?: number;
+  url: string;
+  title: string;
+  folderName: string;
+  mode: ClipMode;
+  status: ClipJobStatus;
+  message: string;
+  completed?: number;
+  total?: number;
+  createdAt: string;
+  updatedAt: string;
+  result?: ClipResult;
+  error?: string;
+  errorCode?: BackgroundErrorCode;
+}
+
+export function isActiveClipJobStatus(
+  status: ClipJobStatus,
+): status is ActiveClipJobStatus {
+  return (
+    status === 'extracting' ||
+    status === 'queued' ||
+    status === 'downloading' ||
+    status === 'uploading'
+  );
+}
 
 export type ClipProgressEvent =
   | {
@@ -236,6 +280,9 @@ export type ContentResponseMessage =
 export type UiToBackgroundMessage =
   | { type: 'GET_PAGE_INFO'; tabId?: number }
   | { type: 'START_CLIP'; request: ClipRequest }
+  | { type: 'GET_CLIP_JOBS' }
+  | { type: 'DISMISS_CLIP_JOB'; jobId: string }
+  | { type: 'CLEAR_COMPLETED_JOBS' }
   | { type: 'GET_SETTINGS' }
   | { type: 'UPDATE_SETTINGS'; patch: Partial<ExtensionSettings> }
   | { type: 'GET_HISTORY' }
@@ -246,7 +293,15 @@ export type UiToBackgroundMessage =
 
 export interface UiMessageResponseMap {
   GET_PAGE_INFO: PageInfo;
-  START_CLIP: ClipResult;
+  /**
+   * Non-blocking: resolves once fast page extraction finishes and the job is
+   * enqueued for background download/upload (returning the created `ClipJob`).
+   * Track live progress via `GET_CLIP_JOBS` and `CLIP_JOBS_UPDATED`.
+   */
+  START_CLIP: ClipJob;
+  GET_CLIP_JOBS: ClipJob[];
+  DISMISS_CLIP_JOB: ClipJob[];
+  CLEAR_COMPLETED_JOBS: ClipJob[];
   GET_SETTINGS: ExtensionSettings;
   UPDATE_SETTINGS: ExtensionSettings;
   GET_HISTORY: ClipHistoryItem[];
@@ -256,10 +311,15 @@ export interface UiMessageResponseMap {
   ENSURE_ROOT_FOLDER: RootFolderInfo;
 }
 
-export type BackgroundPushMessage = {
-  type: 'CLIP_PROGRESS';
-  event: ClipProgressEvent;
-};
+export type BackgroundPushMessage =
+  | {
+      type: 'CLIP_PROGRESS';
+      event: ClipProgressEvent;
+    }
+  | {
+      type: 'CLIP_JOBS_UPDATED';
+      jobs: ClipJob[];
+    };
 
 declare const __DRIVE_CLIPPER_WEB_AUTH_CLIENT_ID__: string | undefined;
 

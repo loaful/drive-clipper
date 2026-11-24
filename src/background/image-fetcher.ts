@@ -15,6 +15,7 @@ export interface DeclarativeNetRequestLike {
   updateSessionRules(
     options: chrome.declarativeNetRequest.UpdateRuleOptions,
   ): Promise<void>;
+  getSessionRules?: () => Promise<chrome.declarativeNetRequest.Rule[]>;
 }
 
 export interface ImageFetchOptions {
@@ -40,7 +41,10 @@ export interface ImageFetchOptions {
 const DEFAULT_CONCURRENCY = DEFAULT_EXTENSION_SETTINGS.imageConcurrency;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_BYTES = DEFAULT_EXTENSION_SETTINGS.maxImageSizeBytes;
-const MAX_URL_FILTERS_BEFORE_ORIGIN_COLLAPSE = 100;
+const MAX_URL_FILTERS_BEFORE_ORIGIN_COLLAPSE = 1_000;
+const MAX_REGEX_FILTER_LENGTH = 1_800;
+const SPECIFIC_URL_RULE_PRIORITY = 2;
+const ORIGIN_FALLBACK_RULE_PRIORITY = 1;
 const MIN_RULE_ID = 1_000;
 const MAX_RULE_ID = 2_000_000_000;
 
@@ -48,6 +52,9 @@ const MAX_RULE_ID = 2_000_000_000;
 let nextDnrRuleId =
   MIN_RULE_ID +
   ((Date.now() % 1_000_000) * 1_000 + Math.floor(Math.random() * 1_000));
+
+// Tracks rule IDs owned by active in-flight fetchImages() batches in this SW instance.
+const activeDnrRuleIds = new Set<number>();
 
 const KNOWN_IMAGE_EXTENSIONS = new Set([
   'png',
@@ -255,16 +262,23 @@ export function detectImageFormat(
 }
 
 /**
- * Allocates unique positive 32-bit integer DNR rule IDs.
+ * Allocates unique positive 32-bit integer DNR rule IDs that never collide
+ * with rule IDs currently active in concurrent `fetchImages` batches.
  */
 export function allocateDnrRuleIds(count: number): number[] {
   const ids: number[] = [];
   for (let i = 0; i < count; i += 1) {
-    if (nextDnrRuleId >= MAX_RULE_ID) {
-      nextDnrRuleId = MIN_RULE_ID;
+    let attempts = 0;
+    while (activeDnrRuleIds.has(nextDnrRuleId)) {
+      nextDnrRuleId = nextDnrRuleId >= MAX_RULE_ID ? MIN_RULE_ID : nextDnrRuleId + 1;
+      attempts += 1;
+      if (attempts > 100_000) {
+        throw new Error('Exhausted available DNR session rule IDs.');
+      }
     }
-    ids.push(nextDnrRuleId);
-    nextDnrRuleId += 1;
+    const allocated = nextDnrRuleId;
+    nextDnrRuleId = nextDnrRuleId >= MAX_RULE_ID ? MIN_RULE_ID : nextDnrRuleId + 1;
+    ids.push(allocated);
   }
   return ids;
 }
@@ -282,13 +296,54 @@ function isHttpUrl(url: string): URL | null {
 }
 
 const DNR_FILTER_SPECIAL_OR_NON_ASCII_RE = /[^\x21-\x7e]|[*|^]/;
+const ASCII_PRINTABLE_RE = /^[\x20-\x7e]+$/;
 
-function buildUrlFilter(parsed: URL): string {
-  const candidate = `${parsed.origin}${parsed.pathname}`;
-  if (!DNR_FILTER_SPECIAL_OR_NON_ASCII_RE.test(candidate)) {
-    return `|${candidate}`;
+interface DnrUrlMatcher {
+  key: string;
+  urlFilter?: string;
+  regexFilter?: string;
+  priority: number;
+}
+
+function escapeRegexLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Builds an exact-URL DNR matcher (origin + pathname + query, excluding hash)
+ * so concurrent jobs clipping different articles on the same domain/CDN never
+ * collide on broad host rules or URL prefix overlaps (e.g. `/img/1` vs `/img/10`
+ * or `/proxy?id=1` vs `/proxy?id=2`).
+ */
+function buildUrlMatcher(parsed: URL): DnrUrlMatcher {
+  const fullUrl = `${parsed.origin}${parsed.pathname}${parsed.search}`;
+  if (!DNR_FILTER_SPECIAL_OR_NON_ASCII_RE.test(fullUrl)) {
+    const urlFilter = `|${fullUrl}|`;
+    return {
+      key: `url:${urlFilter}`,
+      urlFilter,
+      priority: SPECIFIC_URL_RULE_PRIORITY,
+    };
   }
-  return `|${parsed.origin}/`;
+
+  const regexFilter = `^${escapeRegexLiteral(fullUrl)}$`;
+  if (
+    regexFilter.length <= MAX_REGEX_FILTER_LENGTH &&
+    ASCII_PRINTABLE_RE.test(regexFilter)
+  ) {
+    return {
+      key: `regex:${regexFilter}`,
+      regexFilter,
+      priority: SPECIFIC_URL_RULE_PRIORITY,
+    };
+  }
+
+  const originFilter = `|${parsed.origin}/`;
+  return {
+    key: `origin:${originFilter}`,
+    urlFilter: originFilter,
+    priority: ORIGIN_FALLBACK_RULE_PRIORITY,
+  };
 }
 
 /**
@@ -315,24 +370,35 @@ export function buildRefererSessionRules(
     return [];
   }
 
-  const filterSet = new Set<string>();
+  const matcherMap = new Map<string, DnrUrlMatcher>();
   for (const target of parsedTargets) {
-    filterSet.add(buildUrlFilter(target));
-  }
-
-  let filters = Array.from(filterSet);
-  if (filters.length > MAX_URL_FILTERS_BEFORE_ORIGIN_COLLAPSE) {
-    const originFilters = new Set<string>();
-    for (const target of parsedTargets) {
-      originFilters.add(`|${target.origin}/`);
+    const matcher = buildUrlMatcher(target);
+    if (!matcherMap.has(matcher.key)) {
+      matcherMap.set(matcher.key, matcher);
     }
-    filters = Array.from(originFilters);
   }
 
-  const ids = allocateDnrRuleIds(filters.length);
-  return filters.map((urlFilter, idx) => ({
+  let matchers = Array.from(matcherMap.values());
+  if (matchers.length > MAX_URL_FILTERS_BEFORE_ORIGIN_COLLAPSE) {
+    const originMatchers = new Map<string, DnrUrlMatcher>();
+    for (const target of parsedTargets) {
+      const originFilter = `|${target.origin}/`;
+      const key = `origin:${originFilter}`;
+      if (!originMatchers.has(key)) {
+        originMatchers.set(key, {
+          key,
+          urlFilter: originFilter,
+          priority: ORIGIN_FALLBACK_RULE_PRIORITY,
+        });
+      }
+    }
+    matchers = Array.from(originMatchers.values());
+  }
+
+  const ids = allocateDnrRuleIds(matchers.length);
+  return matchers.map((matcher, idx) => ({
     id: ids[idx],
-    priority: 1,
+    priority: matcher.priority,
     action: {
       type: 'modifyHeaders' as chrome.declarativeNetRequest.RuleActionType,
       requestHeaders: [
@@ -344,7 +410,10 @@ export function buildRefererSessionRules(
       ],
     },
     condition: {
-      urlFilter,
+      ...(matcher.urlFilter !== undefined ? { urlFilter: matcher.urlFilter } : {}),
+      ...(matcher.regexFilter !== undefined
+        ? { regexFilter: matcher.regexFilter }
+        : {}),
       // TAB_ID_NONE (-1) limits the Referer override to Service Worker fetches.
       tabIds: [-1],
       resourceTypes: [
@@ -376,6 +445,10 @@ export async function withRefererSessionRules<T>(
   }
 
   const ruleIds = rules.map((rule) => rule.id);
+  for (const id of ruleIds) {
+    activeDnrRuleIds.add(id);
+  }
+
   let rulesAdded = false;
   let hasPrimaryError = false;
 
@@ -387,16 +460,57 @@ export async function withRefererSessionRules<T>(
     hasPrimaryError = true;
     throw error;
   } finally {
-    if (rulesAdded) {
-      try {
+    try {
+      if (rulesAdded) {
         await dnr.updateSessionRules({ removeRuleIds: ruleIds });
-      } catch (cleanupError) {
-        if (!hasPrimaryError) {
-          throw cleanupError;
-        }
+      }
+    } catch (cleanupError) {
+      if (!hasPrimaryError) {
+        throw cleanupError;
+      }
+    } finally {
+      for (const id of ruleIds) {
+        activeDnrRuleIds.delete(id);
       }
     }
   }
+}
+
+function isServiceWorkerRefererRule(rule: chrome.declarativeNetRequest.Rule): boolean {
+  return (
+    rule.action.type === 'modifyHeaders' &&
+    Array.isArray(rule.condition.tabIds) &&
+    rule.condition.tabIds.length === 1 &&
+    rule.condition.tabIds[0] === -1 &&
+    Array.isArray(rule.action.requestHeaders) &&
+    rule.action.requestHeaders.length === 1 &&
+    rule.action.requestHeaders[0]?.header.toLowerCase() === 'referer' &&
+    rule.action.requestHeaders[0]?.operation === 'set'
+  );
+}
+
+/**
+ * Removes any orphaned Service Worker Referer session rules left behind by a
+ * previous crashed/restarted Service Worker instance while leaving rules owned
+ * by active in-flight batches untouched.
+ */
+export async function cleanupOrphanedRefererSessionRules(
+  dnr?: DeclarativeNetRequestLike | null,
+): Promise<number[]> {
+  const resolvedDnr = dnr === undefined ? resolveDefaultDnr() : dnr;
+  if (!resolvedDnr?.getSessionRules) {
+    return [];
+  }
+
+  const existing = await resolvedDnr.getSessionRules();
+  const orphanIds = existing
+    .filter((rule) => isServiceWorkerRefererRule(rule) && !activeDnrRuleIds.has(rule.id))
+    .map((rule) => rule.id);
+
+  if (orphanIds.length > 0) {
+    await resolvedDnr.updateSessionRules({ removeRuleIds: orphanIds });
+  }
+  return orphanIds;
 }
 
 function deduplicateImages(images: readonly DiscoveredImage[]): DiscoveredImage[] {

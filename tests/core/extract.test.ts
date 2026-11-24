@@ -241,4 +241,54 @@ describe('selection clip support & content script message handler', () => {
       expect(extractResp.data.markdown).toContain('Key insight inside an open Shadow DOM');
     }
   });
+
+  it('strips unread notification prefixes from default titles in getPageInfo and extractPage while preserving years/labels', async () => {
+    const zhihuHtml = `<!doctype html>
+      <html>
+        <head><title>(20 封私信 / 17 条消息) 华硕 ProArt 创 16 深度评测 - 知乎</title></head>
+        <body><article><h1>华硕 ProArt 创 16 深度评测</h1><p>这是一篇关于硬件架构与屏幕素质的深度评测文章，包含详细实测数据与对比结论。</p></article></body>
+      </html>`;
+    const zhihuDoc = new DOMParser().parseFromString(zhihuHtml, 'text/html');
+    const zhihuUrl = 'https://zhuanlan.zhihu.com/p/123456';
+
+    const zhihuInfo = getPageInfo(zhihuDoc, zhihuUrl);
+    expect(zhihuInfo.title).toBe('华硕 ProArt 创 16 深度评测 - 知乎');
+
+    const zhihuExtracted = await extractPage(zhihuDoc, zhihuUrl, {
+      mode: 'full',
+      createDefuddle: (): DefuddleInstance => ({
+        parseAsync: async () => ({
+          title: '(20 封私信 / 17 条消息) 华硕 ProArt 创 16 深度评测',
+          description: '',
+          domain: 'zhuanlan.zhihu.com',
+          favicon: '',
+          image: '',
+          language: 'zh',
+          parseTime: 1,
+          published: '',
+          author: '',
+          site: '知乎',
+          schemaOrgData: null,
+          wordCount: 10,
+          content: '<p>正文内容。</p>',
+        }),
+        parse: () => {
+          throw new Error('should not fall back');
+        },
+      }),
+    });
+    expect(zhihuExtracted.title).toBe('华硕 ProArt 创 16 深度评测');
+
+    const yearHtml = `<!doctype html>
+      <html>
+        <head><title>(2026) Annual Report</title></head>
+        <body><article><p>Annual engineering summary for 2026.</p></article></body>
+      </html>`;
+    const yearDoc = new DOMParser().parseFromString(yearHtml, 'text/html');
+    expect(getPageInfo(yearDoc, 'https://example.com/report').title).toBe(
+      '(2026) Annual Report',
+    );
+    const yearExtracted = await extractPage(yearDoc, 'https://example.com/report');
+    expect(yearExtracted.title).toBe('(2026) Annual Report');
+  });
 });

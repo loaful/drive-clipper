@@ -1,3 +1,4 @@
+import { buildArticleFolderName, cleanPageTitle } from '../core/frontmatter.js';
 import {
   DriveApiError,
   DriveClient,
@@ -10,28 +11,47 @@ import {
   DEFAULT_EXTENSION_SETTINGS,
   STORAGE_KEYS,
   getBuildWebAuthClientId,
+  isActiveClipJobStatus,
   isConfiguredOAuthClientIdValue,
   type AuthStatus,
   type BackgroundErrorCode,
   type BackgroundPushMessage,
   type BackgroundResponse,
   type ClipHistoryItem,
+  type ClipJob,
+  type ClipJobStatus,
   type ClipProgressEvent,
   type ClipRequest,
   type ClipResult,
   type ContentRequestMessage,
   type ContentResponseMessage,
   type ExtensionSettings,
+  type ExtractedPage,
   type PageInfo,
   type RootFolderInfo,
   type UiToBackgroundMessage,
 } from '../types.js';
-import { fetchImages, type ImageFetchOptions } from './image-fetcher.js';
+import {
+  cleanupOrphanedRefererSessionRules,
+  fetchImages,
+  type ImageFetchOptions,
+} from './image-fetcher.js';
 
 export const CONTEXT_MENU_CLIP_SELECTION_ID = 'drive-clipper-clip-selection';
 export const MAX_CLIP_HISTORY_ITEMS = 10;
+export const MAX_CLIP_JOBS = 20;
+export const DEFAULT_MAX_CONCURRENT_JOBS = 2;
+export const DEFAULT_BADGE_CLEAR_DELAY_MS = 8_000;
+export const ORPHANED_JOB_ERROR_MESSAGE =
+  'Background worker restarted before upload finished. Re-open the tab and clip again.';
+
 const CONTENT_SCRIPT_FILE = 'content.js';
 const SW_LISTENER_SENTINEL = '__driveClipperServiceWorkerRegistered__';
+const ROOT_FOLDER_CACHE_TTL_MS = 5 * 60_000;
+
+const BADGE_COLOR_ACTIVE = '#2563eb';
+const BADGE_COLOR_DONE = '#16a34a';
+const BADGE_COLOR_ERROR = '#dc2626';
 
 export interface StorageAreaLike {
   get(keys: string): Promise<Record<string, unknown>>;
@@ -48,6 +68,7 @@ export interface ServiceWorkerDependencies {
   getManifest?: () => chrome.runtime.Manifest;
   storageSync?: StorageAreaLike;
   storageLocal?: StorageAreaLike;
+  storageSession?: StorageAreaLike;
   tabs?: {
     query: (queryInfo: chrome.tabs.QueryInfo) => Promise<chrome.tabs.Tab[]>;
     get: (tabId: number) => Promise<chrome.tabs.Tab>;
@@ -63,6 +84,10 @@ export interface ServiceWorkerDependencies {
   };
   emitPushMessage?: (message: BackgroundPushMessage) => Promise<void>;
   setBadge?: (text: string, color: string) => Promise<void>;
+  /** Maximum concurrent background download+upload jobs. Defaults to 2. */
+  maxConcurrentJobs?: number;
+  /** Delay in ms before auto-clearing the green "OK" badge back to "". Defaults to 8000. */
+  badgeClearDelayMs?: number;
   now?: () => Date;
   createClipId?: () => string;
   imageFetchOptions?: Partial<ImageFetchOptions>;
@@ -70,14 +95,36 @@ export interface ServiceWorkerDependencies {
 
 export interface ServiceWorkerController {
   handleMessage(message: unknown): Promise<BackgroundResponse<unknown>>;
+  enqueueClip(request: ClipRequest): Promise<BackgroundResponse<ClipJob>>;
   runClip(request: ClipRequest): Promise<BackgroundResponse<ClipResult>>;
   handleContextMenuClick(
     info: Pick<chrome.contextMenus.OnClickData, 'menuItemId'>,
     tab?: Pick<chrome.tabs.Tab, 'id' | 'url'>,
   ): Promise<void>;
+  getClipJobs(): Promise<ClipJob[]>;
+  dismissClipJob(jobId: string): Promise<ClipJob[]>;
+  clearCompletedJobs(): Promise<ClipJob[]>;
+  whenIdle(): Promise<void>;
   getSettings(): Promise<ExtensionSettings>;
   updateSettings(patch: Partial<ExtensionSettings>): Promise<ExtensionSettings>;
   getHistory(): Promise<ClipHistoryItem[]>;
+}
+
+type BadgeSyncReason =
+  | 'hydrate'
+  | 'active-updated'
+  | 'job-completed'
+  | 'job-failed'
+  | 'dismissed'
+  | 'cleared';
+
+interface QueuedUploadTask {
+  jobId: string;
+  request: ClipRequest;
+  extracted: ExtractedPage;
+  settings: ExtensionSettings;
+  effectiveFolderName: string;
+  resolveResult: (result: BackgroundResponse<ClipResult>) => void;
 }
 
 export function isConfiguredOAuthClientId(clientId: unknown): boolean {
@@ -94,6 +141,18 @@ export function isSupportedPageUrl(url: string | undefined): url is string {
   } catch {
     return false;
   }
+}
+
+function createInMemoryStorageArea(): StorageAreaLike {
+  const store: Record<string, unknown> = {};
+  return {
+    async get(key: string) {
+      return key in store ? { [key]: store[key] } : {};
+    },
+    async set(items: Record<string, unknown>) {
+      Object.assign(store, items);
+    },
+  };
 }
 
 function normalizeSettings(raw: unknown): ExtensionSettings {
@@ -187,6 +246,124 @@ function normalizeHistory(raw: unknown): ClipHistoryItem[] {
     .slice(0, MAX_CLIP_HISTORY_ITEMS);
 }
 
+function isClipJobStatus(value: unknown): value is ClipJobStatus {
+  return (
+    value === 'extracting' ||
+    value === 'queued' ||
+    value === 'downloading' ||
+    value === 'uploading' ||
+    value === 'done' ||
+    value === 'error'
+  );
+}
+
+function cloneClipJob(job: ClipJob): ClipJob {
+  return {
+    ...job,
+    ...(job.result
+      ? {
+          result: {
+            ...job.result,
+            uploadedImages: job.result.uploadedImages.map((img) => ({ ...img })),
+            failedImages: job.result.failedImages.map((fail) => ({
+              ...fail,
+              sourceUrls: [...fail.sourceUrls],
+            })),
+            warnings: [...job.result.warnings],
+          },
+        }
+      : {}),
+  };
+}
+
+function normalizeClipJobs(raw: unknown): ClipJob[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const normalized: ClipJob[] = [];
+  const seenIds = new Set<string>();
+
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const candidate = item as Partial<ClipJob>;
+    if (
+      typeof candidate.id !== 'string' ||
+      candidate.id.length === 0 ||
+      seenIds.has(candidate.id) ||
+      typeof candidate.url !== 'string' ||
+      typeof candidate.title !== 'string' ||
+      typeof candidate.folderName !== 'string' ||
+      (candidate.mode !== 'full' && candidate.mode !== 'selection') ||
+      !isClipJobStatus(candidate.status) ||
+      typeof candidate.message !== 'string' ||
+      typeof candidate.createdAt !== 'string' ||
+      typeof candidate.updatedAt !== 'string'
+    ) {
+      continue;
+    }
+
+    seenIds.add(candidate.id);
+    normalized.push(
+      cloneClipJob({
+        id: candidate.id,
+        ...(typeof candidate.tabId === 'number' ? { tabId: candidate.tabId } : {}),
+        url: candidate.url,
+        title: candidate.title,
+        folderName: candidate.folderName,
+        mode: candidate.mode,
+        status: candidate.status,
+        message: candidate.message,
+        ...(typeof candidate.completed === 'number'
+          ? { completed: candidate.completed }
+          : {}),
+        ...(typeof candidate.total === 'number' ? { total: candidate.total } : {}),
+        createdAt: candidate.createdAt,
+        updatedAt: candidate.updatedAt,
+        ...(candidate.result ? { result: candidate.result } : {}),
+        ...(typeof candidate.error === 'string' ? { error: candidate.error } : {}),
+        ...(typeof candidate.errorCode === 'string'
+          ? { errorCode: candidate.errorCode }
+          : {}),
+      }),
+    );
+  }
+
+  return pruneClipJobs(normalized);
+}
+
+/**
+ * Caps stored clip jobs to `MAX_CLIP_JOBS`, always retaining every active/queued
+ * job plus the most recent finished/failed jobs.
+ */
+function pruneClipJobs(
+  jobs: readonly ClipJob[],
+  maxJobs = MAX_CLIP_JOBS,
+): ClipJob[] {
+  if (jobs.length <= maxJobs) {
+    return jobs.map(cloneClipJob);
+  }
+
+  const activeCount = jobs.reduce(
+    (count, job) => count + (isActiveClipJobStatus(job.status) ? 1 : 0),
+    0,
+  );
+  let terminalBudget = Math.max(0, maxJobs - activeCount);
+
+  const kept: ClipJob[] = [];
+  for (const job of jobs) {
+    if (isActiveClipJobStatus(job.status)) {
+      kept.push(cloneClipJob(job));
+    } else if (terminalBudget > 0) {
+      kept.push(cloneClipJob(job));
+      terminalBudget -= 1;
+    }
+  }
+  return kept;
+}
+
 function isUiToBackgroundMessage(value: unknown): value is UiToBackgroundMessage {
   if (!value || typeof value !== 'object' || !('type' in value)) {
     return false;
@@ -195,6 +372,9 @@ function isUiToBackgroundMessage(value: unknown): value is UiToBackgroundMessage
   return (
     type === 'GET_PAGE_INFO' ||
     type === 'START_CLIP' ||
+    type === 'GET_CLIP_JOBS' ||
+    type === 'DISMISS_CLIP_JOB' ||
+    type === 'CLEAR_COMPLETED_JOBS' ||
     type === 'GET_SETTINGS' ||
     type === 'UPDATE_SETTINGS' ||
     type === 'GET_HISTORY' ||
@@ -272,6 +452,17 @@ export function createServiceWorkerController(
   const setBadge = deps.setBadge ?? defaultSetBadge;
   const now = deps.now ?? (() => new Date());
   const createClipId = deps.createClipId ?? (() => crypto.randomUUID());
+  const maxConcurrentJobs = Math.max(
+    1,
+    Math.floor(deps.maxConcurrentJobs ?? DEFAULT_MAX_CONCURRENT_JOBS),
+  );
+  const badgeClearDelayMs = Math.max(
+    0,
+    deps.badgeClearDelayMs ?? DEFAULT_BADGE_CLEAR_DELAY_MS,
+  );
+
+  // Fallback in-memory session store only used outside Chrome when no storageSession is injected.
+  let fallbackSessionStorage: StorageAreaLike | null = null;
 
   const getManifest = (): chrome.runtime.Manifest | null => {
     if (deps.getManifest) {
@@ -307,6 +498,22 @@ export function createServiceWorkerController(
       };
     }
     throw new Error('chrome.storage.local is unavailable.');
+  };
+
+  const getStorageSession = (): StorageAreaLike => {
+    if (deps.storageSession) {
+      return deps.storageSession;
+    }
+    if (typeof chrome !== 'undefined' && chrome.storage?.session) {
+      return {
+        get: (keys: string) => chrome.storage.session.get(keys),
+        set: (items: Record<string, unknown>) => chrome.storage.session.set(items),
+      };
+    }
+    if (!fallbackSessionStorage) {
+      fallbackSessionStorage = createInMemoryStorageArea();
+    }
+    return fallbackSessionStorage;
   };
 
   const getTabsApi = () => {
@@ -345,9 +552,17 @@ export function createServiceWorkerController(
     );
   };
 
-  const emitProgress = async (event: ClipProgressEvent): Promise<void> => {
-    await emitPushMessage({ type: 'CLIP_PROGRESS', event });
-  };
+  // --- Serialized settings & history state ---
+
+  let settingsWriteChain: Promise<void> = Promise.resolve();
+  let historyWriteChain: Promise<void> = Promise.resolve();
+
+  let cachedRootFolder: {
+    info: RootFolderInfo;
+    rootFolderName: string;
+    verifiedAtMs: number;
+  } | null = null;
+  const inFlightRootFolders = new Map<string, Promise<RootFolderInfo>>();
 
   const getSettings = async (): Promise<ExtensionSettings> => {
     const stored = await getStorageSync().get(STORAGE_KEYS.settings);
@@ -357,17 +572,30 @@ export function createServiceWorkerController(
   const updateSettings = async (
     patch: Partial<ExtensionSettings>,
   ): Promise<ExtensionSettings> => {
-    const current = await getSettings();
-    const merged: ExtensionSettings = normalizeSettings({
-      ...current,
-      ...patch,
-      frontmatter: {
-        ...current.frontmatter,
-        ...(patch.frontmatter ?? {}),
-      },
+    const operation = settingsWriteChain.then(async () => {
+      const current = await getSettings();
+      const merged: ExtensionSettings = normalizeSettings({
+        ...current,
+        ...patch,
+        frontmatter: {
+          ...current.frontmatter,
+          ...(patch.frontmatter ?? {}),
+        },
+      });
+      await getStorageSync().set({ [STORAGE_KEYS.settings]: merged });
+      if (
+        patch.rootFolderName !== undefined ||
+        patch.rootFolderId !== undefined
+      ) {
+        cachedRootFolder = null;
+      }
+      return merged;
     });
-    await getStorageSync().set({ [STORAGE_KEYS.settings]: merged });
-    return merged;
+    settingsWriteChain = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   };
 
   const getHistory = async (): Promise<ClipHistoryItem[]> => {
@@ -376,31 +604,493 @@ export function createServiceWorkerController(
   };
 
   const recordClipHistory = async (result: ClipResult): Promise<void> => {
-    const existing = await getHistory();
-    const entry: ClipHistoryItem = {
-      id: `${result.folderId}:${result.clippedAt}`,
-      title: result.title,
-      sourceUrl: result.sourceUrl,
-      folderId: result.folderId,
-      folderUrl: result.folderUrl,
-      folderName: result.folderName,
-      clippedAt: result.clippedAt,
-      imageCount: result.uploadedImages.length,
-      warningCount: result.warnings.length,
-    };
+    const operation = historyWriteChain.then(async () => {
+      const existing = await getHistory();
+      const entry: ClipHistoryItem = {
+        id: `${result.folderId}:${result.clippedAt}`,
+        title: result.title,
+        sourceUrl: result.sourceUrl,
+        folderId: result.folderId,
+        folderUrl: result.folderUrl,
+        folderName: result.folderName,
+        clippedAt: result.clippedAt,
+        imageCount: result.uploadedImages.length,
+        warningCount: result.warnings.length,
+      };
 
-    const next = [
-      entry,
-      ...existing.filter((item) => item.folderId !== result.folderId),
-    ].slice(0, MAX_CLIP_HISTORY_ITEMS);
+      const next = [
+        entry,
+        ...existing.filter((item) => item.folderId !== result.folderId),
+      ].slice(0, MAX_CLIP_HISTORY_ITEMS);
 
-    await getStorageLocal().set({ [STORAGE_KEYS.history]: next });
+      await getStorageLocal().set({ [STORAGE_KEYS.history]: next });
+    });
+    historyWriteChain = operation.catch(() => undefined);
+    await operation;
   };
+
+  // --- Single-flight root folder resolution ---
+
+  const ensureRootFolderForClip = (interactive = true): Promise<RootFolderInfo> => {
+    const key = '__clip_root__';
+    const existing = inFlightRootFolders.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = (async (): Promise<RootFolderInfo> => {
+      const settings = await getSettings();
+      if (
+        cachedRootFolder &&
+        cachedRootFolder.rootFolderName === settings.rootFolderName &&
+        cachedRootFolder.info.folderId === settings.rootFolderId &&
+        now().getTime() - cachedRootFolder.verifiedAtMs < ROOT_FOLDER_CACHE_TTL_MS
+      ) {
+        return cachedRootFolder.info;
+      }
+
+      const folderInfo = await driveClient.ensureRootFolder({
+        rootFolderName: settings.rootFolderName,
+        rootFolderId: settings.rootFolderId,
+        interactive,
+      });
+
+      if (
+        folderInfo.folderId !== settings.rootFolderId ||
+        folderInfo.folderName !== settings.rootFolderName
+      ) {
+        await updateSettings({
+          rootFolderId: folderInfo.folderId,
+          rootFolderName: folderInfo.folderName,
+        });
+      }
+
+      cachedRootFolder = {
+        info: folderInfo,
+        rootFolderName: folderInfo.folderName,
+        verifiedAtMs: now().getTime(),
+      };
+      return folderInfo;
+    })().finally(() => {
+      if (inFlightRootFolders.get(key) === promise) {
+        inFlightRootFolders.delete(key);
+      }
+    });
+
+    inFlightRootFolders.set(key, promise);
+    return promise;
+  };
+
+  // --- Clip Job Queue, persistence, unified badge, and orphan recovery ---
+
+  let jobs: ClipJob[] = [];
+  const liveJobIds = new Set<string>();
+  const jobCompletions = new Map<string, Promise<BackgroundResponse<ClipResult>>>();
+  const pendingQueue: QueuedUploadTask[] = [];
+  let runningWorkers = 0;
+
+  let hydrationPromise: Promise<void> | null = null;
+  let persistChain: Promise<void> = Promise.resolve();
+  let pendingPersistSnapshot: ClipJob[] | null = null;
+  let pushChain: Promise<void> = Promise.resolve();
+  let badgeChain: Promise<void> = Promise.resolve();
+  let lastBadge: { text: string; color: string } | null = null;
+  let okBadgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const inFlightEffects = new Set<Promise<void>>();
+  const idleWaiters = new Set<() => void>();
+
+  const trackEffect = (promise: Promise<void>): Promise<void> => {
+    const tracked = promise.catch(() => undefined);
+    inFlightEffects.add(tracked);
+    void tracked.finally(() => {
+      inFlightEffects.delete(tracked);
+      notifyIdleWaiters();
+    });
+    return tracked;
+  };
+
+  const notifyIdleWaiters = (): void => {
+    if (
+      liveJobIds.size === 0 &&
+      pendingQueue.length === 0 &&
+      runningWorkers === 0 &&
+      inFlightEffects.size === 0
+    ) {
+      for (const resolve of idleWaiters) {
+        resolve();
+      }
+      idleWaiters.clear();
+    }
+  };
+
+  const getJobsSnapshot = (): ClipJob[] => jobs.map(cloneClipJob);
+
+  const findJob = (jobId: string): ClipJob | undefined =>
+    jobs.find((job) => job.id === jobId);
+
+  const getActiveJobCount = (): number =>
+    jobs.reduce(
+      (count, job) => count + (isActiveClipJobStatus(job.status) ? 1 : 0),
+      0,
+    );
+
+  const hasErrorJob = (): boolean => jobs.some((job) => job.status === 'error');
+
+  const clearOkBadgeTimer = (): void => {
+    if (okBadgeTimer !== null) {
+      clearTimeout(okBadgeTimer);
+      okBadgeTimer = null;
+    }
+  };
+
+  const applyBadge = (text: string, color: string): Promise<void> => {
+    if (lastBadge && lastBadge.text === text && lastBadge.color === color) {
+      return badgeChain;
+    }
+    lastBadge = { text, color };
+    const next = badgeChain.then(() => setBadge(text, color));
+    badgeChain = next.catch(() => undefined);
+    return trackEffect(next);
+  };
+
+  const syncBadge = (reason: BadgeSyncReason): Promise<void> => {
+    const activeCount = getActiveJobCount();
+    if (activeCount > 0) {
+      clearOkBadgeTimer();
+      return applyBadge(String(activeCount), BADGE_COLOR_ACTIVE);
+    }
+
+    if (hasErrorJob()) {
+      clearOkBadgeTimer();
+      return applyBadge('!', BADGE_COLOR_ERROR);
+    }
+
+    if (reason === 'job-completed') {
+      clearOkBadgeTimer();
+      const promise = applyBadge('OK', BADGE_COLOR_DONE);
+      const timer = setTimeout(() => {
+        okBadgeTimer = null;
+        if (getActiveJobCount() === 0 && !hasErrorJob()) {
+          void applyBadge('', '');
+        }
+      }, badgeClearDelayMs);
+      if (
+        typeof timer === 'object' &&
+        timer !== null &&
+        'unref' in timer &&
+        typeof (timer as { unref?: unknown }).unref === 'function'
+      ) {
+        (timer as { unref: () => void }).unref();
+      }
+      okBadgeTimer = timer;
+      return promise;
+    }
+
+    if (reason === 'dismissed' || reason === 'cleared') {
+      clearOkBadgeTimer();
+      return applyBadge('', '');
+    }
+
+    // On hydrate with no active jobs and no errors, keep any existing empty state clean.
+    if (okBadgeTimer === null && lastBadge && lastBadge.text.length > 0) {
+      return applyBadge('', '');
+    }
+    return badgeChain;
+  };
+
+  const emitPushOrdered = (message: BackgroundPushMessage): Promise<void> => {
+    const next = pushChain.then(() => emitPushMessage(message));
+    pushChain = next.catch(() => undefined);
+    return trackEffect(next);
+  };
+
+  const emitProgress = (event: ClipProgressEvent): Promise<void> =>
+    emitPushOrdered({ type: 'CLIP_PROGRESS', event });
+
+  const commitJobs = (reason: BadgeSyncReason): Promise<void> => {
+    jobs = pruneClipJobs(jobs);
+    const snapshot = getJobsSnapshot();
+    pendingPersistSnapshot = snapshot;
+
+    const persistOp = persistChain.then(async () => {
+      const toWrite = pendingPersistSnapshot;
+      if (!toWrite) {
+        return;
+      }
+      pendingPersistSnapshot = null;
+      await getStorageSession().set({ [STORAGE_KEYS.clipJobs]: toWrite });
+    });
+    persistChain = persistOp.catch(() => undefined);
+
+    const badgeOp = syncBadge(reason);
+    const broadcastOp = emitPushOrdered({
+      type: 'CLIP_JOBS_UPDATED',
+      jobs: snapshot,
+    });
+
+    return trackEffect(
+      Promise.all([persistOp, badgeOp, broadcastOp]).then(() => undefined),
+    );
+  };
+
+  const updateJobSync = (
+    jobId: string,
+    patch: Partial<Omit<ClipJob, 'id' | 'createdAt'>>,
+  ): ClipJob | null => {
+    const idx = jobs.findIndex((job) => job.id === jobId);
+    if (idx === -1) {
+      return null;
+    }
+    const updated: ClipJob = {
+      ...jobs[idx],
+      ...patch,
+      updatedAt: now().toISOString(),
+    };
+    jobs[idx] = updated;
+    return updated;
+  };
+
+  const ensureHydrated = (): Promise<void> => {
+    if (!hydrationPromise) {
+      hydrationPromise = (async () => {
+        const stored = await getStorageSession().get(STORAGE_KEYS.clipJobs);
+        const restored = normalizeClipJobs(stored[STORAGE_KEYS.clipJobs]);
+
+        let recoveredOrphans = false;
+        const recoveryTimestamp = now().toISOString();
+
+        const reconciled = restored.map((job) => {
+          if (isActiveClipJobStatus(job.status) && !liveJobIds.has(job.id)) {
+            recoveredOrphans = true;
+            return {
+              ...job,
+              status: 'error' as const,
+              message: ORPHANED_JOB_ERROR_MESSAGE,
+              error: ORPHANED_JOB_ERROR_MESSAGE,
+              updatedAt: recoveryTimestamp,
+            };
+          }
+          return job;
+        });
+
+        // Merge any live jobs created concurrently (if any) ahead of restored ones.
+        if (jobs.length === 0) {
+          jobs = pruneClipJobs(reconciled);
+        } else {
+          const existingIds = new Set(jobs.map((job) => job.id));
+          jobs = pruneClipJobs([
+            ...jobs,
+            ...reconciled.filter((job) => !existingIds.has(job.id)),
+          ]);
+        }
+
+        if (recoveredOrphans) {
+          await commitJobs('hydrate');
+        } else if (hasErrorJob() || getActiveJobCount() > 0) {
+          await syncBadge('hydrate');
+        }
+      })().catch((error) => {
+        hydrationPromise = null;
+        throw error;
+      });
+    }
+    return hydrationPromise;
+  };
+
+  // --- Worker execution ---
+
+  const executeQueuedTask = async (task: QueuedUploadTask): Promise<void> => {
+    const { jobId, request, extracted, settings, effectiveFolderName, resolveResult } =
+      task;
+
+    try {
+      const totalImages = extracted.images.length;
+      const downloadMessage =
+        totalImages > 0
+          ? `Downloading images (0/${totalImages})...`
+          : 'No images to download';
+
+      updateJobSync(jobId, {
+        status: 'downloading',
+        message: downloadMessage,
+        completed: 0,
+        total: totalImages,
+      });
+      await commitJobs('active-updated');
+      await emitProgress({
+        clipId: jobId,
+        stage: 'downloading',
+        message: downloadMessage,
+        completed: 0,
+        total: totalImages,
+      });
+
+      const batch = await fetchImagesImpl(extracted.images, extracted.url, {
+        concurrency: settings.imageConcurrency,
+        maxBytes: settings.maxImageSizeBytes,
+        fetchImpl,
+        ...deps.imageFetchOptions,
+        onProgress: (completed, total) => {
+          const current = findJob(jobId);
+          if (!current || current.status !== 'downloading') {
+            return;
+          }
+          const progressMsg = `Downloading images (${completed}/${total})...`;
+          updateJobSync(jobId, {
+            message: progressMsg,
+            completed,
+            total,
+          });
+          void commitJobs('active-updated');
+          void emitProgress({
+            clipId: jobId,
+            stage: 'downloading',
+            message: progressMsg,
+            completed,
+            total,
+          });
+        },
+      });
+
+      const rootFolder = await ensureRootFolderForClip(true);
+
+      const totalUploads = batch.succeeded.length + 1;
+      const initialUploadMsg = `Uploading to Google Drive (0/${totalUploads})...`;
+      updateJobSync(jobId, {
+        status: 'uploading',
+        message: initialUploadMsg,
+        completed: 0,
+        total: totalUploads,
+      });
+      await commitJobs('active-updated');
+      await emitProgress({
+        clipId: jobId,
+        stage: 'uploading',
+        message: initialUploadMsg,
+        completed: 0,
+        total: totalUploads,
+      });
+
+      const clippedAt = now().toISOString();
+      const explicitTitle = request.title?.trim();
+
+      const result = await driveClient.uploadArticle({
+        rootFolderId: rootFolder.folderId,
+        page: extracted,
+        fetchedImages: batch.succeeded,
+        failedImages: batch.failed,
+        ...(explicitTitle ? { title: explicitTitle } : {}),
+        tags: request.tags ?? settings.defaultTags,
+        folderName: effectiveFolderName,
+        clippedAt,
+        frontmatterPreferences: settings.frontmatter,
+        uploadConcurrency: settings.imageConcurrency,
+        interactive: true,
+        onProgress: (completed, total) => {
+          const current = findJob(jobId);
+          if (!current || current.status !== 'uploading') {
+            return;
+          }
+          const resolvedTotal = total || totalUploads;
+          const progressMsg =
+            completed < resolvedTotal
+              ? `Uploading to Google Drive (${completed}/${resolvedTotal})...`
+              : 'Finalizing README.md...';
+          updateJobSync(jobId, {
+            message: progressMsg,
+            completed,
+            total: resolvedTotal,
+          });
+          void commitJobs('active-updated');
+          void emitProgress({
+            clipId: jobId,
+            stage: 'uploading',
+            message: progressMsg,
+            completed,
+            total: resolvedTotal,
+          });
+        },
+      });
+
+      await recordClipHistory(result);
+
+      liveJobIds.delete(jobId);
+      updateJobSync(jobId, {
+        status: 'done',
+        title: result.title,
+        folderName: result.folderName,
+        message: 'Saved to Google Drive',
+        completed: totalUploads,
+        total: totalUploads,
+        result,
+        error: undefined,
+        errorCode: undefined,
+      });
+      await commitJobs('job-completed');
+      await emitProgress({
+        clipId: jobId,
+        stage: 'done',
+        message: 'Saved to Google Drive',
+        result,
+      });
+
+      resolveResult({ ok: true, data: result });
+    } catch (error) {
+      if (error instanceof DriveApiError && error.status === 404) {
+        cachedRootFolder = null;
+      }
+
+      const message = errorToMessage(error);
+      const code = classifyErrorCode(error);
+
+      liveJobIds.delete(jobId);
+      updateJobSync(jobId, {
+        status: 'error',
+        message,
+        error: message,
+        errorCode: code,
+      });
+      await commitJobs('job-failed');
+      await emitProgress({
+        clipId: jobId,
+        stage: 'error',
+        message,
+        error: message,
+      });
+
+      resolveResult({
+        ok: false,
+        code,
+        error: message,
+      });
+    } finally {
+      jobCompletions.delete(jobId);
+    }
+  };
+
+  const drainQueue = (): void => {
+    while (runningWorkers < maxConcurrentJobs && pendingQueue.length > 0) {
+      const nextTask = pendingQueue.shift();
+      if (!nextTask) {
+        break;
+      }
+      runningWorkers += 1;
+      void executeQueuedTask(nextTask).finally(() => {
+        runningWorkers -= 1;
+        drainQueue();
+        notifyIdleWaiters();
+      });
+    }
+    notifyIdleWaiters();
+  };
+
+  // --- Tab resolution and content script messaging ---
 
   const resolveTargetTab = async (
     requestedTabId?: number,
   ): Promise<
-    | { ok: true; tabId: number; url: string }
+    | { ok: true; tabId: number; url: string; title?: string }
     | { ok: false; code: BackgroundErrorCode; error: string }
   > => {
     const tabsApi = getTabsApi();
@@ -433,7 +1123,14 @@ export function createServiceWorkerController(
       };
     }
 
-    return { ok: true, tabId: tab.id, url: tab.url };
+    return {
+      ok: true,
+      tabId: tab.id,
+      url: tab.url,
+      ...(typeof tab.title === 'string' && tab.title.trim().length > 0
+        ? { title: tab.title }
+        : {}),
+    };
   };
 
   const injectAndSendContentMessage = async (
@@ -552,6 +1249,7 @@ export function createServiceWorkerController(
 
   const signOut = async (): Promise<BackgroundResponse<AuthStatus>> => {
     const oauthConfigured = isOAuthConfigured();
+    cachedRootFolder = null;
 
     if (oauthConfigured) {
       let currentToken: string | null = null;
@@ -605,6 +1303,12 @@ export function createServiceWorkerController(
         rootFolderId: folderInfo.folderId,
       });
 
+      cachedRootFolder = {
+        info: folderInfo,
+        rootFolderName: folderInfo.folderName,
+        verifiedAtMs: now().getTime(),
+      };
+
       return { ok: true, data: folderInfo };
     } catch (error) {
       return {
@@ -615,9 +1319,11 @@ export function createServiceWorkerController(
     }
   };
 
-  const runClip = async (
+  // --- Public Clip Job Queue operations ---
+
+  const enqueueClip = async (
     request: ClipRequest,
-  ): Promise<BackgroundResponse<ClipResult>> => {
+  ): Promise<BackgroundResponse<ClipJob>> => {
     if (!isOAuthConfigured()) {
       return {
         ok: false,
@@ -632,17 +1338,46 @@ export function createServiceWorkerController(
       return target;
     }
 
+    await ensureHydrated();
+
     const clipId = createClipId();
+    const createdAt = now().toISOString();
+    const explicitTitle = request.title?.trim();
+    const initialTitle =
+      explicitTitle ||
+      (target.title ? cleanPageTitle(target.title) : '') ||
+      target.url;
+    const explicitFolderName = request.folderName?.trim();
+    const initialFolderName =
+      explicitFolderName || buildArticleFolderName(initialTitle, createdAt);
+
+    const initialJob: ClipJob = {
+      id: clipId,
+      tabId: target.tabId,
+      url: target.url,
+      title: initialTitle,
+      folderName: initialFolderName,
+      mode: request.mode,
+      status: 'extracting',
+      message: 'Extracting page content...',
+      createdAt,
+      updatedAt: createdAt,
+    };
+
+    liveJobIds.add(clipId);
+    jobs.unshift(initialJob);
+    await commitJobs('active-updated');
+    await emitProgress({
+      clipId,
+      stage: 'extracting',
+      message: 'Extracting page content...',
+    });
+
+    let settings: ExtensionSettings;
+    let extracted: ExtractedPage;
 
     try {
-      const settings = await getSettings();
-
-      await emitProgress({
-        clipId,
-        stage: 'extracting',
-        message: 'Extracting page content...',
-      });
-
+      settings = await getSettings();
       const extractResponse = await injectAndSendContentMessage(target.tabId, {
         type: 'CONTENT_EXTRACT_PAGE',
         mode: request.mode,
@@ -652,12 +1387,22 @@ export function createServiceWorkerController(
         const message = extractResponse.ok
           ? 'Unexpected extraction response from content script.'
           : extractResponse.error;
+
+        liveJobIds.delete(clipId);
+        updateJobSync(clipId, {
+          status: 'error',
+          message,
+          error: message,
+          errorCode: 'EXTRACTION_FAILED',
+        });
+        await commitJobs('job-failed');
         await emitProgress({
           clipId,
           stage: 'error',
           message,
           error: message,
         });
+        notifyIdleWaiters();
         return {
           ok: false,
           code: 'EXTRACTION_FAILED',
@@ -665,104 +1410,144 @@ export function createServiceWorkerController(
         };
       }
 
-      const extracted = extractResponse.data;
-      const totalImages = extracted.images.length;
-
-      await emitProgress({
-        clipId,
-        stage: 'downloading',
-        message:
-          totalImages > 0
-            ? `Downloading images (0/${totalImages})...`
-            : 'No images to download',
-        completed: 0,
-        total: totalImages,
-      });
-
-      const batch = await fetchImagesImpl(extracted.images, extracted.url, {
-        concurrency: settings.imageConcurrency,
-        maxBytes: settings.maxImageSizeBytes,
-        fetchImpl,
-        ...deps.imageFetchOptions,
-        onProgress: (completed, total) => {
-          void emitProgress({
-            clipId,
-            stage: 'downloading',
-            message: `Downloading images (${completed}/${total})...`,
-            completed,
-            total,
-          });
-        },
-      });
-
-      const rootFolder = await driveClient.ensureRootFolder({
-        rootFolderName: settings.rootFolderName,
-        rootFolderId: settings.rootFolderId,
-        interactive: true,
-      });
-
-      if (
-        rootFolder.folderId !== settings.rootFolderId ||
-        rootFolder.folderName !== settings.rootFolderName
-      ) {
-        await updateSettings({
-          rootFolderId: rootFolder.folderId,
-          rootFolderName: rootFolder.folderName,
-        });
-      }
-
-      const totalUploads = batch.succeeded.length + 1;
-      const clippedAt = now().toISOString();
-
-      const result = await driveClient.uploadArticle({
-        rootFolderId: rootFolder.folderId,
-        page: extracted,
-        fetchedImages: batch.succeeded,
-        failedImages: batch.failed,
-        title: request.title,
-        tags: request.tags ?? settings.defaultTags,
-        folderName: request.folderName,
-        clippedAt,
-        frontmatterPreferences: settings.frontmatter,
-        uploadConcurrency: settings.imageConcurrency,
-        interactive: true,
-        onProgress: (completed, total) => {
-          void emitProgress({
-            clipId,
-            stage: 'uploading',
-            message:
-              completed < total
-                ? `Uploading to Google Drive (${completed}/${total})...`
-                : 'Finalizing README.md...',
-            completed,
-            total: total || totalUploads,
-          });
-        },
-      });
-
-      await recordClipHistory(result);
-
-      await emitProgress({
-        clipId,
-        stage: 'done',
-        message: 'Saved to Google Drive',
-        result,
-      });
-
-      return { ok: true, data: result };
+      extracted = extractResponse.data;
     } catch (error) {
       const message = errorToMessage(error);
+      liveJobIds.delete(clipId);
+      updateJobSync(clipId, {
+        status: 'error',
+        message,
+        error: message,
+        errorCode: 'EXTRACTION_FAILED',
+      });
+      await commitJobs('job-failed');
       await emitProgress({
         clipId,
         stage: 'error',
         message,
         error: message,
       });
+      notifyIdleWaiters();
       return {
         ok: false,
-        code: classifyErrorCode(error),
+        code: 'EXTRACTION_FAILED',
         error: message,
       };
+    }
+
+    const effectiveTitle = explicitTitle || extracted.title || initialTitle;
+    const effectiveFolderName =
+      explicitFolderName || buildArticleFolderName(effectiveTitle, createdAt);
+
+    const queuedJob = updateJobSync(clipId, {
+      url: extracted.url || target.url,
+      title: effectiveTitle,
+      folderName: effectiveFolderName,
+      mode: extracted.mode,
+      status: 'queued',
+      message: 'Queued for background upload...',
+    });
+    await commitJobs('active-updated');
+
+    const acceptedJob = cloneClipJob(queuedJob ?? initialJob);
+
+    let resolveResult!: (result: BackgroundResponse<ClipResult>) => void;
+    const completionPromise = new Promise<BackgroundResponse<ClipResult>>(
+      (resolve) => {
+        resolveResult = resolve;
+      },
+    );
+    jobCompletions.set(clipId, completionPromise);
+
+    pendingQueue.push({
+      jobId: clipId,
+      request,
+      extracted,
+      settings,
+      effectiveFolderName,
+      resolveResult,
+    });
+    drainQueue();
+
+    return { ok: true, data: acceptedJob };
+  };
+
+  const runClip = async (
+    request: ClipRequest,
+  ): Promise<BackgroundResponse<ClipResult>> => {
+    const enqueued = await enqueueClip(request);
+    if (!enqueued.ok) {
+      return enqueued;
+    }
+
+    const completion = jobCompletions.get(enqueued.data.id);
+    if (completion) {
+      return completion;
+    }
+
+    const finished = findJob(enqueued.data.id);
+    if (finished?.status === 'done' && finished.result) {
+      return { ok: true, data: finished.result };
+    }
+    return {
+      ok: false,
+      code: finished?.errorCode ?? 'DRIVE_ERROR',
+      error: finished?.error ?? 'Clip job did not complete.',
+    };
+  };
+
+  const getClipJobs = async (): Promise<ClipJob[]> => {
+    await ensureHydrated();
+    return getJobsSnapshot();
+  };
+
+  const dismissClipJob = async (jobId: string): Promise<ClipJob[]> => {
+    await ensureHydrated();
+    const target = findJob(jobId);
+    if (target && !isActiveClipJobStatus(target.status)) {
+      jobs = jobs.filter((job) => job.id !== jobId);
+      await commitJobs('dismissed');
+    }
+    return getJobsSnapshot();
+  };
+
+  const clearCompletedJobs = async (): Promise<ClipJob[]> => {
+    await ensureHydrated();
+    const before = jobs.length;
+    jobs = jobs.filter((job) => isActiveClipJobStatus(job.status));
+    if (jobs.length !== before) {
+      await commitJobs('cleared');
+    }
+    return getJobsSnapshot();
+  };
+
+  const whenIdle = async (): Promise<void> => {
+    for (;;) {
+      if (
+        liveJobIds.size === 0 &&
+        pendingQueue.length === 0 &&
+        runningWorkers === 0 &&
+        inFlightEffects.size === 0
+      ) {
+        await Promise.all([
+          persistChain,
+          pushChain,
+          badgeChain,
+          historyWriteChain,
+          settingsWriteChain,
+        ]);
+        if (
+          liveJobIds.size === 0 &&
+          pendingQueue.length === 0 &&
+          runningWorkers === 0 &&
+          inFlightEffects.size === 0
+        ) {
+          return;
+        }
+      }
+      await new Promise<void>((resolve) => {
+        idleWaiters.add(resolve);
+      });
     }
   };
 
@@ -781,7 +1566,24 @@ export function createServiceWorkerController(
       case 'GET_PAGE_INFO':
         return getPageInfo(rawMessage.tabId);
       case 'START_CLIP':
-        return runClip(rawMessage.request);
+        return enqueueClip(rawMessage.request);
+      case 'GET_CLIP_JOBS':
+        return { ok: true, data: await getClipJobs() };
+      case 'DISMISS_CLIP_JOB': {
+        if (
+          typeof rawMessage.jobId !== 'string' ||
+          rawMessage.jobId.trim().length === 0
+        ) {
+          return {
+            ok: false,
+            code: 'INVALID_MESSAGE',
+            error: 'Missing jobId for DISMISS_CLIP_JOB.',
+          };
+        }
+        return { ok: true, data: await dismissClipJob(rawMessage.jobId) };
+      }
+      case 'CLEAR_COMPLETED_JOBS':
+        return { ok: true, data: await clearCompletedJobs() };
       case 'GET_SETTINGS':
         return { ok: true, data: await getSettings() };
       case 'UPDATE_SETTINGS':
@@ -810,23 +1612,26 @@ export function createServiceWorkerController(
       return;
     }
 
-    await setBadge('...', '#2563eb');
     const result = await runClip({
       tabId: tab?.id,
       mode: 'selection',
     });
 
-    if (result.ok) {
-      await setBadge('OK', '#16a34a');
-    } else {
-      await setBadge('!', '#dc2626');
+    if (!result.ok && getActiveJobCount() === 0 && !hasErrorJob()) {
+      clearOkBadgeTimer();
+      await applyBadge('!', BADGE_COLOR_ERROR);
     }
   };
 
   return {
     handleMessage,
+    enqueueClip,
     runClip,
     handleContextMenuClick,
+    getClipJobs,
+    dismissClipJob,
+    clearCompletedJobs,
+    whenIdle,
     getSettings,
     updateSettings,
     getHistory,
@@ -857,6 +1662,10 @@ function registerServiceWorkerListeners(): void {
 
   scope[SW_LISTENER_SENTINEL] = true;
   const controller = createServiceWorkerController();
+
+  // Eagerly recover orphaned jobs and DNR session rules after a cold SW restart.
+  void cleanupOrphanedRefererSessionRules().catch(() => undefined);
+  void controller.getClipJobs().catch(() => undefined);
 
   chrome.runtime.onInstalled?.addListener(() => {
     registerContextMenus();

@@ -16,6 +16,28 @@ const SAFE_UNQUOTED_YAML_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const YAML_RESERVED_LITERAL_RE =
   /^(?:true|false|yes|no|on|off|null|~|[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?|0x[0-9a-fA-F]+|0o[0-7]+|\d{4}-\d{2}-\d{2})$/i;
 
+const ZH_NOTIFICATION_UNIT =
+  '(?:封私信|条私信|条新消息|条消息|条通知|条未读消息|条未读|个未读|个新消息|个通知|个提醒|条提醒|条新动态|条动态|条评论|条回复|封未读邮件|封邮件)';
+const ZH_NOTIFICATION_CLAUSE = `\\d+\\+?\\s*${ZH_NOTIFICATION_UNIT}`;
+const ZH_NOTIFICATION_INNER = `${ZH_NOTIFICATION_CLAUSE}(?:\\s*[/／、,，·|]\\s*${ZH_NOTIFICATION_CLAUSE})*`;
+const EN_NOTIFICATION_INNER =
+  '\\d+\\+?\\s*(?:unread(?:\\s+(?:messages?|emails?|notifications?|items?))?|new\\s+(?:messages?|notifications?|alerts?)|messages?|notifications?|alerts?)';
+// 1–3 digits (1..999) with optional "+", avoiding 4-digit years like "(2026)".
+const NUMERIC_UNREAD_INNER = '[1-9]\\d{0,2}\\+?';
+
+const LEADING_UNREAD_PREFIX_RE = new RegExp(
+  `^(?:[•·]\\s*)?(?:` +
+    `(?:\\(\\s*${ZH_NOTIFICATION_INNER}\\s*\\)|\\[\\s*${ZH_NOTIFICATION_INNER}\\s*\\]|（\\s*${ZH_NOTIFICATION_INNER}\\s*）)\\s*` +
+    `|` +
+    `(?:\\(\\s*${EN_NOTIFICATION_INNER}\\s*\\)|\\[\\s*${EN_NOTIFICATION_INNER}\\s*\\]|（\\s*${EN_NOTIFICATION_INNER}\\s*）)(?:\\s+|(?=[^\\x00-\\x7f]))` +
+    `|` +
+    `(?:\\(\\s*${NUMERIC_UNREAD_INNER}\\s*\\)|\\[\\s*${NUMERIC_UNREAD_INNER}\\s*\\])(?:\\s+|(?=[^\\x00-\\x7f]))` +
+    `|` +
+    `（\\s*${NUMERIC_UNREAD_INNER}\\s*）\\s*` +
+    `)`,
+  'i',
+);
+
 export interface FrontmatterInput {
   title: string;
   url: string;
@@ -26,6 +48,31 @@ export interface FrontmatterInput {
   tags?: string[];
   images?: string[];
   warnings?: string[];
+}
+
+/**
+ * Strips leading site unread/notification prefixes (e.g. Zhihu
+ * `(20 封私信 / 17 条消息) ...`, X `(3) ...`, `(99+) ...`, `[12] ...`)
+ * from default page titles while preserving legitimate parentheticals
+ * such as `(2026) Annual Report`, `(Part 1) Guide`, `(RFC 9110) HTTP`,
+ * and `(Beta) Feature`.
+ */
+export function cleanPageTitle(rawTitle: string): string {
+  const trimmed = rawTitle.trim();
+  if (trimmed.length === 0) {
+    return '';
+  }
+
+  let current = trimmed;
+  for (;;) {
+    const next = current.replace(LEADING_UNREAD_PREFIX_RE, '').trimStart();
+    if (next === current || next.length === 0) {
+      break;
+    }
+    current = next;
+  }
+
+  return current;
 }
 
 /**

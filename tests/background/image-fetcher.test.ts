@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  buildRefererSessionRules,
+  cleanupOrphanedRefererSessionRules,
   detectImageFormat,
   fetchImages,
   withRefererSessionRules,
@@ -68,6 +70,9 @@ function createFakeDnr() {
   const history: chrome.declarativeNetRequest.UpdateRuleOptions[] = [];
 
   const dnr: DeclarativeNetRequestLike = {
+    async getSessionRules() {
+      return Array.from(activeRules.values());
+    },
     async updateSessionRules(options) {
       history.push(options);
       if (options.removeRuleIds) {
@@ -77,6 +82,9 @@ function createFakeDnr() {
       }
       if (options.addRules) {
         for (const rule of options.addRules) {
+          if (activeRules.has(rule.id)) {
+            throw new Error(`Duplicate DNR session rule ID: ${rule.id}`);
+          }
           activeRules.set(rule.id, rule);
         }
       }
@@ -213,7 +221,9 @@ describe('fetchImages', () => {
       { header: 'Referer', operation: 'set', value: pageUrl },
     ]);
     expect(addedRule.condition.tabIds).toEqual([-1]);
-    expect(addedRule.condition.urlFilter).toBe('|https://img.example.org/protected/hero');
+    expect(addedRule.condition.urlFilter).toBe(
+      '|https://img.example.org/protected/hero|',
+    );
 
     // Exact rule ID removed after fetch completes.
     expect(activeRules.size).toBe(0);
@@ -290,6 +300,156 @@ describe('fetchImages', () => {
     expect(activeRules.size).toBe(0);
     // Both rules coexisted without overwriting each other's IDs.
     expect(observedRuleSets.some((ids) => ids.length === 2)).toBe(true);
+  });
+
+  it('isolates exact-URL DNR Referer rules across concurrent articles sharing the same CDN host and removes only each call’s own rule IDs', async () => {
+    const { dnr, activeRules, history } = createFakeDnr();
+    const articleA = 'https://zhuanlan.zhihu.com/p/111';
+    const articleB = 'https://zhuanlan.zhihu.com/p/222';
+
+    const imgA1 = 'https://pic1.zhimg.com/img/1';
+    const imgA2 = 'https://pic1.zhimg.com/proxy?id=1';
+    const imgB1 = 'https://pic1.zhimg.com/img/10';
+    const imgB2 = 'https://pic1.zhimg.com/proxy?id=2';
+
+    let releaseJobA!: () => void;
+    let releaseJobB!: () => void;
+    const jobAGate = new Promise<void>((resolve) => {
+      releaseJobA = resolve;
+    });
+    const jobBGate = new Promise<void>((resolve) => {
+      releaseJobB = resolve;
+    });
+
+    let bothStartedResolve!: () => void;
+    const bothStarted = new Promise<void>((resolve) => {
+      bothStartedResolve = resolve;
+    });
+    const startedJobs = new Set<string>();
+
+    const makeGatedFetch =
+      (jobName: string, gate: Promise<void>): typeof fetch =>
+      async () => {
+        startedJobs.add(jobName);
+        if (startedJobs.size === 2) {
+          bothStartedResolve();
+        }
+        await gate;
+        return makeBinaryResponse(PNG_BYTES, 'image/png');
+      };
+
+    const runA = fetchImages(
+      [makeImage(1, imgA1), makeImage(2, imgA2)],
+      articleA,
+      { dnr, fetchImpl: makeGatedFetch('A', jobAGate) },
+    );
+    const runB = fetchImages(
+      [makeImage(1, imgB1), makeImage(2, imgB2)],
+      articleB,
+      { dnr, fetchImpl: makeGatedFetch('B', jobBGate) },
+    );
+
+    await bothStarted;
+
+    // All 4 specific-URL rules coexist with unique IDs and distinct Referers (no broad host wildcards).
+    expect(activeRules.size).toBe(4);
+    const rulesDuringOverlap = Array.from(activeRules.values());
+    const filtersByReferer = new Map<string, string[]>();
+    for (const rule of rulesDuringOverlap) {
+      const ref = rule.action.requestHeaders?.[0]?.value ?? '';
+      const filter = rule.condition.urlFilter ?? '';
+      expect(filter).not.toBe('|https://pic1.zhimg.com/');
+      filtersByReferer.set(ref, [...(filtersByReferer.get(ref) ?? []), filter]);
+    }
+
+    expect(filtersByReferer.get(articleA)?.sort()).toEqual([
+      '|https://pic1.zhimg.com/img/1|',
+      '|https://pic1.zhimg.com/proxy?id=1|',
+    ]);
+    expect(filtersByReferer.get(articleB)?.sort()).toEqual([
+      '|https://pic1.zhimg.com/img/10|',
+      '|https://pic1.zhimg.com/proxy?id=2|',
+    ]);
+
+    // Finish Job A first: only Job A's rule IDs are removed; Job B's rules remain active!
+    releaseJobA();
+    const resA = await runA;
+    expect(resA.succeeded).toHaveLength(2);
+    expect(activeRules.size).toBe(2);
+    for (const remainingRule of activeRules.values()) {
+      expect(remainingRule.action.requestHeaders?.[0]?.value).toBe(articleB);
+    }
+
+    // Finish Job B: all rules cleaned up cleanly.
+    releaseJobB();
+    const resB = await runB;
+    expect(resB.succeeded).toHaveLength(2);
+    expect(activeRules.size).toBe(0);
+    expect(history.filter((entry) => entry.removeRuleIds)).toHaveLength(2);
+  });
+
+  it('uses exact regexFilter for image URLs containing DNR wildcards (*|^) instead of falling back to a broad origin rule', () => {
+    const rules = buildRefererSessionRules('https://site.example/post/1', [
+      'https://cdn.example/images/hero*2x|alt.png?v=1^2',
+    ]);
+    expect(rules).toHaveLength(1);
+    expect(rules[0].condition.urlFilter).toBeUndefined();
+    expect(rules[0].condition.regexFilter).toBe(
+      '^https://cdn\\.example/images/hero\\*2x\\|alt\\.png\\?v=1\\^2$',
+    );
+    expect(rules[0].priority).toBe(2);
+  });
+
+  it('cleans up orphaned SW Referer session rules while preserving active batch rules and unrelated rules', async () => {
+    const { dnr, activeRules } = createFakeDnr();
+    const orphanRule: chrome.declarativeNetRequest.Rule = {
+      id: 777,
+      priority: 2,
+      action: {
+        type: 'modifyHeaders' as chrome.declarativeNetRequest.RuleActionType,
+        requestHeaders: [
+          {
+            header: 'Referer',
+            operation: 'set' as chrome.declarativeNetRequest.HeaderOperation,
+            value: 'https://stale.example/article',
+          },
+        ],
+      },
+      condition: {
+        urlFilter: '|https://cdn.example/stale.png|',
+        tabIds: [-1],
+        resourceTypes: ['image'] as chrome.declarativeNetRequest.ResourceType[],
+      },
+    };
+    const unrelatedRule: chrome.declarativeNetRequest.Rule = {
+      id: 888,
+      priority: 1,
+      action: {
+        type: 'allow' as chrome.declarativeNetRequest.RuleActionType,
+      },
+      condition: {
+        urlFilter: '|https://other.example/',
+      },
+    };
+    await dnr.updateSessionRules({ addRules: [orphanRule, unrelatedRule] });
+
+    const removed = await withRefererSessionRules(
+      dnr,
+      'https://live.example/article',
+      ['https://cdn.example/live.png'],
+      async () => {
+        const cleaned = await cleanupOrphanedRefererSessionRules(dnr);
+        // Orphan 777 removed, active live rule + unrelated rule 888 preserved!
+        expect(cleaned).toEqual([777]);
+        expect(activeRules.has(777)).toBe(false);
+        expect(activeRules.has(888)).toBe(true);
+        expect(activeRules.size).toBe(2);
+        return cleaned;
+      },
+    );
+
+    expect(removed).toEqual([777]);
+    expect(Array.from(activeRules.keys())).toEqual([888]);
   });
 
   it('gracefully returns structured failures for 404, network error, timeout, non-image payload, and size cap without failing valid images', async () => {

@@ -1,13 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { DeclarativeNetRequestLike } from '../../src/background/image-fetcher.js';
 import {
   CONTEXT_MENU_CLIP_SELECTION_ID,
   MAX_CLIP_HISTORY_ITEMS,
+  MAX_CLIP_JOBS,
+  ORPHANED_JOB_ERROR_MESSAGE,
   createServiceWorkerController,
 } from '../../src/background/service-worker.js';
 import { DriveClient, type UploadArticleParams } from '../../src/drive/drive-client.js';
 import {
   OAUTH_CLIENT_ID_PLACEHOLDER,
+  STORAGE_KEYS,
   type BackgroundPushMessage,
+  type ClipJob,
   type ClipProgressEvent,
   type ClipResult,
   type ContentRequestMessage,
@@ -95,6 +100,7 @@ describe('service-worker controller', () => {
     const syncStorage = createMemoryStorage();
     const localStorage = createMemoryStorage();
     const pushEvents: ClipProgressEvent[] = [];
+    const jobSnapshots: ClipJob[][] = [];
     const executedInjections: chrome.scripting.ScriptInjection<unknown[], unknown>[] = [];
     const sentContentMessages: ContentRequestMessage[] = [];
 
@@ -194,9 +200,13 @@ describe('service-worker controller', () => {
         };
       }),
       emitPushMessage: async (msg: BackgroundPushMessage) => {
-        pushEvents.push(msg.event);
+        if (msg.type === 'CLIP_PROGRESS') {
+          pushEvents.push(msg.event);
+        } else if (msg.type === 'CLIP_JOBS_UPDATED') {
+          jobSnapshots.push(msg.jobs);
+        }
       },
-      createClipId: () => 'clip-test-id',
+      createClipId: () => `clip-test-id-${clipCounter + 1}`,
     });
 
     const response = await controller.handleMessage({
@@ -205,6 +215,14 @@ describe('service-worker controller', () => {
     });
 
     expect(response.ok).toBe(true);
+    if (response.ok) {
+      const acceptedJob = response.data as ClipJob;
+      expect(acceptedJob.status).toBe('queued');
+      expect(acceptedJob.title).toBe('Sample Post');
+    }
+
+    await controller.whenIdle();
+
     expect(executedInjections).toHaveLength(1);
     expect(executedInjections[0]).toEqual({
       target: { tabId: 7 },
@@ -220,6 +238,14 @@ describe('service-worker controller', () => {
     expect(stages).toContain('downloading');
     expect(stages).toContain('uploading');
     expect(stages[stages.length - 1]).toBe('done');
+
+    // Verify live job snapshot transitions: extracting -> queued -> downloading -> uploading -> done
+    const observedStatuses = jobSnapshots.map((snapshot) => snapshot[0]?.status);
+    expect(observedStatuses).toContain('extracting');
+    expect(observedStatuses).toContain('queued');
+    expect(observedStatuses).toContain('downloading');
+    expect(observedStatuses).toContain('uploading');
+    expect(observedStatuses[observedStatuses.length - 1]).toBe('done');
 
     // Root folder ID persisted in chrome.storage.sync.
     const savedSettings = await controller.getSettings();
@@ -385,7 +411,7 @@ describe('service-worker controller', () => {
       { type: 'CONTENT_EXTRACT_PAGE', mode: 'selection' },
     ]);
     expect(badgeCalls).toEqual([
-      ['...', '#2563eb'],
+      ['1', '#2563eb'],
       ['OK', '#16a34a'],
     ]);
   });
@@ -482,5 +508,482 @@ describe('service-worker controller', () => {
         (globalThis as Record<string, unknown>).chrome = originalChrome;
       }
     }
+  });
+
+  it('queues 5 concurrent tab clips with maxConcurrentJobs=2, single-flight ensureRootFolder, isolated DNR rules, tab-close resilience, storage.session persistence, and aggregate badge lifecycle', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const sessionStorage = createMemoryStorage();
+    const badgeCalls: Array<[string, string]> = [];
+    const jobSnapshots: ClipJob[][] = [];
+
+    const activeDnrRules = new Map<number, chrome.declarativeNetRequest.Rule>();
+    const observedDnrOverlaps: chrome.declarativeNetRequest.Rule[][] = [];
+    const dnr: DeclarativeNetRequestLike = {
+      async getSessionRules() {
+        return Array.from(activeDnrRules.values());
+      },
+      async updateSessionRules(options) {
+        if (options.removeRuleIds) {
+          for (const id of options.removeRuleIds) {
+            activeDnrRules.delete(id);
+          }
+        }
+        if (options.addRules) {
+          for (const rule of options.addRules) {
+            if (activeDnrRules.has(rule.id)) {
+              throw new Error(`DNR rule ID collision: ${rule.id}`);
+            }
+            activeDnrRules.set(rule.id, rule);
+          }
+        }
+      },
+    };
+
+    let tabsClosed = false;
+    let activeWorkers = 0;
+    let peakActiveWorkers = 0;
+    let maxSimultaneousQueued = 0;
+    let rootFolderCalls = 0;
+    let clipSeq = 0;
+
+    // Gate first two fetches until all 5 START_CLIP calls have returned so queue depth reaches 5.
+    let releaseDownloads!: () => void;
+    const downloadGate = new Promise<void>((resolve) => {
+      releaseDownloads = resolve;
+    });
+
+    const fetchImpl: typeof fetch = vi.fn(async () => {
+      observedDnrOverlaps.push(Array.from(activeDnrRules.values()));
+      await downloadGate;
+      await new Promise((r) => setTimeout(r, 15));
+      const copy = new Uint8Array(PNG_BYTES.byteLength);
+      copy.set(PNG_BYTES);
+      return new Response(copy, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'content-length': String(copy.byteLength),
+        },
+      });
+    });
+
+    const driveClient = {
+      ensureRootFolder: vi.fn(async ({ rootFolderName }) => {
+        rootFolderCalls += 1;
+        await new Promise((r) => setTimeout(r, 20));
+        return {
+          folderId: 'root-single-flight',
+          folderName: rootFolderName,
+          folderUrl: 'https://drive.google.com/drive/folders/root-single-flight',
+          created: true,
+        };
+      }),
+      uploadArticle: vi.fn(async (params: UploadArticleParams) => {
+        activeWorkers += 1;
+        peakActiveWorkers = Math.max(peakActiveWorkers, activeWorkers);
+        await new Promise((r) => setTimeout(r, 15));
+        activeWorkers -= 1;
+
+        const folderId = `folder-${params.page.url.split('/').pop()}`;
+        return {
+          folderId,
+          folderUrl: `https://drive.google.com/drive/folders/${folderId}`,
+          folderName: params.folderName ?? '2026-11-24-article',
+          readmeFileId: `readme-${folderId}`,
+          title: params.title ?? params.page.title,
+          sourceUrl: params.page.url,
+          clippedAt: params.clippedAt ?? '2026-11-24T04:00:00.000Z',
+          uploadedImages: params.fetchedImages.map((img) => ({
+            id: img.id,
+            filename: img.filename,
+            fileId: `file-${folderId}-${img.id}`,
+            mimeType: img.mimeType,
+            resolvedUrl: img.resolvedUrl,
+          })),
+          failedImages: [...(params.failedImages ?? [])],
+          warnings: [],
+          reusedFolder: false,
+        };
+      }),
+    } as unknown as DriveClient;
+
+    const controller = createServiceWorkerController({
+      driveClient,
+      fetchImpl,
+      storageSync: syncStorage,
+      storageLocal: localStorage,
+      storageSession: sessionStorage,
+      getManifest: () => makeConfiguredManifest(),
+      getAuthToken: async () => 'valid-token',
+      maxConcurrentJobs: 2,
+      badgeClearDelayMs: 30,
+      imageFetchOptions: { dnr },
+      now: () => new Date('2026-11-24T05:00:00.000Z'),
+      createClipId: () => `job-${++clipSeq}`,
+      tabs: {
+        query: async () => [],
+        get: async (tabId) => {
+          if (tabsClosed) {
+            throw new Error(`Tab ${tabId} was already closed`);
+          }
+          return {
+            id: tabId,
+            url: `https://zhuanlan.zhihu.com/p/${tabId}`,
+            title: `(20 封私信 / 17 条消息) 华硕 ProArt 评测 ${tabId}`,
+          } as chrome.tabs.Tab;
+        },
+        sendMessage: async (tabId): Promise<ContentResponseMessage> => {
+          if (tabsClosed) {
+            throw new Error(`Tab ${tabId} was already closed`);
+          }
+          const pageUrl = `https://zhuanlan.zhihu.com/p/${tabId}`;
+          const imgUrl = `https://pic1.zhimg.com/v2-pic-${tabId}.png?source=1`;
+          return {
+            ok: true,
+            type: 'CONTENT_EXTRACTED_PAGE',
+            data: {
+              ...makeExtractedPage(pageUrl),
+              title: `华硕 ProArt 评测 ${tabId}`,
+              images: [
+                {
+                  id: `img-${tabId}`,
+                  originalUrl: imgUrl,
+                  resolvedUrl: imgUrl,
+                  sourceUrls: [imgUrl],
+                  alt: `pic ${tabId}`,
+                  suggestedName: `01-pic-${tabId}`,
+                },
+              ],
+            },
+          };
+        },
+      },
+      scripting: {
+        executeScript: async () => [],
+      },
+      emitPushMessage: async (msg: BackgroundPushMessage) => {
+        if (msg.type === 'CLIP_JOBS_UPDATED') {
+          jobSnapshots.push(msg.jobs);
+          const queuedCount = msg.jobs.filter((j) => j.status === 'queued').length;
+          maxSimultaneousQueued = Math.max(maxSimultaneousQueued, queuedCount);
+        }
+      },
+      setBadge: async (text, color) => {
+        badgeCalls.push([text, color]);
+      },
+    });
+
+    // Fire 5 concurrent START_CLIP requests across 5 different tabs.
+    const responses = await Promise.all(
+      [1, 2, 3, 4, 5].map((tabId) =>
+        controller.handleMessage({
+          type: 'START_CLIP',
+          request: { tabId, mode: 'full' },
+        }),
+      ),
+    );
+
+    // Every START_CLIP resolves non-blocking with status === 'queued' before downloads complete.
+    for (const res of responses) {
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        const job = res.data as ClipJob;
+        expect(job.status).toBe('queued');
+        expect(job.title).not.toContain('封私信');
+        expect(job.folderName).not.toContain('封私信');
+      }
+    }
+
+    // Simulate user immediately closing all 5 tabs after clicking Clip!
+    tabsClosed = true;
+
+    // Inspect live jobs while downloads are paused: 2 downloading, 3 queued.
+    const midJobsRes = await controller.handleMessage({ type: 'GET_CLIP_JOBS' });
+    expect(midJobsRes.ok).toBe(true);
+    if (midJobsRes.ok) {
+      const midJobs = midJobsRes.data as ClipJob[];
+      expect(midJobs).toHaveLength(5);
+      expect(midJobs.filter((j) => j.status === 'downloading')).toHaveLength(2);
+      expect(midJobs.filter((j) => j.status === 'queued')).toHaveLength(3);
+    }
+
+    // Unblock downloads and wait for all 5 background jobs to finish.
+    releaseDownloads();
+    await controller.whenIdle();
+
+    // Queue concurrency stayed strictly bounded at 2, while 3 waited in 'queued'.
+    expect(peakActiveWorkers).toBeLessThanOrEqual(2);
+    expect(maxSimultaneousQueued).toBeGreaterThanOrEqual(3);
+
+    // Single-flight + burst cache: ensureRootFolder called exactly ONCE across all 5 clips!
+    expect(rootFolderCalls).toBe(1);
+    expect((await controller.getSettings()).rootFolderId).toBe('root-single-flight');
+
+    // Concurrent DNR rules never collided, used specific URLs (not host wildcards), and cleaned up.
+    expect(activeDnrRules.size).toBe(0);
+    const overlappingBatch = observedDnrOverlaps.find((rules) => rules.length === 2);
+    expect(overlappingBatch).toBeDefined();
+    if (overlappingBatch) {
+      const referers = overlappingBatch.map(
+        (r) => r.action.requestHeaders?.[0]?.value,
+      );
+      expect(new Set(referers).size).toBe(2);
+      for (const rule of overlappingBatch) {
+        expect(rule.condition.urlFilter).toMatch(
+          /^\|https:\/\/pic1\.zhimg\.com\/v2-pic-\d+\.png\?source=1\|$/,
+        );
+      }
+    }
+
+    // All 5 clips completed, persisted in chrome.storage.session, and recorded in history without race loss.
+    const persistedJobs = sessionStorage.store[STORAGE_KEYS.clipJobs] as ClipJob[];
+    expect(persistedJobs).toHaveLength(5);
+    expect(persistedJobs.every((j) => j.status === 'done')).toBe(true);
+
+    const history = await controller.getHistory();
+    expect(history).toHaveLength(5);
+
+    // Aggregate badge reached '5', counted down through '1', showed green 'OK', then auto-cleared to ''.
+    expect(badgeCalls).toContainEqual(['5', '#2563eb']);
+    expect(badgeCalls).toContainEqual(['1', '#2563eb']);
+    expect(badgeCalls[badgeCalls.length - 1]).toEqual(['OK', '#16a34a']);
+
+    await new Promise((r) => setTimeout(r, 60));
+    expect(badgeCalls[badgeCalls.length - 1]).toEqual(['', '']);
+  });
+
+  it('shows red "!" badge on error, preserves manual user title, supports dismiss/clear, and caps stored jobs at MAX_CLIP_JOBS', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const sessionStorage = createMemoryStorage();
+    const badgeCalls: Array<[string, string]> = [];
+    let shouldFailUpload = false;
+    let idSeq = 0;
+
+    const driveClient = {
+      ensureRootFolder: vi.fn(async () => ({
+        folderId: 'root-1',
+        folderName: 'WebClips',
+        folderUrl: 'https://drive.google.com/drive/folders/root-1',
+        created: false,
+      })),
+      uploadArticle: vi.fn(async (params: UploadArticleParams) => {
+        if (shouldFailUpload) {
+          throw new Error('Drive quota temporarily exceeded');
+        }
+        const id = ++idSeq;
+        return {
+          folderId: `f-${id}`,
+          folderUrl: `https://drive.google.com/drive/folders/f-${id}`,
+          folderName: params.folderName ?? `2026-11-24-doc-${id}`,
+          readmeFileId: `r-${id}`,
+          title: params.title ?? params.page.title,
+          sourceUrl: params.page.url,
+          clippedAt: '2026-11-24T05:00:00.000Z',
+          uploadedImages: [],
+          failedImages: [],
+          warnings: [],
+          reusedFolder: false,
+        };
+      }),
+    } as unknown as DriveClient;
+
+    let clipIdCounter = 0;
+    const controller = createServiceWorkerController({
+      driveClient,
+      storageSync: syncStorage,
+      storageLocal: localStorage,
+      storageSession: sessionStorage,
+      getManifest: () => makeConfiguredManifest(),
+      getAuthToken: async () => 'tok',
+      badgeClearDelayMs: 5_000,
+      createClipId: () => `c-${++clipIdCounter}`,
+      tabs: {
+        query: async () => [
+          { id: 10, url: 'https://example.com/a' } as chrome.tabs.Tab,
+        ],
+        get: async (tabId) =>
+          ({ id: tabId, url: `https://example.com/p/${tabId}` }) as chrome.tabs.Tab,
+        sendMessage: async (tabId): Promise<ContentResponseMessage> => ({
+          ok: true,
+          type: 'CONTENT_EXTRACTED_PAGE',
+          data: {
+            ...makeExtractedPage(`https://example.com/p/${tabId}`),
+            title: `Extracted Title ${tabId}`,
+            images: [],
+          },
+        }),
+      },
+      scripting: { executeScript: async () => [] },
+      fetchImagesImpl: async () => ({ succeeded: [], failed: [] }),
+      emitPushMessage: async () => undefined,
+      setBadge: async (text, color) => {
+        badgeCalls.push([text, color]);
+      },
+    });
+
+    // 1. User's manually edited title starting with "(3) " is preserved verbatim!
+    const manualRes = await controller.runClip({
+      tabId: 10,
+      mode: 'full',
+      title: '(3) My Manual Title',
+    });
+    expect(manualRes.ok).toBe(true);
+    if (manualRes.ok) {
+      expect(manualRes.data.title).toBe('(3) My Manual Title');
+    }
+
+    // 2. A failing job turns the badge to red "!" when active count returns to 0.
+    shouldFailUpload = true;
+    const failRes = await controller.runClip({ tabId: 11, mode: 'full' });
+    expect(failRes.ok).toBe(false);
+    await controller.whenIdle();
+    expect(badgeCalls[badgeCalls.length - 1]).toEqual(['!', '#dc2626']);
+
+    const jobsAfterFailure = await controller.getClipJobs();
+    const errorJob = jobsAfterFailure.find((j) => j.status === 'error');
+    expect(errorJob).toBeDefined();
+
+    // 3. Dismissing the failed job removes it from storage.session and clears "!" badge.
+    const dismissRes = await controller.handleMessage({
+      type: 'DISMISS_CLIP_JOB',
+      jobId: errorJob!.id,
+    });
+    expect(dismissRes.ok).toBe(true);
+    if (dismissRes.ok) {
+      expect((dismissRes.data as ClipJob[]).some((j) => j.id === errorJob!.id)).toBe(
+        false,
+      );
+    }
+    expect(badgeCalls[badgeCalls.length - 1]).toEqual(['', '']);
+
+    // 4. Clearing completed jobs empties all finished jobs.
+    const clearRes = await controller.handleMessage({
+      type: 'CLEAR_COMPLETED_JOBS',
+    });
+    expect(clearRes.ok).toBe(true);
+    if (clearRes.ok) {
+      expect(clearRes.data).toEqual([]);
+    }
+
+    // 5. Persisted clip jobs stay capped at MAX_CLIP_JOBS (20).
+    shouldFailUpload = false;
+    for (let i = 0; i < MAX_CLIP_JOBS + 5; i += 1) {
+      await controller.runClip({ tabId: 100 + i, mode: 'full' });
+    }
+    await controller.whenIdle();
+    const capped = await controller.getClipJobs();
+    expect(capped).toHaveLength(MAX_CLIP_JOBS);
+    expect(
+      (sessionStorage.store[STORAGE_KEYS.clipJobs] as ClipJob[]).length,
+    ).toBe(MAX_CLIP_JOBS);
+  });
+
+  it('recovers orphaned active jobs from chrome.storage.session as errors after a Service Worker cold restart', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const sessionStorage = createMemoryStorage();
+    const badgeCalls: Array<[string, string]> = [];
+    const pushedMessages: BackgroundPushMessage[] = [];
+
+    const makeStoredJob = (
+      id: string,
+      status: ClipJob['status'],
+      extra: Partial<ClipJob> = {},
+    ): ClipJob => ({
+      id,
+      tabId: 1,
+      url: `https://example.com/${id}`,
+      title: `Article ${id}`,
+      folderName: `2026-11-24-${id}`,
+      mode: 'full',
+      status,
+      message: `In ${status}`,
+      createdAt: '2026-11-24T04:00:00.000Z',
+      updatedAt: '2026-11-24T04:01:00.000Z',
+      ...extra,
+    });
+
+    sessionStorage.store[STORAGE_KEYS.clipJobs] = [
+      makeStoredJob('orphan-extracting', 'extracting'),
+      makeStoredJob('orphan-queued', 'queued'),
+      makeStoredJob('orphan-downloading', 'downloading', { completed: 3, total: 10 }),
+      makeStoredJob('orphan-uploading', 'uploading', { completed: 1, total: 4 }),
+      makeStoredJob('already-done', 'done', {
+        message: 'Saved to Google Drive',
+        result: {
+          folderId: 'done-folder',
+          folderUrl: 'https://drive.google.com/drive/folders/done-folder',
+          folderName: '2026-11-24-already-done',
+          readmeFileId: 'readme-done',
+          title: 'Article already-done',
+          sourceUrl: 'https://example.com/already-done',
+          clippedAt: '2026-11-24T04:01:00.000Z',
+          uploadedImages: [],
+          failedImages: [],
+          warnings: [],
+          reusedFolder: false,
+        },
+      }),
+      makeStoredJob('prior-error', 'error', {
+        message: 'Previous failure',
+        error: 'Previous failure',
+      }),
+    ];
+
+    // Instantiate a fresh SW controller (simulating Chrome waking a restarted Service Worker).
+    const restartedController = createServiceWorkerController({
+      storageSync: syncStorage,
+      storageLocal: localStorage,
+      storageSession: sessionStorage,
+      getManifest: () => makeConfiguredManifest(),
+      emitPushMessage: async (msg) => {
+        pushedMessages.push(msg);
+      },
+      setBadge: async (text, color) => {
+        badgeCalls.push([text, color]);
+      },
+    });
+
+    const response = await restartedController.handleMessage({
+      type: 'GET_CLIP_JOBS',
+    });
+
+    expect(response.ok).toBe(true);
+    if (response.ok) {
+      const recovered = response.data as ClipJob[];
+      expect(recovered).toHaveLength(6);
+
+      for (const orphanId of [
+        'orphan-extracting',
+        'orphan-queued',
+        'orphan-downloading',
+        'orphan-uploading',
+      ]) {
+        const job = recovered.find((j) => j.id === orphanId);
+        expect(job?.status).toBe('error');
+        expect(job?.message).toBe(ORPHANED_JOB_ERROR_MESSAGE);
+        expect(job?.error).toBe(ORPHANED_JOB_ERROR_MESSAGE);
+      }
+
+      const doneJob = recovered.find((j) => j.id === 'already-done');
+      expect(doneJob?.status).toBe('done');
+      expect(doneJob?.result?.folderId).toBe('done-folder');
+
+      const priorErr = recovered.find((j) => j.id === 'prior-error');
+      expect(priorErr?.status).toBe('error');
+      expect(priorErr?.error).toBe('Previous failure');
+    }
+
+    // Recovered state persisted back to storage.session, broadcast to UI, and badge turned red "!".
+    const persisted = sessionStorage.store[STORAGE_KEYS.clipJobs] as ClipJob[];
+    expect(
+      persisted.filter((j) => j.error === ORPHANED_JOB_ERROR_MESSAGE),
+    ).toHaveLength(4);
+    expect(
+      pushedMessages.some((m) => m.type === 'CLIP_JOBS_UPDATED'),
+    ).toBe(true);
+    expect(badgeCalls[badgeCalls.length - 1]).toEqual(['!', '#dc2626']);
   });
 });
