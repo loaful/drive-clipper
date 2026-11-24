@@ -17,7 +17,7 @@ Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Mar
 | `src/background/service-worker.ts` | Orchestrates popup/context-menu clips, settings/history persistence, auth actions, and `CLIP_PROGRESS` broadcasts. |
 | `src/ui/` | Popup UI (`popup.{html,css,ts}`), Options UI (`options.{html,css,ts}`), and shared UI runtime/tag helpers (`shared.ts`). |
 | `src/icons/` | Vector source (`icon.svg`) and raster PNG extension icons (`icon16.png`, `icon48.png`, `icon128.png`). |
-| `scripts/build.mjs` | esbuild bundler for the four entrypoints, static UI/icon copier, and `dist/manifest.json` generator with scope and remote-script checks. |
+| `scripts/build.mjs` | esbuild bundler for the four entrypoints (injecting optional gitignored `webAuthClientId` at build time), static UI/icon copier, and `dist/manifest.json` generator with scope and remote-script checks. |
 | `tests/` | Unit tests (`tests/core/`, `tests/background/`, `tests/drive/`, `tests/ui/`) and Playwright E2E suite (`tests/e2e/`). |
 
 ## Commands

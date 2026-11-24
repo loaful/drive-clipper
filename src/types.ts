@@ -261,6 +261,41 @@ export type BackgroundPushMessage = {
   event: ClipProgressEvent;
 };
 
+declare const __DRIVE_CLIPPER_WEB_AUTH_CLIENT_ID__: string | undefined;
+
+export function isConfiguredOAuthClientIdValue(clientId: unknown): clientId is string {
+  if (typeof clientId !== 'string') {
+    return false;
+  }
+  const trimmed = clientId.trim();
+  if (trimmed.length === 0 || trimmed === OAUTH_CLIENT_ID_PLACEHOLDER) {
+    return false;
+  }
+  return !trimmed.startsWith('YOUR_');
+}
+
+/**
+ * Returns the optional Web Application OAuth Client ID injected at build time
+ * from gitignored `config.local.json` (`webAuthClientId`), or `null` if unset.
+ */
+export function getBuildWebAuthClientId(): string | null {
+  const raw =
+    typeof __DRIVE_CLIPPER_WEB_AUTH_CLIENT_ID__ === 'string'
+      ? __DRIVE_CLIPPER_WEB_AUTH_CLIENT_ID__
+      : '';
+  return isConfiguredOAuthClientIdValue(raw) ? raw.trim() : null;
+}
+
 export function buildDriveFolderUrl(folderId: string): string {
   return `${DRIVE_FOLDER_URL_PREFIX}${encodeURIComponent(folderId)}`;
+}
+
+/**
+ * Normalizes `chrome.identity.getRedirectURL()` by stripping a trailing slash
+ * so `launchWebAuthFlow` and the Options UI match origin-form Authorized
+ * Redirect URIs registered in Google Cloud Console (e.g.
+ * `https://<extension-id>.chromiumapp.org`).
+ */
+export function normalizeWebAuthRedirectUri(redirectUri: string): string {
+  return redirectUri.trim().replace(/\/+$/, '');
 }

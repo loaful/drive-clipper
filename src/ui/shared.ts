@@ -1,5 +1,7 @@
 import {
-  OAUTH_CLIENT_ID_PLACEHOLDER,
+  getBuildWebAuthClientId,
+  isConfiguredOAuthClientIdValue,
+  normalizeWebAuthRedirectUri,
   type AuthStatus,
   type BackgroundPushMessage,
   type BackgroundResponse,
@@ -27,17 +29,7 @@ const TAG_SPLIT_RE = /[,;\r\n]+/;
 const INVALID_TAG_CHARS_RE = /[^\p{L}\p{N}_/-]+/gu;
 
 export function isConfiguredOAuthClientId(clientId: unknown): boolean {
-  if (typeof clientId !== 'string') {
-    return false;
-  }
-  const trimmed = clientId.trim();
-  if (trimmed.length === 0) {
-    return false;
-  }
-  if (trimmed === OAUTH_CLIENT_ID_PLACEHOLDER) {
-    return false;
-  }
-  return !trimmed.startsWith('YOUR_');
+  return isConfiguredOAuthClientIdValue(clientId);
 }
 
 export function resolveOAuthConfigured(
@@ -445,7 +437,10 @@ export function createChromeRuntimeClient(): UiRuntimeClient {
       }
       try {
         const manifest = runtime.getManifest();
-        return isConfiguredOAuthClientId(manifest.oauth2?.client_id);
+        return (
+          isConfiguredOAuthClientId(manifest.oauth2?.client_id) ||
+          getBuildWebAuthClientId() !== null
+        );
       } catch {
         return null;
       }
@@ -463,7 +458,7 @@ export function createChromeRuntimeClient(): UiRuntimeClient {
         try {
           const url = identity.getRedirectURL();
           if (typeof url === 'string' && url.trim().length > 0) {
-            redirectUri = url.trim();
+            redirectUri = normalizeWebAuthRedirectUri(url);
           }
         } catch {
           redirectUri = null;

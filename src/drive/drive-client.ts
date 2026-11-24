@@ -6,9 +6,11 @@ import {
 import { rewriteMarkdownImageUrls } from '../core/images.js';
 import {
   DRIVE_FILE_SCOPE,
-  OAUTH_CLIENT_ID_PLACEHOLDER,
   STORAGE_KEYS,
   buildDriveFolderUrl,
+  getBuildWebAuthClientId,
+  isConfiguredOAuthClientIdValue,
+  normalizeWebAuthRedirectUri,
   type ClipResult,
   type ExtractedPage,
   type FetchedImage,
@@ -200,16 +202,35 @@ function extractTokenValue(
   return null;
 }
 
-function isUsableOAuthClientId(clientId: unknown): clientId is string {
-  if (typeof clientId !== 'string') {
-    return false;
+/**
+ * Resolves the OAuth Client ID for `chrome.identity.launchWebAuthFlow`.
+ * Prefers the optional build-time `webAuthClientId` (Web Application client
+ * for non-Sync Chromium browsers like Ego Lite / Brave / Arc) and falls back
+ * to `manifest.oauth2.client_id`.
+ */
+export function resolveWebAuthClientId(options?: {
+  webAuthClientId?: string | null;
+  manifestClientId?: string | null;
+}): string | null {
+  const configuredWebClient =
+    options && 'webAuthClientId' in options
+      ? options.webAuthClientId
+      : getBuildWebAuthClientId();
+  if (isConfiguredOAuthClientIdValue(configuredWebClient)) {
+    return configuredWebClient.trim();
   }
-  const trimmed = clientId.trim();
-  return (
-    trimmed.length > 0 &&
-    trimmed !== OAUTH_CLIENT_ID_PLACEHOLDER &&
-    !trimmed.startsWith('YOUR_')
-  );
+
+  const manifestClient =
+    options && 'manifestClientId' in options
+      ? options.manifestClientId
+      : typeof chrome !== 'undefined'
+        ? chrome.runtime?.getManifest?.()?.oauth2?.client_id
+        : undefined;
+  if (isConfiguredOAuthClientIdValue(manifestClient)) {
+    return manifestClient.trim();
+  }
+
+  return null;
 }
 
 function getSessionStorageArea():
@@ -430,6 +451,7 @@ export function parseWebAuthFlowRedirect(
 
 async function launchChromeDriveWebAuthFlow(options: {
   interactive: boolean;
+  webAuthClientId?: string | null;
 }): Promise<string> {
   if (
     typeof chrome === 'undefined' ||
@@ -442,10 +464,14 @@ async function launchChromeDriveWebAuthFlow(options: {
     });
   }
 
-  const clientId = chrome.runtime?.getManifest?.()?.oauth2?.client_id;
-  if (!isUsableOAuthClientId(clientId)) {
+  const clientId = resolveWebAuthClientId(
+    'webAuthClientId' in options
+      ? { webAuthClientId: options.webAuthClientId }
+      : undefined,
+  );
+  if (!clientId) {
     throw new DriveApiError(
-      'Google OAuth Client ID is not configured in manifest.json.',
+      'Google OAuth Client ID is not configured in config.local.json.',
       {
         status: 401,
         code: 'AUTH_REQUIRED',
@@ -453,7 +479,9 @@ async function launchChromeDriveWebAuthFlow(options: {
     );
   }
 
-  const redirectUri = chrome.identity.getRedirectURL();
+  const redirectUri = normalizeWebAuthRedirectUri(
+    chrome.identity.getRedirectURL(),
+  );
   const state = crypto.randomUUID();
   const authUrl = buildGoogleWebAuthUrl({ clientId, redirectUri, state });
 
@@ -495,6 +523,7 @@ async function launchChromeDriveWebAuthFlow(options: {
  */
 export async function getChromeDriveAuthToken(options: {
   interactive: boolean;
+  webAuthClientId?: string | null;
 }): Promise<string> {
   const cachedWebToken = await readCachedWebAuthToken();
   if (cachedWebToken) {
@@ -543,7 +572,12 @@ export async function getChromeDriveAuthToken(options: {
       (getAuthTokenError !== null &&
         shouldFallbackToWebAuthFlow(getAuthTokenError.message)))
   ) {
-    return launchChromeDriveWebAuthFlow({ interactive: true });
+    return launchChromeDriveWebAuthFlow({
+      interactive: true,
+      ...('webAuthClientId' in options
+        ? { webAuthClientId: options.webAuthClientId }
+        : {}),
+    });
   }
 
   if (getAuthTokenError instanceof DriveApiError) {

@@ -10,6 +10,7 @@ import {
   getChromeDriveAuthToken,
   parseWebAuthFlowRedirect,
   removeCachedChromeAuthToken,
+  resolveWebAuthClientId,
   shouldFallbackToWebAuthFlow,
 } from '../../src/drive/drive-client.js';
 import {
@@ -687,7 +688,8 @@ describe('DriveClient uploadArticle', () => {
 
   it('falls back to launchWebAuthFlow with strict drive.file scope and session caching when browser sign-in is disabled', async () => {
     const sessionStore: Record<string, unknown> = {};
-    const redirectUri = 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/';
+    const rawRedirectUri = 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/';
+    const expectedRedirectUri = 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org';
     const getAuthTokenSpy = vi.fn(async () => {
       throw new Error('The user turned off browser signin');
     });
@@ -701,12 +703,12 @@ describe('DriveClient uploadArticle', () => {
           '123456-webapp.apps.googleusercontent.com',
         );
         expect(parsed.searchParams.get('response_type')).toBe('token');
-        expect(parsed.searchParams.get('redirect_uri')).toBe(redirectUri);
+        expect(parsed.searchParams.get('redirect_uri')).toBe(expectedRedirectUri);
         expect(parsed.searchParams.get('scope')).toBe(DRIVE_FILE_SCOPE);
         expect(parsed.searchParams.get('include_granted_scopes')).toBeNull();
         const state = parsed.searchParams.get('state');
         expect(state).toBeTruthy();
-        return `${redirectUri}#access_token=webauth-tok-1&expires_in=3600&token_type=Bearer&state=${encodeURIComponent(state!)}`;
+        return `${rawRedirectUri}#access_token=webauth-tok-1&expires_in=3600&token_type=Bearer&state=${encodeURIComponent(state!)}`;
       },
     );
     const clearAllSpy = vi.fn(async () => {
@@ -725,7 +727,7 @@ describe('DriveClient uploadArticle', () => {
       },
       identity: {
         getAuthToken: getAuthTokenSpy,
-        getRedirectURL: () => redirectUri,
+        getRedirectURL: () => rawRedirectUri,
         launchWebAuthFlow: launchWebAuthFlowSpy,
         removeCachedAuthToken: vi.fn(async () => undefined),
         clearAllCachedAuthTokens: clearAllSpy,
@@ -831,6 +833,81 @@ describe('DriveClient uploadArticle', () => {
       ).rejects.toMatchObject({ status: 401, code: 'AUTH_REQUIRED' });
       expect(launchWebAuthFlowSpy).not.toHaveBeenCalled();
     } finally {
+      if (originalChrome === undefined) {
+        delete (globalThis as Record<string, unknown>).chrome;
+      } else {
+        (globalThis as Record<string, unknown>).chrome = originalChrome;
+      }
+    }
+  });
+
+  it('prefers webAuthClientId over manifest oauth2.client_id during launchWebAuthFlow fallback', async () => {
+    expect(
+      resolveWebAuthClientId({
+        webAuthClientId: '111-web.apps.googleusercontent.com',
+        manifestClientId: '222-ext.apps.googleusercontent.com',
+      }),
+    ).toBe('111-web.apps.googleusercontent.com');
+
+    expect(
+      resolveWebAuthClientId({
+        webAuthClientId: '',
+        manifestClientId: '222-ext.apps.googleusercontent.com',
+      }),
+    ).toBe('222-ext.apps.googleusercontent.com');
+
+    expect(
+      resolveWebAuthClientId({
+        webAuthClientId: 'YOUR_PLACEHOLDER.apps.googleusercontent.com',
+        manifestClientId: '222-ext.apps.googleusercontent.com',
+      }),
+    ).toBe('222-ext.apps.googleusercontent.com');
+
+    expect(
+      resolveWebAuthClientId({
+        webAuthClientId: '',
+        manifestClientId: 'YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com',
+      }),
+    ).toBeNull();
+
+    const rawRedirectUri = 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/';
+    const seenClientIds: string[] = [];
+    const originalChrome = (globalThis as Record<string, unknown>).chrome;
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        getManifest: () => ({
+          oauth2: {
+            client_id: '222-chromeext.apps.googleusercontent.com',
+            scopes: [DRIVE_FILE_SCOPE],
+          },
+        }),
+      },
+      identity: {
+        getAuthToken: vi.fn(async () => {
+          throw new Error('The user turned off browser signin');
+        }),
+        getRedirectURL: () => rawRedirectUri,
+        launchWebAuthFlow: vi.fn(
+          async (details: chrome.identity.WebAuthFlowDetails) => {
+            const parsed = new URL(details.url);
+            seenClientIds.push(parsed.searchParams.get('client_id') ?? '');
+            const state = parsed.searchParams.get('state')!;
+            return `${rawRedirectUri}#access_token=dual-client-token&expires_in=3600&state=${encodeURIComponent(state)}`;
+          },
+        ),
+      },
+    };
+
+    try {
+      await clearAllCachedChromeAuthTokens();
+      const token = await getChromeDriveAuthToken({
+        interactive: true,
+        webAuthClientId: '111-webapp.apps.googleusercontent.com',
+      });
+      expect(token).toBe('dual-client-token');
+      expect(seenClientIds).toEqual(['111-webapp.apps.googleusercontent.com']);
+    } finally {
+      await clearAllCachedChromeAuthTokens();
       if (originalChrome === undefined) {
         delete (globalThis as Record<string, unknown>).chrome;
       } else {

@@ -387,7 +387,7 @@ describe('Options UI', () => {
     });
     mock.runtime.getExtensionIdentityInfo = () => ({
       extensionId: 'lliikkoebahbliapkdchhdahfodpcach',
-      redirectUri: 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/',
+      redirectUri: 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org',
     });
 
     controller = await mountOptions(root, { runtime: mock.runtime });
@@ -401,7 +401,7 @@ describe('Options UI', () => {
     expect(extVal.textContent).toBe('lliikkoebahbliapkdchhdahfodpcach');
     expect(redirectMeta.hidden).toBe(false);
     expect(redirectVal.textContent).toBe(
-      'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/',
+      'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org',
     );
   });
 });

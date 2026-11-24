@@ -37,20 +37,24 @@ function readJsonFile(filePath) {
   return JSON.parse(readFileSync(filePath, 'utf8'));
 }
 
-function buildManifest() {
+function readLocalConfig() {
+  const localConfigPath = path.join(rootDir, 'config.local.json');
+  if (!existsSync(localConfigPath)) {
+    return {};
+  }
+  return readJsonFile(localConfigPath);
+}
+
+function buildManifest(localConfig) {
   const templatePath = path.join(srcDir, 'manifest.template.json');
   const manifest = readJsonFile(templatePath);
 
-  const localConfigPath = path.join(rootDir, 'config.local.json');
-  if (existsSync(localConfigPath)) {
-    const localConfig = readJsonFile(localConfigPath);
-    if (typeof localConfig.oauthClientId === 'string' && localConfig.oauthClientId.trim().length > 0) {
-      manifest.oauth2 = manifest.oauth2 ?? {};
-      manifest.oauth2.client_id = localConfig.oauthClientId.trim();
-    }
-    if (typeof localConfig.manifestKey === 'string' && localConfig.manifestKey.trim().length > 0) {
-      manifest.key = localConfig.manifestKey.trim();
-    }
+  if (typeof localConfig.oauthClientId === 'string' && localConfig.oauthClientId.trim().length > 0) {
+    manifest.oauth2 = manifest.oauth2 ?? {};
+    manifest.oauth2.client_id = localConfig.oauthClientId.trim();
+  }
+  if (typeof localConfig.manifestKey === 'string' && localConfig.manifestKey.trim().length > 0) {
+    manifest.key = localConfig.manifestKey.trim();
   }
 
   const scopes = manifest.oauth2?.scopes;
@@ -92,7 +96,7 @@ function copyStaticAssets() {
   }
 }
 
-async function bundleScripts() {
+async function bundleScripts(localConfig) {
   const missing = ENTRYPOINTS.filter(({ entry }) => !existsSync(entry));
   if (missing.length > 0) {
     const names = missing.map(({ entry }) => path.relative(rootDir, entry)).join(', ');
@@ -100,6 +104,10 @@ async function bundleScripts() {
   }
 
   const sourcemap = process.env.BUILD_SOURCEMAP === '1' ? 'inline' : false;
+  const webAuthClientId =
+    typeof localConfig.webAuthClientId === 'string'
+      ? localConfig.webAuthClientId.trim()
+      : '';
 
   await Promise.all(
     ENTRYPOINTS.map(({ entry, outfile }) =>
@@ -111,6 +119,9 @@ async function bundleScripts() {
         platform: 'browser',
         target: ['chrome120'],
         sourcemap,
+        define: {
+          __DRIVE_CLIPPER_WEB_AUTH_CLIENT_ID__: JSON.stringify(webAuthClientId),
+        },
         logLevel: 'silent',
       }),
     ),
@@ -118,12 +129,13 @@ async function bundleScripts() {
 }
 
 async function main() {
+  const localConfig = readLocalConfig();
   rmSync(distDir, { recursive: true, force: true });
   mkdirSync(distDir, { recursive: true });
 
-  await bundleScripts();
+  await bundleScripts(localConfig);
   copyStaticAssets();
-  buildManifest();
+  buildManifest(localConfig);
 }
 
 main().catch((err) => {

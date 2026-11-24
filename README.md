@@ -36,24 +36,27 @@ The repository ships with a placeholder OAuth Client ID in `src/manifest.templat
    - Create or select a project.
    - Enable the **Google Drive API** (`APIs & Services` > `Library` > `Google Drive API` > `Enable`).
    - Configure the **OAuth consent screen** (`Google Auth Platform` > `Branding` / `Audience`). Add your Google account as a Test User while the app is in Testing status, and add the single scope `https://www.googleapis.com/auth/drive.file`.
-   - Create an OAuth Client ID (`Clients` > `Create Client`):
-     - **Option A — Web application (recommended for Chromium browsers without Chrome Sync such as Ego Lite, Brave, Arc, Dia, or Edge; also works in Google Chrome):**
-       - Application type: **Web application**
-       - Authorized redirect URIs: `https://<your-32-character-extension-id>.chromiumapp.org/` (also displayed inside Drive Clipper's Options page)
-       - Drive Clipper automatically falls back to `chrome.identity.launchWebAuthFlow` and caches the short-lived token in `chrome.storage.session`.
-     - **Option B — Chrome Extension (Google Chrome with Chrome Sync signed in):**
+   - Create one or both OAuth Client IDs (`Clients` > `Create Client`) — never copy or store any `client_secret`:
+     - **Chrome Extension client** (`oauthClientId` in `config.local.json`, for Google Chrome with Chrome Sync signed in):
        - Application type: **Chrome Extension**
        - Item ID: your 32-character Chrome Extension ID
-       - Uses Chrome's native `chrome.identity.getAuthToken` cache directly.
+       - Used by Chrome's native `chrome.identity.getAuthToken()`.
+     - **Web application client** (`webAuthClientId` in `config.local.json`, for Chromium browsers without Chrome Sync such as Ego Lite, Brave, Arc, Dia, or Edge):
+       - Application type: **Web application**
+       - Authorized redirect URIs: `https://<your-32-character-extension-id>.chromiumapp.org` (no trailing slash; also displayed inside Drive Clipper's Options page)
+       - Used automatically by `chrome.identity.launchWebAuthFlow()` when browser sign-in is disabled (caching the short-lived token in `chrome.storage.session`). If you configure only a Web application client, you may put it in either `webAuthClientId` or `oauthClientId`.
 
-4. Put the Client ID into `config.local.json`:
+4. Put your Client ID(s) into `config.local.json`:
 
    ```json
    {
-     "oauthClientId": "1234567890-abcdefg.apps.googleusercontent.com",
+     "oauthClientId": "1234567890-chromeext.apps.googleusercontent.com",
+     "webAuthClientId": "1234567890-webapp.apps.googleusercontent.com",
      "manifestKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A..."
    }
    ```
+
+   Setting both `oauthClientId` and `webAuthClientId` lets a single `dist/` build authenticate natively in official Google Chrome (`getAuthToken`) and seamlessly fall back to `launchWebAuthFlow` in Ego Lite / non-Sync Chromium.
 
 5. Build the extension and load it in Chrome:
 

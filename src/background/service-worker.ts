@@ -8,8 +8,9 @@ import {
 } from '../drive/drive-client.js';
 import {
   DEFAULT_EXTENSION_SETTINGS,
-  OAUTH_CLIENT_ID_PLACEHOLDER,
   STORAGE_KEYS,
+  getBuildWebAuthClientId,
+  isConfiguredOAuthClientIdValue,
   type AuthStatus,
   type BackgroundErrorCode,
   type BackgroundPushMessage,
@@ -80,14 +81,7 @@ export interface ServiceWorkerController {
 }
 
 export function isConfiguredOAuthClientId(clientId: unknown): boolean {
-  if (typeof clientId !== 'string') {
-    return false;
-  }
-  const trimmed = clientId.trim();
-  if (trimmed.length === 0 || trimmed === OAUTH_CLIENT_ID_PLACEHOLDER) {
-    return false;
-  }
-  return !trimmed.startsWith('YOUR_');
+  return isConfiguredOAuthClientIdValue(clientId);
 }
 
 export function isSupportedPageUrl(url: string | undefined): url is string {
@@ -345,7 +339,10 @@ export function createServiceWorkerController(
 
   const isOAuthConfigured = (): boolean => {
     const manifest = getManifest();
-    return isConfiguredOAuthClientId(manifest?.oauth2?.client_id);
+    return (
+      isConfiguredOAuthClientId(manifest?.oauth2?.client_id) ||
+      getBuildWebAuthClientId() !== null
+    );
   };
 
   const emitProgress = async (event: ClipProgressEvent): Promise<void> => {
