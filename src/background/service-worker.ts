@@ -2,6 +2,7 @@ import {
   DriveApiError,
   DriveClient,
   getChromeDriveAuthToken,
+  removeCachedChromeAuthToken,
   revokeChromeAuthToken,
 } from '../drive/drive-client.js';
 import {
@@ -276,7 +277,9 @@ export function createServiceWorkerController(
     deps.driveClient ??
     new DriveClient({
       fetchImpl,
-      tokenProvider: getAuthToken,
+      ...(deps.getAuthToken
+        ? { tokenProvider: deps.getAuthToken }
+        : { onUnauthorizedToken: removeCachedChromeAuthToken }),
     });
   const fetchImagesImpl = deps.fetchImagesImpl ?? fetchImages;
   const emitPushMessage = deps.emitPushMessage ?? defaultEmitPushMessage;

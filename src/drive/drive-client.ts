@@ -348,7 +348,9 @@ export class DriveClient {
     this.tokenProvider = options.tokenProvider ?? getChromeDriveAuthToken;
     this.onUnauthorizedToken =
       options.onUnauthorizedToken ??
-      (options.tokenProvider ? undefined : removeCachedChromeAuthToken);
+      (options.tokenProvider && options.tokenProvider !== getChromeDriveAuthToken
+        ? undefined
+        : removeCachedChromeAuthToken);
     this.sleep = options.sleep ?? defaultSleep;
     this.maxRetries = Math.max(0, options.maxRetries ?? DEFAULT_MAX_RETRIES);
     this.baseRetryDelayMs = Math.max(

@@ -411,4 +411,76 @@ describe('service-worker controller', () => {
       expect(infoRes.code).toBe('UNSUPPORTED_PAGE');
     }
   });
+
+  it('refreshes a stale 401 token via chrome.identity.removeCachedAuthToken under default production wiring', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    let tokenIndex = 0;
+    const tokens = ['stale-sw-token', 'fresh-sw-token'];
+
+    const getAuthTokenSpy = vi.fn(async () => ({
+      token: tokens[Math.min(tokenIndex++, tokens.length - 1)],
+    }));
+    const removeCachedAuthTokenSpy = vi.fn(async () => undefined);
+
+    const fetchImpl: typeof fetch = vi.fn(async (_input, init) => {
+      const auth = new Headers(init?.headers).get('authorization');
+      if (auth === 'Bearer stale-sw-token') {
+        return new Response(
+          JSON.stringify({ error: { message: 'Invalid Credentials' } }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (auth === 'Bearer fresh-sw-token') {
+        return new Response(
+          JSON.stringify({ id: 'root-after-refresh', name: 'WebClips' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`Unexpected auth header: ${auth}`);
+    });
+
+    const originalChrome = (globalThis as Record<string, unknown>).chrome;
+    (globalThis as Record<string, unknown>).chrome = {
+      identity: {
+        getAuthToken: getAuthTokenSpy,
+        removeCachedAuthToken: removeCachedAuthTokenSpy,
+      },
+    };
+
+    try {
+      // Omit both `driveClient` and `getAuthToken` to exercise default production wiring.
+      const controller = createServiceWorkerController({
+        fetchImpl,
+        storageSync: syncStorage,
+        storageLocal: localStorage,
+        getManifest: () => makeConfiguredManifest(),
+      });
+
+      const res = await controller.handleMessage({
+        type: 'ENSURE_ROOT_FOLDER',
+        folderName: 'WebClips',
+      });
+
+      expect(res).toEqual({
+        ok: true,
+        data: {
+          folderId: 'root-after-refresh',
+          folderName: 'WebClips',
+          folderUrl: 'https://drive.google.com/drive/folders/root-after-refresh',
+          created: true,
+        },
+      });
+      expect(removeCachedAuthTokenSpy).toHaveBeenCalledWith({
+        token: 'stale-sw-token',
+      });
+      expect(getAuthTokenSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      if (originalChrome === undefined) {
+        delete (globalThis as Record<string, unknown>).chrome;
+      } else {
+        (globalThis as Record<string, unknown>).chrome = originalChrome;
+      }
+    }
+  });
 });
