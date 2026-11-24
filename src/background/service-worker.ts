@@ -1,4 +1,11 @@
-import { buildArticleFolderName, cleanPageTitle } from '../core/frontmatter.js';
+import {
+  buildArticleFileName,
+  buildArticleFolderName,
+  cleanPageTitle,
+  deriveSourceSlug,
+  extractPlainTextExcerpt,
+  type RootIndexEntry,
+} from '../core/frontmatter.js';
 import {
   DriveApiError,
   DriveClient,
@@ -160,6 +167,17 @@ function createInMemoryStorageArea(): StorageAreaLike {
   };
 }
 
+function normalizeTagList(items: readonly unknown[]): string[] {
+  return Array.from(
+    new Set(
+      items
+        .filter((tag): tag is string => typeof tag === 'string')
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0),
+    ),
+  );
+}
+
 function normalizeSettings(raw: unknown): ExtensionSettings {
   const input =
     raw && typeof raw === 'object' ? (raw as Partial<ExtensionSettings>) : {};
@@ -181,15 +199,13 @@ function normalizeSettings(raw: unknown): ExtensionSettings {
       : null;
 
   const defaultTags = Array.isArray(input.defaultTags)
-    ? Array.from(
-        new Set(
-          input.defaultTags
-            .filter((tag): tag is string => typeof tag === 'string')
-            .map((tag) => tag.trim())
-            .filter((tag) => tag.length > 0),
-        ),
-      )
+    ? normalizeTagList(input.defaultTags)
     : [...DEFAULT_EXTENSION_SETTINGS.defaultTags];
+
+  // Preserve `null` (not customized yet) separately from `[]` (explicitly empty).
+  const stickyTags = Array.isArray(input.stickyTags)
+    ? normalizeTagList(input.stickyTags)
+    : null;
 
   const maxImageSizeBytes =
     typeof input.maxImageSizeBytes === 'number' &&
@@ -208,6 +224,7 @@ function normalizeSettings(raw: unknown): ExtensionSettings {
     rootFolderName,
     rootFolderId,
     defaultTags,
+    stickyTags,
     frontmatter: {
       includeAuthor:
         typeof rawFrontmatter.includeAuthor === 'boolean'
@@ -579,10 +596,11 @@ export function createServiceWorkerController(
     );
   };
 
-  // --- Serialized settings & history state ---
+  // --- Serialized settings, history, and bundle index/log state ---
 
   let settingsWriteChain: Promise<void> = Promise.resolve();
   let historyWriteChain: Promise<void> = Promise.resolve();
+  let indexWriteChain: Promise<void> = Promise.resolve();
 
   let cachedRootFolder: {
     info: RootFolderInfo;
@@ -604,6 +622,13 @@ export function createServiceWorkerController(
       const merged: ExtensionSettings = normalizeSettings({
         ...current,
         ...patch,
+        // Ignore explicit `undefined` while preserving explicit `null` or `[]`.
+        stickyTags:
+          patch.stickyTags === undefined ? current.stickyTags : patch.stickyTags,
+        rootFolderId:
+          patch.rootFolderId === undefined
+            ? current.rootFolderId
+            : patch.rootFolderId,
         frontmatter: {
           ...current.frontmatter,
           ...(patch.frontmatter ?? {}),
@@ -633,6 +658,11 @@ export function createServiceWorkerController(
   const recordClipHistory = async (result: ClipResult): Promise<void> => {
     const operation = historyWriteChain.then(async () => {
       const existing = await getHistory();
+      const articleFileName =
+        result.fileName ??
+        result.articleFileName ??
+        buildArticleFileName(result.folderName);
+      const articleFileId = result.articleFileId ?? result.readmeFileId;
       const entry: ClipHistoryItem = {
         id: `${result.folderId}:${result.clippedAt}`,
         title: result.title,
@@ -640,6 +670,10 @@ export function createServiceWorkerController(
         folderId: result.folderId,
         folderUrl: result.folderUrl,
         folderName: result.folderName,
+        fileName: articleFileName,
+        articleFileName,
+        articleFileId,
+        readmeFileId: articleFileId,
         clippedAt: result.clippedAt,
         imageCount: result.uploadedImages.length,
         warningCount: result.warnings.length,
@@ -654,6 +688,40 @@ export function createServiceWorkerController(
     });
     historyWriteChain = operation.catch(() => undefined);
     await operation;
+  };
+
+  /**
+   * Serializes root `index.md` + `log.md` updates through `indexWriteChain` so
+   * concurrent background clip jobs never overwrite each other's entries.
+   * Transient index failures degrade gracefully to an observable warning without
+   * failing the already-uploaded article.
+   */
+  const updateBundleIndexSerialized = async (params: {
+    rootFolderId: string;
+    rootFolderName: string;
+    entry: Omit<RootIndexEntry, 'rootFolderName'>;
+    action: 'clipped' | 'updated';
+  }): Promise<string | null> => {
+    const operation = indexWriteChain.then(async (): Promise<string | null> => {
+      try {
+        await driveClient.updateBundleIndexAndLog({
+          ...params,
+          interactive: true,
+        });
+        return null;
+      } catch (error) {
+        const message = errorToMessage(error);
+        console.warn(
+          `[drive-clipper] Failed to update bundle index.md/log.md: ${message}`,
+        );
+        return `Saved article, but failed to update bundle index.md/log.md: ${message}`;
+      }
+    });
+    indexWriteChain = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   };
 
   // --- Single-flight root folder resolution ---
@@ -1038,14 +1106,18 @@ export function createServiceWorkerController(
 
       const clippedAt = now().toISOString();
       const explicitTitle = request.title?.trim();
+      const effectiveTags =
+        request.tags ??
+        (settings.stickyTags !== null ? settings.stickyTags : settings.defaultTags);
+      const expectedFileName = buildArticleFileName(effectiveFolderName);
 
-      const result = await driveClient.uploadArticle({
+      const uploadedResult = await driveClient.uploadArticle({
         rootFolderId: rootFolder.folderId,
         page: extracted,
         fetchedImages: batch.succeeded,
         failedImages: batch.failed,
         ...(explicitTitle ? { title: explicitTitle } : {}),
-        tags: request.tags ?? settings.defaultTags,
+        tags: effectiveTags,
         folderName: effectiveFolderName,
         clippedAt,
         frontmatterPreferences: settings.frontmatter,
@@ -1060,7 +1132,7 @@ export function createServiceWorkerController(
           const progressMsg =
             completed < resolvedTotal
               ? `Uploading to Google Drive (${completed}/${resolvedTotal})...`
-              : 'Finalizing README.md...';
+              : `Finalizing ${expectedFileName}...`;
           updateJobSync(jobId, {
             message: progressMsg,
             completed,
@@ -1076,6 +1148,40 @@ export function createServiceWorkerController(
           });
         },
       });
+
+      const uploadedFileName =
+        uploadedResult.fileName ??
+        uploadedResult.articleFileName ??
+        buildArticleFileName(uploadedResult.folderName);
+      const indexDescription =
+        extracted.description?.replace(/\s+/g, ' ').trim() ||
+        extractPlainTextExcerpt(extracted.markdown) ||
+        uploadedResult.title;
+
+      const indexWarning = await updateBundleIndexSerialized({
+        rootFolderId: rootFolder.folderId,
+        rootFolderName: rootFolder.folderName,
+        entry: {
+          folderName: uploadedResult.folderName,
+          fileName: uploadedFileName,
+          title: uploadedResult.title,
+          sourceUrl: uploadedResult.sourceUrl,
+          clippedAt: uploadedResult.clippedAt,
+          source:
+            deriveSourceSlug(uploadedResult.sourceUrl) ??
+            deriveSourceSlug(extracted.site),
+          tags: effectiveTags,
+          description: indexDescription,
+        },
+        action: uploadedResult.reusedFolder ? 'updated' : 'clipped',
+      });
+
+      const result: ClipResult = indexWarning
+        ? {
+            ...uploadedResult,
+            warnings: [...uploadedResult.warnings, indexWarning],
+          }
+        : uploadedResult;
 
       await recordClipHistory(result);
 
@@ -1415,7 +1521,8 @@ export function createServiceWorkerController(
       target.url;
     const explicitFolderName = request.folderName?.trim();
     const initialFolderName =
-      explicitFolderName || buildArticleFolderName(initialTitle, createdAt);
+      explicitFolderName ||
+      buildArticleFolderName(initialTitle, createdAt, target.url);
 
     const initialJob: ClipJob = {
       id: clipId,
@@ -1506,7 +1613,12 @@ export function createServiceWorkerController(
 
     const effectiveTitle = explicitTitle || extracted.title || initialTitle;
     const effectiveFolderName =
-      explicitFolderName || buildArticleFolderName(effectiveTitle, createdAt);
+      explicitFolderName ||
+      buildArticleFolderName(
+        effectiveTitle,
+        createdAt,
+        extracted.url || target.url || extracted.site,
+      );
 
     const queuedJob = updateJobSync(clipId, {
       url: extracted.url || target.url,
@@ -1604,6 +1716,7 @@ export function createServiceWorkerController(
           badgeChain,
           historyWriteChain,
           settingsWriteChain,
+          indexWriteChain,
         ]);
         if (
           liveJobIds.size === 0 &&

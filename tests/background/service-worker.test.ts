@@ -7,7 +7,11 @@ import {
   ORPHANED_JOB_ERROR_MESSAGE,
   createServiceWorkerController,
 } from '../../src/background/service-worker.js';
-import { DriveClient, type UploadArticleParams } from '../../src/drive/drive-client.js';
+import {
+  DRIVE_FOLDER_MIME_TYPE,
+  DriveClient,
+  type UploadArticleParams,
+} from '../../src/drive/drive-client.js';
 import {
   OAUTH_CLIENT_ID_PLACEHOLDER,
   STORAGE_KEYS,
@@ -141,6 +145,10 @@ describe('service-worker controller', () => {
         };
         return result;
       }),
+      updateBundleIndexAndLog: vi.fn(async () => ({
+        indexFileId: 'idx-1',
+        logFileId: 'log-1',
+      })),
     } as unknown as DriveClient;
 
     const controller = createServiceWorkerController({
@@ -370,6 +378,10 @@ describe('service-worker controller', () => {
         failedImages: [],
         warnings: [],
         reusedFolder: false,
+      })),
+      updateBundleIndexAndLog: vi.fn(async () => ({
+        indexFileId: 'idx-sel',
+        logFileId: 'log-sel',
       })),
     } as unknown as DriveClient;
 
@@ -606,6 +618,10 @@ describe('service-worker controller', () => {
           reusedFolder: false,
         };
       }),
+      updateBundleIndexAndLog: vi.fn(async () => ({
+        indexFileId: 'idx-multi',
+        logFileId: 'log-multi',
+      })),
     } as unknown as DriveClient;
 
     const controller = createServiceWorkerController({
@@ -787,6 +803,10 @@ describe('service-worker controller', () => {
           reusedFolder: false,
         };
       }),
+      updateBundleIndexAndLog: vi.fn(async () => ({
+        indexFileId: 'idx-multi',
+        logFileId: 'log-multi',
+      })),
     } as unknown as DriveClient;
 
     let clipIdCounter = 0;
@@ -1021,6 +1041,10 @@ describe('service-worker controller', () => {
           reusedFolder: false,
         };
       }),
+      updateBundleIndexAndLog: vi.fn(async () => ({
+        indexFileId: 'idx-multi',
+        logFileId: 'log-multi',
+      })),
     } as unknown as DriveClient;
 
     const controller = createServiceWorkerController({
@@ -1074,5 +1098,398 @@ describe('service-worker controller', () => {
     const countAfterIdle = keepalivePing.mock.calls.length;
     await new Promise((r) => setTimeout(r, 60));
     expect(keepalivePing.mock.calls.length).toBe(countAfterIdle);
+  });
+
+  it('serializes concurrent bundle index.md/log.md updates via indexWriteChain with zero lost updates across 5 concurrent tabs and degrades non-fatally on index errors', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const sessionStorage = createMemoryStorage();
+
+    // Minimal in-memory Drive v3 HTTP mock supporting folders, multipart uploads, and ?alt=media downloads.
+    let idSeq = 0;
+    const driveFiles = new Map<
+      string,
+      {
+        id: string;
+        name: string;
+        mimeType: string;
+        parents: string[];
+        trashed: boolean;
+        appProperties: Record<string, string>;
+        content?: Uint8Array;
+      }
+    >();
+    let failIndexWrites = false;
+    let activeIndexMediaReadsOrWrites = 0;
+    let peakIndexConcurrency = 0;
+
+    const parseMultipart = (raw: Uint8Array, ctHeader: string) => {
+      const boundary = /boundary=([^\s;]+)/i.exec(ctHeader)![1];
+      const latin1 = new TextDecoder('latin1').decode(raw);
+      const delim = `--${boundary}`;
+      const parts = latin1.split(delim).slice(1, -1);
+      const metaPart = parts[0].replace(/^\r\n/, '');
+      const meta = JSON.parse(
+        metaPart.slice(metaPart.indexOf('\r\n\r\n') + 4).replace(/\r\n$/, ''),
+      ) as Record<string, unknown>;
+      const mediaStart =
+        latin1.indexOf(delim, latin1.indexOf(delim) + delim.length) + delim.length + 2;
+      const mediaHeaderEnd = latin1.indexOf('\r\n\r\n', mediaStart);
+      const contentStart = mediaHeaderEnd + 4;
+      const closeIdx = latin1.indexOf(`\r\n${delim}--`, contentStart);
+      const contentBytes = raw.slice(contentStart, closeIdx);
+      const mediaCt =
+        /Content-Type:\s*([^\r\n]+)/i.exec(latin1.slice(mediaStart, mediaHeaderEnd))?.[1]?.trim() ??
+        'application/octet-stream';
+      return { meta, contentBytes, mediaCt };
+    };
+
+    const driveFetch: typeof fetch = vi.fn(async (input, init) => {
+      const url = new URL(String(input));
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const headers = new Headers(init?.headers);
+
+      if (method === 'GET' && url.pathname.startsWith('/drive/v3/files/')) {
+        const id = decodeURIComponent(url.pathname.slice('/drive/v3/files/'.length));
+        const found = driveFiles.get(id);
+        if (!found) {
+          return new Response(JSON.stringify({ error: { message: 'Not found' } }), { status: 404 });
+        }
+        if (url.searchParams.get('alt') === 'media') {
+          if (found.name === 'index.md') {
+            activeIndexMediaReadsOrWrites += 1;
+            peakIndexConcurrency = Math.max(peakIndexConcurrency, activeIndexMediaReadsOrWrites);
+            await new Promise((r) => setTimeout(r, 15));
+            activeIndexMediaReadsOrWrites -= 1;
+          }
+          const copy = new Uint8Array(found.content ?? []);
+          return new Response(copy, {
+            status: 200,
+            headers: { 'content-type': found.mimeType },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            id: found.id,
+            name: found.name,
+            mimeType: found.mimeType,
+            trashed: found.trashed,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (method === 'GET' && url.pathname === '/drive/v3/files') {
+        const q = url.searchParams.get('q') ?? '';
+        const parentMatch = /'((?:\\.|[^'])+)' in parents/.exec(q);
+        const sourceUrlMatch =
+          /appProperties has \{ key='sourceUrl' and value='((?:\\.|[^'])+)' \}/.exec(q);
+        const onlyFolders = q.includes(`mimeType = '${DRIVE_FOLDER_MIME_TYPE}'`);
+        const excludeFolders = q.includes(`mimeType != '${DRIVE_FOLDER_MIME_TYPE}'`);
+        const unescape = (s: string) => s.replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+
+        const matched = Array.from(driveFiles.values()).filter((f) => {
+          if (f.trashed) return false;
+          if (onlyFolders && f.mimeType !== DRIVE_FOLDER_MIME_TYPE) return false;
+          if (excludeFolders && f.mimeType === DRIVE_FOLDER_MIME_TYPE) return false;
+          if (parentMatch && !f.parents.includes(unescape(parentMatch[1]))) return false;
+          if (sourceUrlMatch && f.appProperties.sourceUrl !== unescape(sourceUrlMatch[1])) {
+            return false;
+          }
+          return true;
+        });
+        return new Response(
+          JSON.stringify({
+            files: matched.map((f) => ({
+              id: f.id,
+              name: f.name,
+              mimeType: f.mimeType,
+              trashed: f.trashed,
+              appProperties: f.appProperties,
+            })),
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (method === 'POST' && url.pathname === '/drive/v3/files') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as {
+          name: string;
+          mimeType: string;
+          parents?: string[];
+          appProperties?: Record<string, string>;
+        };
+        const id = `d-${++idSeq}`;
+        driveFiles.set(id, {
+          id,
+          name: body.name,
+          mimeType: body.mimeType,
+          parents: body.parents ?? [],
+          trashed: false,
+          appProperties: body.appProperties ?? {},
+        });
+        return new Response(
+          JSON.stringify({ id, name: body.name, mimeType: body.mimeType }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      if (
+        (method === 'POST' || method === 'PATCH') &&
+        url.pathname.startsWith('/upload/drive/v3/files')
+      ) {
+        const { meta, contentBytes, mediaCt } = parseMultipart(
+          init?.body as Uint8Array,
+          headers.get('content-type') ?? '',
+        );
+        const name = String(meta.name);
+        if ((name === 'index.md' || name === 'log.md') && failIndexWrites) {
+          return new Response(
+            JSON.stringify({ error: { message: 'Simulated index write outage' } }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        if (name === 'index.md') {
+          activeIndexMediaReadsOrWrites += 1;
+          peakIndexConcurrency = Math.max(peakIndexConcurrency, activeIndexMediaReadsOrWrites);
+          await new Promise((r) => setTimeout(r, 15));
+          activeIndexMediaReadsOrWrites -= 1;
+        }
+        if (method === 'PATCH') {
+          const id = decodeURIComponent(url.pathname.slice('/upload/drive/v3/files/'.length));
+          const existing = driveFiles.get(id)!;
+          existing.name = name;
+          existing.mimeType = mediaCt;
+          existing.content = contentBytes;
+          return new Response(
+            JSON.stringify({ id: existing.id, name: existing.name, mimeType: existing.mimeType }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        const id = `d-${++idSeq}`;
+        driveFiles.set(id, {
+          id,
+          name,
+          mimeType: mediaCt,
+          parents: (meta.parents as string[]) ?? [],
+          trashed: false,
+          appProperties: (meta.appProperties as Record<string, string>) ?? {},
+          content: contentBytes,
+        });
+        return new Response(
+          JSON.stringify({ id, name, mimeType: mediaCt }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      throw new Error(`Unhandled request: ${method} ${url.toString()}`);
+    });
+
+    const realDriveClient = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: driveFetch,
+      tokenProvider: async () => 'tok',
+      maxRetries: 0,
+    });
+
+    let seq = 0;
+    const controller = createServiceWorkerController({
+      driveClient: realDriveClient,
+      storageSync: syncStorage,
+      storageLocal: localStorage,
+      storageSession: sessionStorage,
+      getManifest: () => makeConfiguredManifest(),
+      getAuthToken: async () => 'tok',
+      maxConcurrentJobs: 3,
+      now: () => new Date(`2026-11-24T05:00:0${Math.min(++seq, 9)}.000Z`),
+      createClipId: () => `idx-job-${++seq}`,
+      tabs: {
+        query: async () => [],
+        get: async (tabId) =>
+          ({
+            id: tabId,
+            url: `https://zhuanlan.zhihu.com/p/${tabId}`,
+            title: `(5 条消息) Article ${tabId} - 知乎`,
+          }) as chrome.tabs.Tab,
+        sendMessage: async (tabId): Promise<ContentResponseMessage> => ({
+          ok: true,
+          type: 'CONTENT_EXTRACTED_PAGE',
+          data: {
+            ...makeExtractedPage(`https://zhuanlan.zhihu.com/p/${tabId}`),
+            title: `Article ${tabId}`,
+            description: `Summary for article ${tabId}.`,
+            site: '知乎',
+            images: [],
+          },
+        }),
+      },
+      scripting: { executeScript: async () => [] },
+      fetchImagesImpl: async () => ({ succeeded: [], failed: [] }),
+      emitPushMessage: async () => undefined,
+      setBadge: async () => undefined,
+    });
+
+    // Fire 5 concurrent clips (3 concurrent workers!) -> indexWriteChain must serialize index.md/log.md writes.
+    await Promise.all(
+      [1, 2, 3, 4, 5].map((tabId) =>
+        controller.handleMessage({
+          type: 'START_CLIP',
+          request: { tabId, mode: 'full', tags: ['batch'] },
+        }),
+      ),
+    );
+    await controller.whenIdle();
+
+    expect(peakIndexConcurrency).toBe(1);
+
+    const indexFile = Array.from(driveFiles.values()).find((f) => f.name === 'index.md');
+    const logFile = Array.from(driveFiles.values()).find((f) => f.name === 'log.md');
+    expect(indexFile).toBeDefined();
+    expect(logFile).toBeDefined();
+
+    const indexText = new TextDecoder().decode(indexFile!.content!);
+    const logText = new TextDecoder().decode(logFile!.content!);
+
+    const indexLines = indexText.split('\n').filter((l) => l.startsWith('- ['));
+    const logLines = logText.split('\n').filter((l) => l.startsWith('- '));
+    expect(indexLines).toHaveLength(5);
+    expect(logLines).toHaveLength(5);
+    for (const id of [1, 2, 3, 4, 5]) {
+      expect(indexText).toContain(`https://zhuanlan.zhihu.com/p/${id}`);
+      expect(indexText).toContain(`./2026-11-24-zhihu-article-${id}/2026-11-24-zhihu-article-${id}.md`);
+      expect(logText).toContain(`https://zhuanlan.zhihu.com/p/${id}`);
+    }
+
+    // History items record canonical article filename and ID.
+    const history = await controller.getHistory();
+    expect(history[0].fileName).toMatch(/^2026-11-24-zhihu-article-\d+\.md$/);
+    expect(history[0].articleFileId).toBeTruthy();
+
+    // Transient index write failure must NOT fail the already-uploaded article, and must emit a warning.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      failIndexWrites = true;
+      const degraded = await controller.runClip({ tabId: 6, mode: 'full' });
+      expect(degraded.ok).toBe(true);
+      if (degraded.ok) {
+        expect(degraded.data.fileName).toBe('2026-11-24-zhihu-article-6.md');
+        expect(
+          degraded.data.warnings.some((w) => w.includes('index.md/log.md')),
+        ).toBe(true);
+      }
+      expect(warnSpy).toHaveBeenCalled();
+
+      // Subsequent clip after outage recovers cleanly (indexWriteChain not poisoned!).
+      failIndexWrites = false;
+      const recovered = await controller.runClip({ tabId: 7, mode: 'full' });
+      expect(recovered.ok).toBe(true);
+      const afterRecoveryIndex = new TextDecoder().decode(
+        driveFiles.get(indexFile!.id)!.content!,
+      );
+      expect(afterRecoveryIndex).toContain('https://zhuanlan.zhihu.com/p/7');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('persists stickyTags in settings distinguishing null (unset), [] (explicitly empty), and non-empty lists', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const uploadedTagBatches: Array<readonly string[] | undefined> = [];
+
+    const driveClient = {
+      ensureRootFolder: vi.fn(async () => ({
+        folderId: 'root-1',
+        folderName: 'WebClips',
+        folderUrl: 'https://drive.google.com/drive/folders/root-1',
+        created: false,
+      })),
+      uploadArticle: vi.fn(async (params: UploadArticleParams) => {
+        uploadedTagBatches.push(params.tags);
+        return {
+          folderId: 'f-tags',
+          folderUrl: 'https://drive.google.com/drive/folders/f-tags',
+          folderName: params.folderName ?? '2026-11-24-example-sample-post',
+          fileName: `${params.folderName ?? '2026-11-24-example-sample-post'}.md`,
+          articleFileName: `${params.folderName ?? '2026-11-24-example-sample-post'}.md`,
+          articleFileId: 'art-1',
+          readmeFileId: 'art-1',
+          title: params.page.title,
+          sourceUrl: params.page.url,
+          clippedAt: params.clippedAt ?? '2026-11-24T04:00:00.000Z',
+          uploadedImages: [],
+          failedImages: [],
+          warnings: [],
+          reusedFolder: false,
+        };
+      }),
+      updateBundleIndexAndLog: vi.fn(async () => ({
+        indexFileId: 'idx-1',
+        logFileId: 'log-1',
+      })),
+    } as unknown as DriveClient;
+
+    const controller = createServiceWorkerController({
+      driveClient,
+      storageSync: syncStorage,
+      storageLocal: localStorage,
+      getManifest: () => makeConfiguredManifest(),
+      getAuthToken: async () => 'tok',
+      tabs: {
+        query: async () => [
+          { id: 1, url: 'https://example.com/post-1' } as chrome.tabs.Tab,
+        ],
+        get: async (tabId) =>
+          ({ id: tabId, url: 'https://example.com/post-1' }) as chrome.tabs.Tab,
+        sendMessage: async (): Promise<ContentResponseMessage> => ({
+          ok: true,
+          type: 'CONTENT_EXTRACTED_PAGE',
+          data: { ...makeExtractedPage('https://example.com/post-1'), images: [] },
+        }),
+      },
+      scripting: { executeScript: async () => [] },
+      fetchImagesImpl: async () => ({ succeeded: [], failed: [] }),
+      emitPushMessage: async () => undefined,
+      setBadge: async () => undefined,
+    });
+
+    // 1. Default state: stickyTags is null, falls back to defaultTags (['web-clip']).
+    const initial = await controller.getSettings();
+    expect(initial.stickyTags).toBeNull();
+    expect(initial.defaultTags).toEqual(['web-clip']);
+
+    await controller.runClip({ mode: 'full' });
+    expect(uploadedTagBatches.at(-1)).toEqual(['web-clip']);
+
+    // 2. Custom stickyTags persists deduplicated trimmed tags and survives unrelated Options updates.
+    const afterSet = await controller.updateSettings({
+      stickyTags: ['ai', 'agents', 'ai', '  '],
+    });
+    expect(afterSet.stickyTags).toEqual(['ai', 'agents']);
+
+    const afterOptionsSave = await controller.updateSettings({
+      defaultTags: ['reading-list'],
+    });
+    expect(afterOptionsSave.defaultTags).toEqual(['reading-list']);
+    expect(afterOptionsSave.stickyTags).toEqual(['ai', 'agents']);
+
+    await controller.runClip({ mode: 'full' });
+    expect(uploadedTagBatches.at(-1)).toEqual(['ai', 'agents']);
+
+    // 3. Explicit empty array [] MUST stay [] (NOT snap back to null or defaultTags!).
+    const afterClearAll = await controller.updateSettings({ stickyTags: [] });
+    expect(afterClearAll.stickyTags).toEqual([]);
+    expect((await controller.getSettings()).stickyTags).toEqual([]);
+
+    await controller.runClip({ mode: 'full' });
+    expect(uploadedTagBatches.at(-1)).toEqual([]);
+
+    // 4. Explicit null resets stickyTags back to null -> falls back to defaultTags again.
+    const afterReset = await controller.updateSettings({ stickyTags: null });
+    expect(afterReset.stickyTags).toBeNull();
+    expect((await controller.getSettings()).stickyTags).toBeNull();
+
+    await controller.runClip({ mode: 'full' });
+    expect(uploadedTagBatches.at(-1)).toEqual(['reading-list']);
   });
 });

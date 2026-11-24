@@ -106,6 +106,13 @@ export interface ClipResult {
   folderId: string;
   folderUrl: string;
   folderName: string;
+  /** Canonical article Markdown filename inside the folder (`<folderName>.md`). */
+  fileName?: string;
+  /** Alias for `fileName` (`<folderName>.md`). */
+  articleFileName?: string;
+  /** Drive file ID of the uploaded article Markdown file (`<folderName>.md`). */
+  articleFileId?: string;
+  /** Backward-compatible alias for `articleFileId`. */
   readmeFileId: string;
   title: string;
   sourceUrl: string;
@@ -206,6 +213,10 @@ export interface ClipHistoryItem {
   folderId: string;
   folderUrl: string;
   folderName: string;
+  fileName?: string;
+  articleFileName?: string;
+  articleFileId?: string;
+  readmeFileId?: string;
   clippedAt: string;
   imageCount: number;
   warningCount: number;
@@ -223,6 +234,12 @@ export interface ExtensionSettings {
   rootFolderName: string;
   rootFolderId: string | null;
   defaultTags: string[];
+  /**
+   * Last-used Popup tag list persisted across Popup opens.
+   * `null` means not yet customized in Popup (fall back to `defaultTags`).
+   * An empty array `[]` is preserved as an explicit user choice ("no tags").
+   */
+  stickyTags: string[] | null;
   frontmatter: FrontmatterPreferences;
   maxImageSizeBytes: number;
   imageConcurrency: number;
@@ -232,6 +249,7 @@ export const DEFAULT_EXTENSION_SETTINGS: ExtensionSettings = {
   rootFolderName: 'WebClips',
   rootFolderId: null,
   defaultTags: ['web-clip'],
+  stickyTags: null,
   frontmatter: {
     includeAuthor: true,
     includePublished: true,

@@ -125,13 +125,20 @@ function createFakeDriveServer(options?: {
     const headers = new Headers(init?.headers);
     expect(headers.get('authorization')).toMatch(/^Bearer /);
 
-    // Metadata GET /drive/v3/files/:id
+    // Metadata or media GET /drive/v3/files/:id
     if (method === 'GET' && url.pathname.startsWith('/drive/v3/files/')) {
       const id = decodeURIComponent(url.pathname.slice('/drive/v3/files/'.length));
       const found = files.get(id);
       if (!found) {
         return new Response(JSON.stringify({ error: { message: 'File not found' } }), {
           status: 404,
+        });
+      }
+      if (url.searchParams.get('alt') === 'media') {
+        const bytes = found.content ? new Uint8Array(found.content) : new Uint8Array(0);
+        return new Response(bytes, {
+          status: 200,
+          headers: { 'content-type': found.mimeType },
         });
       }
       return new Response(
@@ -503,17 +510,19 @@ describe('DriveClient root folder management', () => {
 });
 
 describe('DriveClient uploadArticle', () => {
-  it('uploads ALL images with bounded concurrency strictly BEFORE README.md, rewrites Markdown links, and preserves failed image URLs + frontmatter warnings', async () => {
+  it('uploads ALL images with bounded concurrency strictly BEFORE <folderName>.md, emits OKF v0.2 frontmatter, rewrites Markdown links, and preserves failed image URLs + warnings', async () => {
+    const expectedFolder = '2026-11-24-example-architecture-guide';
+    const expectedFileName = `${expectedFolder}.md`;
     let activeImageUploads = 0;
     let peakImageUploads = 0;
-    let readmeStartedWhileImageInFlight = false;
+    let articleStartedWhileImageInFlight = false;
 
     const server = createFakeDriveServer({
       onMultipartUpload: async (upload) => {
         const name = String(upload.metadata.name);
-        if (name === 'README.md') {
+        if (name === expectedFileName) {
           if (activeImageUploads > 0) {
-            readmeStartedWhileImageInFlight = true;
+            articleStartedWhileImageInFlight = true;
           }
           return;
         }
@@ -587,14 +596,14 @@ describe('DriveClient uploadArticle', () => {
       clippedAt: '2026-11-24T04:00:00.000Z',
     });
 
-    expect(readmeStartedWhileImageInFlight).toBe(false);
+    expect(articleStartedWhileImageInFlight).toBe(false);
     expect(peakImageUploads).toBeLessThanOrEqual(5);
     expect(peakImageUploads).toBeGreaterThan(1);
 
-    // README.md MUST be strictly the last uploaded file.
+    // <folderName>.md MUST be strictly the last uploaded file.
     expect(server.uploadOrder).toHaveLength(8);
-    expect(server.uploadOrder[server.uploadOrder.length - 1]).toBe('README.md');
-    expect(server.uploadOrder.slice(0, 7).every((name) => name !== 'README.md')).toBe(
+    expect(server.uploadOrder[server.uploadOrder.length - 1]).toBe(expectedFileName);
+    expect(server.uploadOrder.slice(0, 7).every((name) => name !== expectedFileName)).toBe(
       true,
     );
 
@@ -605,17 +614,27 @@ describe('DriveClient uploadArticle', () => {
     expect(webpUpload?.contentType).toBe('image/webp');
     expect(Array.from(webpUpload?.contentBytes ?? [])).toEqual(Array.from(WEBP_BYTES));
 
-    // Verify README.md content: rewritten local links + failed remote URL kept + warnings in frontmatter.
-    const readmeUpload = server.uploads.find((u) => u.metadata.name === 'README.md');
-    const readmeText = new TextDecoder().decode(readmeUpload!.contentBytes);
-    expect(readmeText).toContain('![Hero](./images/01-hero.webp)');
-    expect(readmeText).toContain('![Diagram](./images/02-diagram.png)');
-    expect(readmeText).toContain('![Broken](https://cdn.example.com/missing.jpg)');
-    expect(readmeText).toContain('warnings:');
-    expect(readmeText).toContain('https://cdn.example.com/missing.jpg');
+    // Verify <folderName>.md content: OKF v0.2 frontmatter + rewritten local links + failed remote URL kept + warnings.
+    const articleUpload = server.uploads.find(
+      (u) => u.metadata.name === expectedFileName,
+    );
+    const articleText = new TextDecoder().decode(articleUpload!.contentBytes);
+    expect(articleText).toContain('type: "web-clip"');
+    expect(articleText).toContain('description: "Deep dive"');
+    expect(articleText).toContain('status: "raw"');
+    expect(articleText).toContain('generated:\n  by: "drive-clipper"\n  at: "2026-11-24T04:00:00.000Z"');
+    expect(articleText).toContain('sources:\n  - url: "https://example.com/posts/o\'reilly-guide"');
+    expect(articleText).toContain('![Hero](./images/01-hero.webp)');
+    expect(articleText).toContain('![Diagram](./images/02-diagram.png)');
+    expect(articleText).toContain('![Broken](https://cdn.example.com/missing.jpg)');
+    expect(articleText).toContain('warnings:');
+    expect(articleText).toContain('https://cdn.example.com/missing.jpg');
 
     expect(result.reusedFolder).toBe(false);
-    expect(result.folderName).toBe('2026-11-24-architecture-guide');
+    expect(result.folderName).toBe(expectedFolder);
+    expect(result.fileName).toBe(expectedFileName);
+    expect(result.articleFileName).toBe(expectedFileName);
+    expect(result.articleFileId).toBe(result.readmeFileId);
     expect(result.folderUrl).toBe(
       `https://drive.google.com/drive/folders/${result.folderId}`,
     );
@@ -1146,7 +1165,8 @@ describe('DriveClient uploadArticle', () => {
     expect(second.uploadedImages[0].fileId).toBe(first.uploadedImages[0].fileId);
   });
 
-  it('degrades gracefully on single-image Drive upload errors so README.md ALWAYS uploads with remote URL fallback and warning, while still aborting on 401/AbortError', async () => {
+  it('degrades gracefully on single-image Drive upload errors so <folderName>.md ALWAYS uploads with remote URL fallback and warning, while still aborting on 401/AbortError', async () => {
+    const expectedFileName = '2026-11-24-example-architecture-guide.md';
     const server = createFakeDriveServer({
       failUploadNames: {
         '02-diagram.png': {
@@ -1198,9 +1218,10 @@ describe('DriveClient uploadArticle', () => {
       clippedAt: '2026-11-24T04:00:00.000Z',
     });
 
-    // README.md MUST still be uploaded even though 02-diagram.png failed!
+    // <folderName>.md MUST still be uploaded even though 02-diagram.png failed!
     expect(result.readmeFileId).toBeTruthy();
-    expect(server.uploadOrder).toEqual(['01-hero.webp', 'README.md']);
+    expect(result.fileName).toBe(expectedFileName);
+    expect(server.uploadOrder).toEqual(['01-hero.webp', expectedFileName]);
     expect(result.uploadedImages).toHaveLength(1);
     expect(result.uploadedImages[0].filename).toBe('01-hero.webp');
     expect(result.failedImages).toHaveLength(1);
@@ -1208,16 +1229,18 @@ describe('DriveClient uploadArticle', () => {
     expect(result.failedImages[0].reason).toMatch(/Drive upload failed/i);
     expect(result.failedImages[0].status).toBe(400);
 
-    const readmeUpload = server.uploads.find((u) => u.metadata.name === 'README.md');
-    const readmeText = new TextDecoder().decode(readmeUpload!.contentBytes);
-    expect(readmeText).toContain('![Hero](./images/01-hero.webp)');
+    const articleUpload = server.uploads.find(
+      (u) => u.metadata.name === expectedFileName,
+    );
+    const articleText = new TextDecoder().decode(articleUpload!.contentBytes);
+    expect(articleText).toContain('![Hero](./images/01-hero.webp)');
     // Failed upload keeps original remote URL instead of a broken ./images/ link!
-    expect(readmeText).toContain('![Diagram](https://cdn.example.com/diagram.png)');
-    expect(readmeText).not.toContain('./images/02-diagram.png');
-    expect(readmeText).toContain('warnings:');
-    expect(readmeText).toContain('Image upload failed for https://cdn.example.com/diagram.png');
+    expect(articleText).toContain('![Diagram](https://cdn.example.com/diagram.png)');
+    expect(articleText).not.toContain('./images/02-diagram.png');
+    expect(articleText).toContain('warnings:');
+    expect(articleText).toContain('Image upload failed for https://cdn.example.com/diagram.png');
 
-    // Auth error (401) during image upload MUST still abort without uploading README.md.
+    // Auth error (401) during image upload MUST still abort without uploading article Markdown.
     const authFailServer = createFakeDriveServer({
       failUploadNames: {
         '02-diagram.png': {
@@ -1241,9 +1264,10 @@ describe('DriveClient uploadArticle', () => {
         rootFolderId: root2.folderId,
         page: makeSamplePage(),
         fetchedImages,
+        clippedAt: '2026-11-24T04:00:00.000Z',
       }),
     ).rejects.toMatchObject({ status: 401, code: 'AUTH_REQUIRED' });
-    expect(authFailServer.uploadOrder).not.toContain('README.md');
+    expect(authFailServer.uploadOrder).not.toContain(expectedFileName);
   });
 
   it('deduplicates re-clipped images by appProperties.imageUrl even if a filename index shifts', async () => {
@@ -1378,5 +1402,167 @@ describe('DriveClient uploadArticle', () => {
     expect(Array.from(server.files.get(uploadedB.fileId)?.content ?? [])).toEqual(
       Array.from(PNG_BYTES),
     );
+  });
+
+  it('upgrades a legacy folder containing README.md in place to <folderName>.md on re-clip', async () => {
+    const server = createFakeDriveServer();
+    const client = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: server.fetchImpl,
+      tokenProvider: async () => 'test-token',
+    });
+
+    const root = await client.ensureRootFolder({
+      rootFolderName: 'WebClips',
+      rootFolderId: null,
+    });
+
+    const page = makeSamplePage({
+      url: 'https://example.com/legacy-article',
+      markdown: '# Legacy Content',
+    });
+
+    // Seed an older folder with `README.md` inside it.
+    const legacyFolder = server.addFile({
+      name: '2026-11-20-legacy-article',
+      mimeType: DRIVE_FOLDER_MIME_TYPE,
+      parents: [root.folderId],
+      trashed: false,
+      appProperties: { sourceUrl: page.url },
+    });
+    const legacyReadme = server.addFile({
+      name: 'README.md',
+      mimeType: 'text/markdown',
+      parents: [legacyFolder.id],
+      trashed: false,
+      appProperties: {},
+      content: new TextEncoder().encode('# Old README'),
+    });
+
+    const result = await client.uploadArticle({
+      rootFolderId: root.folderId,
+      page,
+      fetchedImages: [],
+      clippedAt: '2026-11-24T04:00:00.000Z',
+    });
+
+    expect(result.reusedFolder).toBe(true);
+    expect(result.folderId).toBe(legacyFolder.id);
+    expect(result.fileName).toBe('2026-11-20-legacy-article.md');
+    expect(result.articleFileId).toBe(legacyReadme.id);
+    expect(result.readmeFileId).toBe(legacyReadme.id);
+
+    // Must have PATCHed and renamed the legacy README.md in place (no duplicate .md files).
+    const mdFilesInFolder = Array.from(server.files.values()).filter(
+      (f) => f.parents.includes(legacyFolder.id) && f.mimeType === 'text/markdown',
+    );
+    expect(mdFilesInFolder).toHaveLength(1);
+    expect(mdFilesInFolder[0].id).toBe(legacyReadme.id);
+    expect(mdFilesInFolder[0].name).toBe('2026-11-20-legacy-article.md');
+  });
+
+  it('creates, updates idempotently via alt=media, and appends OKF v0.2 root index.md and log.md', async () => {
+    const server = createFakeDriveServer();
+    const client = new DriveClient({
+      baseUrl: 'http://127.0.0.1:9999',
+      fetchImpl: server.fetchImpl,
+      tokenProvider: async () => 'test-token',
+    });
+
+    const root = await client.ensureRootFolder({
+      rootFolderName: 'WebClips',
+      rootFolderId: null,
+    });
+
+    // 1. First clip creates both index.md and log.md via POST.
+    const firstRes = await client.updateBundleIndexAndLog({
+      rootFolderId: root.folderId,
+      rootFolderName: root.folderName,
+      entry: {
+        folderName: '2026-11-24-zhihu-first-post',
+        fileName: '2026-11-24-zhihu-first-post.md',
+        title: 'First Post',
+        sourceUrl: 'https://zhuanlan.zhihu.com/p/1',
+        clippedAt: '2026-11-24T04:00:00.000Z',
+        source: 'zhihu',
+        tags: ['ai'],
+        description: 'First summary.',
+      },
+      action: 'clipped',
+    });
+
+    const indexText1 = new TextDecoder().decode(
+      server.files.get(firstRes.indexFileId)!.content!,
+    );
+    const logText1 = new TextDecoder().decode(
+      server.files.get(firstRes.logFileId)!.content!,
+    );
+    expect(indexText1).toContain('okf_version: "0.2"');
+    expect(indexText1).toContain('# WebClips');
+    expect(indexText1).toContain(
+      '- [First Post](./2026-11-24-zhihu-first-post/2026-11-24-zhihu-first-post.md)',
+    );
+    expect(logText1.startsWith('# Clip Log\n\n')).toBe(true);
+    expect(logText1).toContain('2026-11-24T04:00:00.000Z | clipped | [First Post]');
+
+    // 2. Second clip downloads existing via ?alt=media and PATCHes in place.
+    const secondRes = await client.updateBundleIndexAndLog({
+      rootFolderId: root.folderId,
+      rootFolderName: root.folderName,
+      entry: {
+        folderName: '2026-11-24-x-second-post',
+        fileName: '2026-11-24-x-second-post.md',
+        title: 'Second Post',
+        sourceUrl: 'https://x.com/user/status/2',
+        clippedAt: '2026-11-24T05:00:00.000Z',
+        source: 'x',
+        tags: ['agents'],
+        description: 'Second summary.',
+      },
+      action: 'clipped',
+    });
+
+    expect(secondRes.indexFileId).toBe(firstRes.indexFileId);
+    expect(secondRes.logFileId).toBe(firstRes.logFileId);
+
+    // 3. Re-clipping First Post updates its line in index.md in place (2 total entries) and appends 3rd row to log.md.
+    const thirdRes = await client.updateBundleIndexAndLog({
+      rootFolderId: root.folderId,
+      rootFolderName: root.folderName,
+      entry: {
+        folderName: '2026-11-24-zhihu-first-post',
+        fileName: '2026-11-24-zhihu-first-post.md',
+        title: 'First Post (Updated)',
+        sourceUrl: 'https://zhuanlan.zhihu.com/p/1',
+        clippedAt: '2026-11-24T06:00:00.000Z',
+        source: 'zhihu',
+        tags: ['ai', 'updated'],
+        description: 'Refreshed summary.',
+      },
+      action: 'updated',
+    });
+
+    expect(thirdRes.indexFileId).toBe(firstRes.indexFileId);
+    expect(thirdRes.logFileId).toBe(firstRes.logFileId);
+
+    const finalIndex = new TextDecoder().decode(
+      server.files.get(firstRes.indexFileId)!.content!,
+    );
+    const finalLog = new TextDecoder().decode(
+      server.files.get(firstRes.logFileId)!.content!,
+    );
+    const indexEntries = finalIndex
+      .split('\n')
+      .filter((line) => line.startsWith('- ['));
+    expect(indexEntries).toHaveLength(2);
+    expect(indexEntries[0]).toContain('[Second Post]');
+    expect(indexEntries[1]).toContain('[First Post (Updated)]');
+    expect(indexEntries[1]).toContain('Refreshed summary.');
+
+    const logEntries = finalLog
+      .split('\n')
+      .filter((line) => line.startsWith('- '));
+    expect(logEntries).toHaveLength(3);
+    expect(logEntries[2]).toContain('2026-11-24T06:00:00.000Z | updated | [First Post (Updated)]');
   });
 });

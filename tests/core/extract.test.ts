@@ -252,7 +252,7 @@ describe('selection clip support & content script message handler', () => {
     const zhihuUrl = 'https://zhuanlan.zhihu.com/p/123456';
 
     const zhihuInfo = getPageInfo(zhihuDoc, zhihuUrl);
-    expect(zhihuInfo.title).toBe('华硕 ProArt 创 16 深度评测 - 知乎');
+    expect(zhihuInfo.title).toBe('华硕 ProArt 创 16 深度评测');
 
     const zhihuExtracted = await extractPage(zhihuDoc, zhihuUrl, {
       mode: 'full',
@@ -290,5 +290,29 @@ describe('selection clip support & content script message handler', () => {
     );
     const yearExtracted = await extractPage(yearDoc, 'https://example.com/report');
     expect(yearExtracted.title).toBe('(2026) Annual Report');
+  });
+
+  it('generates a clean plain-text description excerpt from extracted Markdown when meta description is missing', async () => {
+    const html = `<!doctype html>
+      <html>
+        <head><title>Open Knowledge Format Guide</title></head>
+        <body>
+          <article>
+            <h1>Open Knowledge Format Guide</h1>
+            <p>Read the <a href="https://example.com/spec">specification</a> and store <strong>structured</strong> clips with https://t.co/ignored123 links stripped cleanly.</p>
+            <img src="https://example.com/hero.png" alt="Hero Image" />
+          </article>
+        </body>
+      </html>`;
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+
+    const extracted = await extractPage(doc, 'https://example.com/okf', {
+      mode: 'full',
+    });
+    expect(extracted.description).toBeTruthy();
+    expect(extracted.description).toContain('Read the specification and store structured clips');
+    expect(extracted.description).not.toContain('**');
+    expect(extracted.description).not.toContain('https://');
+    expect(Array.from(extracted.description ?? '').length).toBeLessThanOrEqual(160);
   });
 });

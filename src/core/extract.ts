@@ -4,7 +4,7 @@ import Defuddle, {
   type DefuddleResponse,
 } from 'defuddle/full';
 import type { ClipMode, ExtractedPage, PageInfo } from '../types.js';
-import { cleanPageTitle } from './frontmatter.js';
+import { cleanPageTitle, extractPlainTextExcerpt } from './frontmatter.js';
 import {
   discoverImagesFromMarkdown,
   resolveDomImages,
@@ -266,6 +266,19 @@ function nonEmptyOrNull(value: string | null | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function resolveDescription(
+  primary: string | null | undefined,
+  fallback: string | null,
+  markdown: string,
+): string | null {
+  const metaDescription = nonEmptyOrNull(primary) ?? nonEmptyOrNull(fallback);
+  if (metaDescription) {
+    return metaDescription.replace(/\s+/g, ' ').trim();
+  }
+  const excerpt = extractPlainTextExcerpt(markdown, 160);
+  return excerpt.length > 0 ? excerpt : null;
+}
+
 /**
  * Extracts either the active selection or the full article from `doc` using
  * bounded Shadow DOM flattening, lazy-load image resolution, Defuddle (`parseAsync`
@@ -300,7 +313,7 @@ export async function extractPage(
       author: fallbackMeta.author,
       published: fallbackMeta.published,
       site: fallbackMeta.site,
-      description: fallbackMeta.description,
+      description: resolveDescription(null, fallbackMeta.description, markdown),
       markdown,
       mode: 'selection',
       hasSelection: true,
@@ -353,7 +366,11 @@ export async function extractPage(
     author: nonEmptyOrNull(parsed.author) ?? fallbackMeta.author,
     published: nonEmptyOrNull(parsed.published) ?? fallbackMeta.published,
     site: nonEmptyOrNull(parsed.site) ?? fallbackMeta.site,
-    description: nonEmptyOrNull(parsed.description) ?? fallbackMeta.description,
+    description: resolveDescription(
+      parsed.description,
+      fallbackMeta.description,
+      markdown,
+    ),
     markdown,
     mode: 'full',
     hasSelection,

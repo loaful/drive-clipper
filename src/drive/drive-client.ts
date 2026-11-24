@@ -1,7 +1,12 @@
 import {
+  appendClipLogMarkdown,
+  buildArticleFileName,
   buildArticleFolderName,
   buildFrontmatter,
   composeMarkdownDocument,
+  extractPlainTextExcerpt,
+  upsertRootIndexMarkdown,
+  type RootIndexEntry,
 } from '../core/frontmatter.js';
 import { rewriteMarkdownImageUrls } from '../core/images.js';
 import {
@@ -37,6 +42,10 @@ const DEFAULT_WEB_AUTH_EXPIRES_IN_SECONDS = 3600;
 const DRIVE_APP_PROPERTY_MAX_BYTES = 124;
 const SOURCE_URL_PROPERTY_KEY = 'sourceUrl';
 const IMAGE_URL_PROPERTY_KEY = 'imageUrl';
+const ROLE_PROPERTY_KEY = 'driveClipperRole';
+const ARTICLE_ROLE_VALUE = 'article';
+const ROOT_INDEX_FILENAME = 'index.md';
+const ROOT_LOG_FILENAME = 'log.md';
 const DEFAULT_MAX_RETRIES = 4;
 const DEFAULT_BASE_RETRY_DELAY_MS = 250;
 const MAX_RETRY_AFTER_MS = 30_000;
@@ -91,6 +100,20 @@ export interface UploadArticleParams {
   interactive?: boolean;
   onProgress?: (completed: number, total: number) => void;
   signal?: AbortSignal;
+}
+
+export interface UpdateBundleIndexAndLogParams {
+  rootFolderId: string;
+  rootFolderName: string;
+  entry: Omit<RootIndexEntry, 'rootFolderName'>;
+  action: 'clipped' | 'updated';
+  interactive?: boolean;
+  signal?: AbortSignal;
+}
+
+export interface UpdateBundleIndexAndLogResult {
+  indexFileId: string;
+  logFileId: string;
 }
 
 interface DriveFileResource {
@@ -1074,9 +1097,14 @@ export class DriveClient {
   private async listChildFiles(
     parentFolderId: string,
     options?: { interactive?: boolean; signal?: AbortSignal },
-  ): Promise<{ byName: Map<string, string>; byImageUrl: Map<string, string> }> {
+  ): Promise<{
+    byName: Map<string, string>;
+    byImageUrl: Map<string, string>;
+    articleFileId?: string;
+  }> {
     const byName = new Map<string, string>();
     const byImageUrl = new Map<string, string>();
+    let articleFileId: string | undefined;
     const query =
       `'${escapeDriveQueryValue(parentFolderId)}' in parents ` +
       `and mimeType != '${DRIVE_FOLDER_MIME_TYPE}' ` +
@@ -1114,12 +1142,18 @@ export class DriveClient {
         if (imageUrlKey && !byImageUrl.has(imageUrlKey)) {
           byImageUrl.set(imageUrlKey, file.id);
         }
+        if (
+          !articleFileId &&
+          file.appProperties?.[ROLE_PROPERTY_KEY] === ARTICLE_ROLE_VALUE
+        ) {
+          articleFileId = file.id;
+        }
       }
 
       pageToken = list.nextPageToken;
     } while (pageToken);
 
-    return { byName, byImageUrl };
+    return { byName, byImageUrl, articleFileId };
   }
 
   /**
@@ -1131,6 +1165,24 @@ export class DriveClient {
   ): Promise<Map<string, string>> {
     const { byName } = await this.listChildFiles(parentFolderId, options);
     return byName;
+  }
+
+  /**
+   * Downloads a UTF-8 text file's raw contents via Drive API v3 `alt=media`.
+   */
+  async downloadTextFile(
+    fileId: string,
+    options?: { interactive?: boolean; signal?: AbortSignal },
+  ): Promise<string> {
+    const response = await this.requestWithRetry(
+      `${this.apiBaseUrl}/files/${encodeURIComponent(fileId)}?alt=media`,
+      {
+        method: 'GET',
+        interactive: options?.interactive,
+        signal: options?.signal,
+      },
+    );
+    return response.text();
   }
 
   /**
@@ -1284,15 +1336,20 @@ export class DriveClient {
    * 1. Find or create idempotent article folder (`appProperties.sourceUrl`).
    * 2. Upload ALL downloaded images into `images/` with bounded concurrency and await all.
    *    Per-image non-auth upload failures degrade gracefully (keeping remote URL + warning).
-   * 3. Rewrite Markdown links and generate YAML frontmatter.
-   * 4. Upload `README.md` LAST.
+   * 3. Rewrite Markdown links and generate OKF v0.2 YAML frontmatter.
+   * 4. Upload `<folderName>.md` LAST.
    */
   async uploadArticle(params: UploadArticleParams): Promise<ClipResult> {
     const clippedAt = params.clippedAt ?? new Date().toISOString();
     const finalTitle =
       params.title?.trim() || params.page.title.trim() || 'Untitled';
     const requestedFolderName =
-      params.folderName?.trim() || buildArticleFolderName(finalTitle, clippedAt);
+      params.folderName?.trim() ||
+      buildArticleFolderName(
+        finalTitle,
+        clippedAt,
+        params.page.url || params.page.site,
+      );
     const interactive = params.interactive ?? true;
     const concurrency = Math.max(
       1,
@@ -1306,6 +1363,7 @@ export class DriveClient {
       interactive,
       signal: params.signal,
     });
+    const articleFileName = buildArticleFileName(articleFolder.folderName);
 
     const totalUploads = params.fetchedImages.length + 1;
     let completedUploads = 0;
@@ -1488,9 +1546,15 @@ export class DriveClient {
       }
     }
 
+    const description =
+      params.page.description?.replace(/\s+/g, ' ').trim() ||
+      extractPlainTextExcerpt(rewriteResult.markdown) ||
+      finalTitle;
+
     const frontmatter = buildFrontmatter(
       {
         title: finalTitle,
+        description,
         url: params.page.url,
         author: params.page.author,
         published: params.page.published,
@@ -1503,30 +1567,36 @@ export class DriveClient {
       params.frontmatterPreferences,
     );
 
-    const readmeContent = composeMarkdownDocument(
+    const articleContent = composeMarkdownDocument(
       frontmatter,
       rewriteResult.markdown,
     );
 
-    // Phase 3: Upload README.md strictly AFTER all images have completed.
-    let existingReadmeId: string | undefined;
+    // Phase 3: Upload `<folderName>.md` strictly AFTER all images have completed.
+    let existingArticleFileId: string | undefined;
     if (articleFolder.reused) {
-      const existingArticleFiles = await this.listChildFilesByName(
+      const existingArticleFiles = await this.listChildFiles(
         articleFolder.folderId,
         {
           interactive,
           signal: params.signal,
         },
       );
-      existingReadmeId = existingArticleFiles.get('README.md');
+      existingArticleFileId =
+        existingArticleFiles.byName.get(articleFileName) ??
+        existingArticleFiles.articleFileId ??
+        existingArticleFiles.byName.get('README.md');
     }
 
-    const readmeFile = await this.uploadFile({
-      name: 'README.md',
+    const articleFile = await this.uploadFile({
+      name: articleFileName,
       mimeType: 'text/markdown',
-      bytes: textEncoder.encode(readmeContent),
+      bytes: textEncoder.encode(articleContent),
       parentFolderId: articleFolder.folderId,
-      existingFileId: existingReadmeId,
+      existingFileId: existingArticleFileId,
+      appProperties: {
+        [ROLE_PROPERTY_KEY]: ARTICLE_ROLE_VALUE,
+      },
       interactive,
       signal: params.signal,
     });
@@ -1538,7 +1608,10 @@ export class DriveClient {
       folderId: articleFolder.folderId,
       folderUrl: buildDriveFolderUrl(articleFolder.folderId),
       folderName: articleFolder.folderName,
-      readmeFileId: readmeFile.id,
+      fileName: articleFileName,
+      articleFileName,
+      articleFileId: articleFile.id,
+      readmeFileId: articleFile.id,
       title: finalTitle,
       sourceUrl: params.page.url,
       clippedAt,
@@ -1546,6 +1619,97 @@ export class DriveClient {
       failedImages,
       warnings: allWarnings,
       reusedFolder: articleFolder.reused,
+    };
+  }
+
+  /**
+   * Downloads existing OKF v0.2 bundle root `index.md` and `log.md` from
+   * `rootFolderId` (if present), applies deterministic upsert/append updates,
+   * and writes them back via `POST`/`PATCH`.
+   *
+   * Callers performing concurrent clips MUST serialize calls to this method
+   * (e.g. via an async mutex chain) to prevent lost-update races.
+   */
+  async updateBundleIndexAndLog(
+    params: UpdateBundleIndexAndLogParams,
+  ): Promise<UpdateBundleIndexAndLogResult> {
+    const interactive = params.interactive ?? true;
+    const childFiles = await this.listChildFilesByName(params.rootFolderId, {
+      interactive,
+      signal: params.signal,
+    });
+
+    let existingIndexId = childFiles.get(ROOT_INDEX_FILENAME);
+    let existingLogId = childFiles.get(ROOT_LOG_FILENAME);
+
+    const readOptionalText = async (
+      fileId: string | undefined,
+    ): Promise<{ text: string | null; stillExists: boolean }> => {
+      if (!fileId) {
+        return { text: null, stillExists: false };
+      }
+      try {
+        const text = await this.downloadTextFile(fileId, {
+          interactive,
+          signal: params.signal,
+        });
+        return { text, stillExists: true };
+      } catch (error) {
+        if (error instanceof DriveApiError && error.status === 404) {
+          return { text: null, stillExists: false };
+        }
+        throw error;
+      }
+    };
+
+    const [indexRead, logRead] = await Promise.all([
+      readOptionalText(existingIndexId),
+      readOptionalText(existingLogId),
+    ]);
+
+    if (!indexRead.stillExists) {
+      existingIndexId = undefined;
+    }
+    if (!logRead.stillExists) {
+      existingLogId = undefined;
+    }
+
+    const fullEntry: RootIndexEntry = {
+      ...params.entry,
+      rootFolderName: params.rootFolderName,
+    };
+
+    const nextIndexContent = upsertRootIndexMarkdown(indexRead.text, fullEntry);
+    const nextLogContent = appendClipLogMarkdown(
+      logRead.text,
+      fullEntry,
+      params.action,
+    );
+
+    const [indexFile, logFile] = await Promise.all([
+      this.uploadFile({
+        name: ROOT_INDEX_FILENAME,
+        mimeType: 'text/markdown',
+        bytes: textEncoder.encode(nextIndexContent),
+        parentFolderId: params.rootFolderId,
+        existingFileId: existingIndexId,
+        interactive,
+        signal: params.signal,
+      }),
+      this.uploadFile({
+        name: ROOT_LOG_FILENAME,
+        mimeType: 'text/markdown',
+        bytes: textEncoder.encode(nextLogContent),
+        parentFolderId: params.rootFolderId,
+        existingFileId: existingLogId,
+        interactive,
+        signal: params.signal,
+      }),
+    ]);
+
+    return {
+      indexFileId: indexFile.id,
+      logFileId: logFile.id,
     };
   }
 }
