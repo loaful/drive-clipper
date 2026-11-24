@@ -101,6 +101,14 @@ function createMockRuntime(config: MockRuntimeConfig = {}) {
   const jobsListeners = new Set<(jobs: ClipJob[]) => void>();
   const sentMessages: UiToBackgroundMessage[] = [];
   const openOptionsPage = vi.fn();
+  let currentSettings: ExtensionSettings = {
+    ...DEFAULT_EXTENSION_SETTINGS,
+    ...config.settings,
+    frontmatter: {
+      ...DEFAULT_EXTENSION_SETTINGS.frontmatter,
+      ...config.settings?.frontmatter,
+    },
+  };
   let currentHistory = [...(config.history ?? [])];
   let currentJobs = [...(config.jobs ?? [])];
 
@@ -142,7 +150,40 @@ function createMockRuntime(config: MockRuntimeConfig = {}) {
         case 'GET_SETTINGS':
           return {
             ok: true,
-            data: (config.settings ?? DEFAULT_EXTENSION_SETTINGS) as UiMessageResponseMap[K],
+            data: {
+              ...currentSettings,
+              defaultTags: [...currentSettings.defaultTags],
+              stickyTags: currentSettings.stickyTags
+                ? [...currentSettings.stickyTags]
+                : null,
+              frontmatter: { ...currentSettings.frontmatter },
+            } as UiMessageResponseMap[K],
+          };
+        case 'UPDATE_SETTINGS':
+          currentSettings = {
+            ...currentSettings,
+            ...msg.patch,
+            stickyTags:
+              msg.patch.stickyTags === undefined
+                ? currentSettings.stickyTags
+                : msg.patch.stickyTags === null
+                  ? null
+                  : [...msg.patch.stickyTags],
+            frontmatter: {
+              ...currentSettings.frontmatter,
+              ...(msg.patch.frontmatter ?? {}),
+            },
+          };
+          return {
+            ok: true,
+            data: {
+              ...currentSettings,
+              defaultTags: [...currentSettings.defaultTags],
+              stickyTags: currentSettings.stickyTags
+                ? [...currentSettings.stickyTags]
+                : null,
+              frontmatter: { ...currentSettings.frontmatter },
+            } as UiMessageResponseMap[K],
           };
         case 'GET_AUTH_STATUS':
           return {
@@ -257,7 +298,7 @@ describe('Popup UI', () => {
     document.body.innerHTML = '';
   });
 
-  it('renders cleaned page title preview and updates YYYY-MM-DD-<slug> folder preview live', async () => {
+  it('renders cleaned page title preview and updates <folderName>/<folderName>.md preview with full-path tooltip live', async () => {
     const root = loadPopupDom();
     const mock = createMockRuntime({
       settings: {
@@ -269,7 +310,7 @@ describe('Popup UI', () => {
         data: {
           tabId: 42,
           url: 'https://www.zhihu.com/question/12345',
-          title: '(20 封私信 / 17 条消息) 华硕 ProArt 显示器评测',
+          title: '(20 封私信 / 17 条消息) 华硕 ProArt 显示器评测 - 知乎',
           hasSelection: false,
           selectionLength: 0,
           site: 'zhihu.com',
@@ -284,22 +325,194 @@ describe('Popup UI', () => {
 
     const titleInput = root.querySelector<HTMLInputElement>('#title-input')!;
     const folderPreview = root.querySelector<HTMLElement>('#folder-preview')!;
+    const folderPreviewRow = root.querySelector<HTMLElement>('#folder-preview-row')!;
     const rootPrefix = root.querySelector<HTMLElement>('#root-folder-prefix')!;
 
     expect(titleInput.value).toBe('华硕 ProArt 显示器评测');
     expect(rootPrefix.textContent).toBe('MyArchive/');
-    expect(folderPreview.textContent).toBe('2026-11-24-华硕-proart-显示器评测');
+    expect(folderPreview.textContent).toBe(
+      '2026-11-24-zhihu-华硕-proart-显示器评测/2026-11-24-zhihu-华硕-proart-显示器评测.md',
+    );
+    expect(folderPreview.title).toBe(
+      'MyArchive/2026-11-24-zhihu-华硕-proart-显示器评测/2026-11-24-zhihu-华硕-proart-显示器评测.md',
+    );
+    expect(folderPreviewRow.title).toBe(folderPreview.title);
 
     // Preserves legitimate parenthetical years and never alters manual edits
     titleInput.value = '(2026) 深入理解 Chrome MV3 & OAuth!';
     titleInput.dispatchEvent(new Event('input', { bubbles: true }));
     expect(folderPreview.textContent).toBe(
-      '2026-11-24-2026-深入理解-chrome-mv3-oauth',
+      '2026-11-24-zhihu-2026-深入理解-chrome-mv3-oauth/2026-11-24-zhihu-2026-深入理解-chrome-mv3-oauth.md',
+    );
+    expect(folderPreview.title).toBe(
+      'MyArchive/2026-11-24-zhihu-2026-深入理解-chrome-mv3-oauth/2026-11-24-zhihu-2026-深入理解-chrome-mv3-oauth.md',
     );
 
     titleInput.value = '   ';
     titleInput.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(folderPreview.textContent).toBe('2026-11-24-untitled');
+    expect(folderPreview.textContent).toBe(
+      '2026-11-24-zhihu-untitled/2026-11-24-zhihu-untitled.md',
+    );
+  });
+
+  it('previews and submits clean X.com slugs as <folderName>/<folderName>.md', async () => {
+    const root = loadPopupDom();
+    const clipRequests: Array<Extract<UiToBackgroundMessage, { type: 'START_CLIP' }>> = [];
+    const mock = createMockRuntime({
+      pageInfo: {
+        ok: true,
+        data: {
+          tabId: 88,
+          url: 'https://x.com/jakevin/status/2125132076768985501',
+          title: 'jakevin on X: "Shipping OKF v0.2 bundles https://t.co/xyz123" / X',
+          hasSelection: false,
+          selectionLength: 0,
+          site: 'X (Twitter)',
+        },
+      },
+      onStartClip: async (msg) => {
+        clipRequests.push(msg);
+        return {
+          ok: true,
+          data: makeJob({
+            id: 'job-x',
+            url: 'https://x.com/jakevin/status/2125132076768985501',
+            title: msg.request.title ?? 'Untitled',
+            folderName: msg.request.folderName ?? '2026-11-24-x-shipping-okf-v0-2-bundles',
+            status: 'queued',
+          }),
+        };
+      },
+    });
+
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    const titleInput = root.querySelector<HTMLInputElement>('#title-input')!;
+    const folderPreview = root.querySelector<HTMLElement>('#folder-preview')!;
+
+    expect(titleInput.value).toBe('Shipping OKF v0.2 bundles');
+    expect(folderPreview.textContent).toBe(
+      '2026-11-24-x-shipping-okf-v0-2-bundles/2026-11-24-x-shipping-okf-v0-2-bundles.md',
+    );
+    expect(folderPreview.title).toBe(
+      'WebClips/2026-11-24-x-shipping-okf-v0-2-bundles/2026-11-24-x-shipping-okf-v0-2-bundles.md',
+    );
+
+    root
+      .querySelector<HTMLFormElement>('#clip-form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await vi.waitFor(() => expect(clipRequests).toHaveLength(1));
+    expect(clipRequests[0]?.request.folderName).toBe(
+      '2026-11-24-x-shipping-okf-v0-2-bundles',
+    );
+  });
+
+  it('persists sticky tags on add, chip removal, Backspace, and submit — preserving empty [] across reopen', async () => {
+    const mock = createMockRuntime({
+      settings: {
+        ...DEFAULT_EXTENSION_SETTINGS,
+        defaultTags: ['web-clip', 'engineering'],
+        stickyTags: null,
+      },
+      onStartClip: async (msg) => ({
+        ok: true,
+        data: makeJob({
+          id: 'job-sticky',
+          title: msg.request.title ?? 'Untitled',
+          folderName: msg.request.folderName ?? '2026-11-24-example-how-v8-compiles-javascript',
+          status: 'queued',
+        }),
+      }),
+    });
+
+    const getChipLabels = (root: HTMLElement) =>
+      Array.from(root.querySelectorAll('.tag-chip-label')).map((el) => el.textContent);
+
+    const getStickyUpdates = () =>
+      mock.sentMessages
+        .filter(
+          (m): m is Extract<UiToBackgroundMessage, { type: 'UPDATE_SETTINGS' }> =>
+            m.type === 'UPDATE_SETTINGS' && m.patch.stickyTags !== undefined,
+        )
+        .map((m) => m.patch.stickyTags);
+
+    // 1. First open (stickyTags: null) seeds from defaultTags
+    const root1 = loadPopupDom();
+    controller = await mountPopup(root1, { runtime: mock.runtime, now: () => FIXED_NOW });
+    expect(getChipLabels(root1)).toEqual(['web-clip', 'engineering']);
+    expect(getStickyUpdates()).toEqual([]);
+
+    // 2. Adding tags immediately persists stickyTags
+    const tagsInput1 = root1.querySelector<HTMLInputElement>('#tags-input')!;
+    tagsInput1.value = '#AI, knowledge-base';
+    tagsInput1.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+    );
+    await vi.waitFor(() =>
+      expect(getStickyUpdates()).toEqual([
+        ['web-clip', 'engineering', 'ai', 'knowledge-base'],
+      ]),
+    );
+
+    // Reopen Popup -> restores stickyTags instead of snapping back to defaultTags
+    controller.destroy();
+    const root2 = loadPopupDom();
+    controller = await mountPopup(root2, { runtime: mock.runtime, now: () => FIXED_NOW });
+    expect(getChipLabels(root2)).toEqual([
+      'web-clip',
+      'engineering',
+      'ai',
+      'knowledge-base',
+    ]);
+
+    // 3. Removing chips via × and Backspace persists immediately, including empty []
+    root2.querySelector<HTMLButtonElement>('[data-remove-tag="web-clip"]')!.click();
+    root2.querySelector<HTMLButtonElement>('[data-remove-tag="engineering"]')!.click();
+    root2.querySelector<HTMLButtonElement>('[data-remove-tag="ai"]')!.click();
+
+    const tagsInput2 = root2.querySelector<HTMLInputElement>('#tags-input')!;
+    tagsInput2.value = '';
+    tagsInput2.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true, cancelable: true }),
+    );
+    expect(getChipLabels(root2)).toEqual([]);
+
+    await vi.waitFor(() => expect(getStickyUpdates().at(-1)).toEqual([]));
+
+    // 4. Crucial edge case: reopening Popup with stickyTags: [] stays empty [] (NEVER snaps back to defaultTags!)
+    controller.destroy();
+    const root3 = loadPopupDom();
+    controller = await mountPopup(root3, { runtime: mock.runtime, now: () => FIXED_NOW });
+    expect(getChipLabels(root3)).toEqual([]);
+
+    // 5. Clicking × on the ONLY remaining chip also persists [] and survives reopen
+    const tagsInput3 = root3.querySelector<HTMLInputElement>('#tags-input')!;
+    tagsInput3.value = 'solo';
+    tagsInput3.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+    );
+    await vi.waitFor(() => expect(getStickyUpdates().at(-1)).toEqual(['solo']));
+
+    root3.querySelector<HTMLButtonElement>('[data-remove-tag="solo"]')!.click();
+    await vi.waitFor(() => expect(getStickyUpdates().at(-1)).toEqual([]));
+
+    controller.destroy();
+    const root4 = loadPopupDom();
+    controller = await mountPopup(root4, { runtime: mock.runtime, now: () => FIXED_NOW });
+    expect(getChipLabels(root4)).toEqual([]);
+
+    // 6. Submitting persists current tags (including empty []) via UPDATE_SETTINGS
+    const countBeforeSubmit = getStickyUpdates().length;
+    root4
+      .querySelector<HTMLFormElement>('#clip-form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await vi.waitFor(() => expect(getStickyUpdates().length).toBe(countBeforeSubmit + 1));
+    expect(getStickyUpdates().at(-1)).toEqual([]);
   });
 
   it('seeds default tags, supports keyboard tag editing, and commits pending tag on clip', async () => {

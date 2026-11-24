@@ -343,6 +343,46 @@ describe('Options UI', () => {
     expect(controller.getSettings().frontmatter.includeWarnings).toBe(false);
   });
 
+  it('leaves stickyTags untouched when saving defaultTags and explains sticky Popup tags', async () => {
+    const root = loadOptionsDom();
+    const mock = createMockOptionsRuntime({
+      settings: {
+        ...DEFAULT_EXTENSION_SETTINGS,
+        defaultTags: ['web-clip'],
+        stickyTags: [],
+      },
+    });
+
+    controller = await mountOptions(root, { runtime: mock.runtime });
+
+    expect(root.querySelector('#default-tags-help')?.textContent).toContain(
+      'Popup remembers your last-used tags',
+    );
+
+    const tagsInput = root.querySelector<HTMLInputElement>('#default-tags-input')!;
+    const form = root.querySelector<HTMLFormElement>('#preferences-form')!;
+    const feedback = root.querySelector<HTMLElement>('#preferences-feedback')!;
+
+    tagsInput.value = 'reading-list';
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await vi.waitFor(() =>
+      expect(feedback.textContent).toBe('Preferences saved.'),
+    );
+
+    const updateMsg = mock.sentMessages.find(
+      (m): m is Extract<UiToBackgroundMessage, { type: 'UPDATE_SETTINGS' }> =>
+        m.type === 'UPDATE_SETTINGS',
+    );
+    expect(updateMsg).toBeDefined();
+    expect('stickyTags' in (updateMsg?.patch ?? {})).toBe(false);
+    expect(controller.getSettings().defaultTags).toEqual([
+      'web-clip',
+      'reading-list',
+    ]);
+    expect(controller.getSettings().stickyTags).toEqual([]);
+  });
+
   it('validates non-empty folder name and surfaces AUTH_REQUIRED errors cleanly', async () => {
     const root = loadOptionsDom();
     const mock = createMockOptionsRuntime({

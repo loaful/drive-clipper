@@ -1,29 +1,36 @@
 # Drive Clipper
 
-Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Markdown with local images and uploads each clip to Google Drive. It uses `defuddle/full` for article extraction, cleans site unread prefixes from default titles, queues multi-tab downloads and uploads in the background service worker, rewrites image links to relative paths, and authenticates through `chrome.identity` with the minimal `drive.file` OAuth scope.
+Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into agent-friendly Open Knowledge Format (OKF v0.2) Markdown bundles with local images and uploads each clip to Google Drive. It uses `defuddle/full` for article extraction (with dedicated X.com media extraction), cleans site prefixes and wrappers from default titles, queues multi-tab downloads and uploads in the background service worker, maintains root `index.md` and `log.md`, remembers your Popup tags across opens, and authenticates through `chrome.identity` with the minimal `drive.file` OAuth scope.
 
-## Multi-tab background queue & title cleanup
+## Multi-tab background queue, title cleanup & sticky tags
 
 - **Clip across tabs without waiting:** Clicking **Clip to Google Drive** runs fast page extraction while the tab is open, enqueues background image download and Google Drive upload (up to 2 concurrent jobs to avoid API rate-limit bursts), keeps the MV3 service worker alive with a 15-second heartbeat until the queue drains, and immediately lets you switch tabs or close the popup.
 - **Unified Clip queue & toolbar badge:** Reopening the popup from any tab restores live job progress from `chrome.storage.session` (`clipJobs`) and streams updates in real time (`Queued`, `Extracting...`, `Downloading`, `Uploading`, `Saved` with `Open ↗` link and collapsible warnings, plus single-job dismiss and `Clear done`). The toolbar badge reflects queue state across both popup and context-menu clips: blue active count (`1`, `3`, …) while jobs run, green `OK` briefly when finished cleanly, and red `!` if any undismissed clip failed.
-- **Automatic unread-prefix title cleanup:** Default page titles strip leading notification counters such as Zhihu `(20 封私信 / 17 条消息) ...`, `(3) ...`, `(99+) ...`, and `[12] ...` before computing the article title and `YYYY-MM-DD-<slug>` folder name, while preserving legitimate parentheticals like `(2026) Annual Report` and `(Part 1) Guide` as well as any manual edits you type in the popup.
+- **Automatic title & slug cleanup:** Default page titles strip leading notification counters such as Zhihu `(20 封私信 / 17 条消息) ...`, `(3) ...`, `(99+) ...`, and `[12] ...`, trailing site brand suffixes (`- 知乎`, `- 知乎专栏`, `/ X`, `/ Twitter`, `| Medium`, etc.), X/Twitter wrappers (`<name> on X: "..."`, `<name> 在 Twitter: "..."`), and inline `https://t.co/...` short URLs before computing the article title, `YYYY-MM-DD-<source>-<slug>` folder name, and `<folderName>.md` filename, while preserving legitimate parentheticals like `(2026) Annual Report` and `(Part 1) Guide` as well as any manual edits you type in the popup.
+- **Sticky Popup tags:** On first use, the Popup seeds tags from Options (`defaultTags`, default `['web-clip']`). Adding or removing any tag chip (or submitting a clip) persists `stickyTags` in `chrome.storage.sync` immediately so the next Popup open remembers your last-used tags — including clearing all tags to `[]` with `×` or Backspace without snapping back to `defaultTags`.
 
-## Output folder structure
+## Output folder structure (OKF v0.2)
 
-Each clip creates a dated subfolder inside your Drive Clipper root folder (default `WebClips`):
+Each clip creates a dated, source-prefixed subfolder inside your Drive Clipper root folder (default `WebClips`) and updates the bundle's root `index.md` and `log.md`:
 
 ```text
 WebClips/
-└── 2026-11-24-how-v8-compiles-javascript/
-    ├── README.md
+├── index.md
+├── log.md
+└── 2026-11-24-example-how-v8-compiles-javascript/
+    ├── 2026-11-24-example-how-v8-compiles-javascript.md
     └── images/
         ├── 01-pipeline.webp
         └── 02-benchmark.png
 ```
 
-`README.md` starts with YAML frontmatter (`title`, `url`, `author`, `published`, `clipped`, `site`, `tags`, `images`, and optional `warnings`) followed by the extracted Markdown body. All downloaded images keep their original format (sniffed from `Content-Type` and magic bytes) and upload before `README.md`, using `uploadType=multipart` for files up to 4.5 MiB and switching automatically to `uploadType=resumable` for larger images.
+- **Article Markdown (`<folderName>/<folderName>.md`):** Named after its folder instead of generic `README.md` so OpenKnowledge (`ok`), Obsidian quick-switcher, Google Drive search, and agent glob tools see readable basenames. Starts with OKF v0.2 YAML frontmatter (`type: "web-clip"`, `title`, `description` with an automatic plain-text excerpt fallback when meta description is missing, `status: "raw"`, `tags`, `generated: { by: "drive-clipper", at }`, `sources: [{ url, site, author, published }]`) alongside top-level compatibility fields (`url`, `author`, `published`, `clipped`, `site`, `images`, and optional `warnings`).
+- **Auto-maintained `WebClips/index.md`:** Starts with OKF v0.2 bundle root frontmatter (`okf_version: "0.2"`) and maintains a newest-first `## Clips` catalog keyed by `<!-- clip-source: <url> -->` so re-clipping updates entries in place without duplicates. Root index and log writes are serialized through an async mutex (`indexWriteChain`) so concurrent multi-tab clips never suffer lost updates.
+- **Auto-maintained `WebClips/log.md`:** Lowercase append-only chronological clip log (`# Clip Log`, no frontmatter per OKF v0.2) recording each `clipped` and `updated` event with a relative link to `./<folderName>/<folderName>.md`.
 
-If an individual image fails to download or upload, the clip still completes and `README.md` always uploads. The Markdown keeps the original remote URL for that image and appends a warning to frontmatter. Re-clipping the same URL reuses the existing folder by matching `appProperties.sourceUrl` and updates images in place using shift-proof filenames and `appProperties.imageUrl` matching instead of creating duplicates.
+All downloaded images keep their original format (sniffed from `Content-Type` and magic bytes) and upload before `<folderName>.md`, using `uploadType=multipart` for files up to 4.5 MiB and switching automatically to `uploadType=resumable` for larger images.
+
+If an individual image fails to download or upload, the clip still completes and `<folderName>.md` always uploads. The Markdown keeps the original remote URL for that image and appends a warning to frontmatter. Re-clipping the same URL reuses the existing folder by matching `appProperties.sourceUrl`, updates images in place using shift-proof filenames and `appProperties.imageUrl` matching, updates `<folderName>.md` in place (renaming legacy `README.md` files if present), and refreshes `index.md` and `log.md`.
 
 ## Five-minute Google Cloud OAuth setup
 

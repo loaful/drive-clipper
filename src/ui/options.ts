@@ -509,6 +509,7 @@ export async function mountOptions(
     getSettings: () => ({
       ...settings,
       defaultTags: [...settings.defaultTags],
+      stickyTags: settings.stickyTags ? [...settings.stickyTags] : null,
       frontmatter: { ...settings.frontmatter },
     }),
     getAuthStatus: () => (authStatus ? { ...authStatus } : null),

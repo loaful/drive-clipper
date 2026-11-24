@@ -1,4 +1,8 @@
-import { buildArticleFolderName, cleanPageTitle } from '../core/frontmatter.js';
+import {
+  buildArticleFileName,
+  buildArticleFolderName,
+  cleanPageTitle,
+} from '../core/frontmatter.js';
 import {
   DEFAULT_EXTENSION_SETTINGS,
   isActiveClipJobStatus,
@@ -367,6 +371,10 @@ export async function mountPopup(
 
   const form = queryRequired<HTMLFormElement>(root, '#clip-form');
   const titleInput = queryRequired<HTMLInputElement>(root, '#title-input');
+  const folderPreviewRow = queryRequired<HTMLDivElement>(
+    root,
+    '#folder-preview-row',
+  );
   const rootFolderPrefix = queryRequired<HTMLSpanElement>(
     root,
     '#root-folder-prefix',
@@ -450,16 +458,61 @@ export async function mountPopup(
   const expandedWarningJobIds = new Set<string>();
   const dismissingJobIds = new Set<string>();
 
+  let stickyPersistChain: Promise<void> = Promise.resolve();
+  let stickyPersistSeq = 0;
+
+  const persistStickyTags = (tags: readonly string[]): void => {
+    const nextTags = [...tags];
+    const seq = (stickyPersistSeq += 1);
+    settings = {
+      ...settings,
+      stickyTags: nextTags,
+    };
+
+    const op = stickyPersistChain.then(async () => {
+      const res = await runtime.sendMessage({
+        type: 'UPDATE_SETTINGS',
+        patch: { stickyTags: nextTags },
+      });
+      if (!destroyed && res.ok && seq === stickyPersistSeq) {
+        settings = {
+          ...settings,
+          ...res.data,
+          frontmatter: {
+            ...settings.frontmatter,
+            ...res.data.frontmatter,
+          },
+        };
+      }
+    });
+    stickyPersistChain = op.catch(() => undefined);
+  };
+
   const tagEditor: TagEditorController = createTagEditor({
     container: tagsContainer,
     input: tagsInput,
-    initialTags: DEFAULT_EXTENSION_SETTINGS.defaultTags,
+    initialTags: [],
+    onChange: (nextTags) => {
+      persistStickyTags(nextTags);
+    },
   });
 
   const updateFolderPreview = (): void => {
-    const folderPrefix = `${settings.rootFolderName.trim() || 'WebClips'}/`;
+    const rootFolder = settings.rootFolderName.trim() || 'WebClips';
+    const folderPrefix = `${rootFolder}/`;
+    const folderName = buildArticleFolderName(
+      titleInput.value,
+      now(),
+      pageInfo?.url || pageInfo?.site,
+    );
+    const fileName = buildArticleFileName(folderName);
+    const relativePath = `${folderName}/${fileName}`;
+    const fullPath = `${folderPrefix}${relativePath}`;
+
     rootFolderPrefix.textContent = folderPrefix;
-    folderPreview.textContent = buildArticleFolderName(titleInput.value, now());
+    folderPreview.textContent = relativePath;
+    folderPreview.title = fullPath;
+    folderPreviewRow.title = fullPath;
   };
 
   const renderSubmitError = (): void => {
@@ -948,8 +1001,12 @@ export async function mountPopup(
           ...settingsRes.data.frontmatter,
         },
       };
-      tagEditor.setTags(settings.defaultTags);
     }
+
+    const seededTags = Array.isArray(settings.stickyTags)
+      ? settings.stickyTags
+      : settings.defaultTags;
+    tagEditor.setTags(seededTags);
 
     if (authRes.ok) {
       authStatus = authRes.data;
@@ -1127,9 +1184,17 @@ export async function mountPopup(
       return;
     }
 
+    const persistSeqBeforeCommit = stickyPersistSeq;
     const tags = tagEditor.commitPendingInput();
+    if (stickyPersistSeq === persistSeqBeforeCommit) {
+      persistStickyTags(tags);
+    }
     const title = titleInput.value.trim() || pageInfo?.title || 'Untitled';
-    const folderName = buildArticleFolderName(title, now());
+    const folderName = buildArticleFolderName(
+      title,
+      now(),
+      pageInfo?.url || pageInfo?.site,
+    );
     const errorIdsBeforeSubmit = new Set(
       clipJobs.filter((job) => job.status === 'error').map((job) => job.id),
     );

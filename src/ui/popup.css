@@ -307,7 +307,7 @@ body {
 .folder-preview-row {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 0;
   min-width: 0;
   padding: 4px 8px;
   border-radius: var(--radius-sm);
@@ -321,7 +321,7 @@ body {
 .folder-icon {
   flex: none;
   color: var(--text-muted);
-  margin-right: 2px;
+  margin-right: 6px;
 }
 
 .folder-prefix {
@@ -330,6 +330,7 @@ body {
 }
 
 .folder-slug {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

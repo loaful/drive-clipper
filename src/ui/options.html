@@ -87,8 +87,10 @@
           <div>
             <h2 id="folder-heading" class="card-title">Root Folder</h2>
             <p class="card-description">
-              Every clipped page creates a dated subfolder (<code>YYYY-MM-DD-&lt;slug&gt;</code>) inside this
-              extension-owned Drive folder.
+              Every clipped page creates a dated subfolder
+              (<code>YYYY-MM-DD-&lt;source&gt;-&lt;slug&gt;</code>) with a matching
+              <code>&lt;folder&gt;.md</code> file inside this extension-owned OKF v0.2 Drive folder
+              (alongside auto-updated <code>index.md</code> and <code>log.md</code>).
             </p>
           </div>
         </div>
@@ -169,7 +171,9 @@
               spellcheck="false"
             />
           </div>
-          <p class="field-help">Press Enter or comma to add a tag. Click × or press Backspace to remove.</p>
+          <p id="default-tags-help" class="field-help">
+            Press Enter or comma to add a tag. Click × or press Backspace to remove. Used as initial defaults — the Popup remembers your last-used tags until you change or clear them with ×.
+          </p>
         </div>
 
         <fieldset class="toggle-group">

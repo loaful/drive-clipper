@@ -694,13 +694,20 @@ async function startMockDriveServer(
       return;
     }
 
-    // GET /drive/v3/files/:id
+    // GET /drive/v3/files/:id (metadata or ?alt=media raw bytes)
     if (method === 'GET' && reqUrl.pathname.startsWith('/drive/v3/files/')) {
       const fileId = decodeURIComponent(reqUrl.pathname.slice('/drive/v3/files/'.length));
       const found = files.get(fileId);
       if (!found) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'File not found' } }));
+        return;
+      }
+      if (reqUrl.searchParams.get('alt') === 'media') {
+        res.writeHead(200, {
+          'Content-Type': found.mimeType || 'application/octet-stream',
+        });
+        res.end(found.content ?? Buffer.alloc(0));
         return;
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1776,8 +1783,12 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
         'Drive Clipper End-to-End Architecture',
       );
       await expect(popupPage.locator('#auth-pill-label')).toHaveText('Connected');
-      await expect(popupPage.locator('#folder-preview')).toContainText(
-        '-drive-clipper-end-to-end-architecture',
+      await expect(popupPage.locator('#folder-preview')).toHaveText(
+        /^\d{4}-\d{2}-\d{2}-drive-clipper-end-to-end-architecture\/\d{4}-\d{2}-\d{2}-drive-clipper-end-to-end-architecture\.md$/,
+      );
+      await expect(popupPage.locator('#folder-preview')).toHaveAttribute(
+        'title',
+        /^WebClips\/\d{4}-\d{2}-\d{2}-drive-clipper-end-to-end-architecture\/\d{4}-\d{2}-\d{2}-drive-clipper-end-to-end-architecture\.md$/,
       );
       await expect(popupPage.locator('#clip-submit-btn')).toBeEnabled();
 
@@ -1849,10 +1860,16 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       ]);
       expect(driveServer.sourceUrlQueries.length).toBe(1);
 
-      // Exact upload order: 3 valid images BEFORE README.md
-      expect(driveServer.uploadOrder).toHaveLength(4);
-      expect(driveServer.uploadOrder[3]).toBe('README.md');
+      const rootFolderId = driveServer.folderCreations[0].id;
+      const articleFolderName = driveServer.folderCreations[1].name;
+      const expectedArticleFileName = `${articleFolderName}.md`;
+
+      // Exact upload order: 3 valid images BEFORE `<folderName>.md`, followed by root `index.md` + `log.md`
+      expect(driveServer.uploadOrder).toHaveLength(6);
+      expect(driveServer.uploadOrder[3]).toBe(expectedArticleFileName);
+      expect(driveServer.uploadOrder.slice(4, 6).sort()).toEqual(['index.md', 'log.md']);
       const uploadedImageNames = driveServer.uploadOrder.slice(0, 3);
+      expect(uploadedImageNames).not.toContain(expectedArticleFileName);
       expect(uploadedImageNames).not.toContain('README.md');
       expect(uploadedImageNames.some((n) => n.endsWith('.webp'))).toBe(true);
       expect(uploadedImageNames.some((n) => n.endsWith('.png'))).toBe(true);
@@ -1877,27 +1894,72 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       expect(pngUpload.contentType).toBe('image/png');
       expect(pngUpload.contentBytes.equals(VALID_PNG_BYTES)).toBe(true);
 
-      // Verify README.md content
-      const readmeUpload = driveServer.uploads.find((u) => u.metadata.name === 'README.md')!;
-      const readmeText = readmeUpload.contentBytes.toString('utf8');
-      expect(readmeText).toContain('Normal light-DOM article introduction');
-      expect(readmeText).toContain('Critical architectural note rendered strictly inside an open Shadow DOM root');
-      expect(readmeText).not.toContain('color: crimson');
+      // Verify `<folderName>.md` OKF v0.2 frontmatter and content
+      const articleUpload = driveServer.uploads.find(
+        (u) => u.metadata.name === expectedArticleFileName,
+      )!;
+      expect(articleUpload).toBeDefined();
+      const articleText = articleUpload.contentBytes.toString('utf8');
+      expect(articleText).toContain('type: "web-clip"');
+      expect(articleText).toContain('title: "Drive Clipper End-to-End Architecture"');
+      expect(articleText).toContain(
+        'description: "Real-browser E2E fixture covering Shadow DOM, lazy images, deduplication, anti-hotlink Referer, and 404 fallback."',
+      );
+      expect(articleText).toContain('status: "raw"');
+      expect(articleText).toContain('generated:\n  by: "drive-clipper"\n  at: "');
+      expect(articleText).toContain(`sources:\n  - url: "${fixtureServer.articleUrl}"`);
+      expect(articleText).toContain('    site: "Clipper Engineering Blog"');
+      expect(articleText).toContain('    author: "Ada Lovelace"');
+      expect(articleText).toContain('    published: "2026-11-20T09:00:00Z"');
+      expect(articleText).toContain('Normal light-DOM article introduction');
+      expect(articleText).toContain(
+        'Critical architectural note rendered strictly inside an open Shadow DOM root',
+      );
+      expect(articleText).not.toContain('color: crimson');
       const webpFilename = String(webpUpload.metadata.name);
-      expect(readmeText).toContain(`./images/${webpFilename}`);
-      expect(readmeText).not.toContain('data:image/svg+xml');
+      expect(articleText).toContain(`./images/${webpFilename}`);
+      expect(articleText).not.toContain('data:image/svg+xml');
       const pngFilename = String(pngUpload.metadata.name);
-      const dupRewrittenMatches = readmeText.match(
+      const dupRewrittenMatches = articleText.match(
         new RegExp(`!\\[[^\\]]*\\]\\(\\./images/${pngFilename.replace('.', '\\.')}\\)`, 'g'),
       );
       expect(dupRewrittenMatches?.length).toBe(2);
       const jpgFilename = String(jpgUpload.metadata.name);
-      expect(readmeText).toContain(`./images/${jpgFilename}`);
-      expect(readmeText).toContain(`${fixtureServer.baseUrl}/media/missing-404.png`);
-      expect(readmeText).toContain('warnings:');
-      expect(readmeText).toContain('HTTP 404');
+      expect(articleText).toContain(`./images/${jpgFilename}`);
+      expect(articleText).toContain(`${fixtureServer.baseUrl}/media/missing-404.png`);
+      expect(articleText).toContain('warnings:');
+      expect(articleText).toContain('HTTP 404');
 
-      // Re-clip the EXACT same URL and verify folder reuse (idempotency via appProperties.sourceUrl)
+      // Verify OKF v0.2 root `WebClips/index.md` and lowercase `WebClips/log.md`
+      const getRootFileText = (name: string): string => {
+        const matched = Array.from(driveServer.files.values()).filter(
+          (f) => f.parents.includes(rootFolderId) && f.name === name,
+        );
+        expect(matched, `Expected exactly 1 ${name} in WebClips root`).toHaveLength(1);
+        return matched[0].content?.toString('utf8') ?? '';
+      };
+
+      const indexText1 = getRootFileText('index.md');
+      expect(indexText1).toContain('okf_version: "0.2"');
+      expect(indexText1).toContain('title: "WebClips"');
+      expect(indexText1).toContain('## Clips');
+      expect(indexText1).toContain(
+        `[Drive Clipper End-to-End Architecture](./${articleFolderName}/${expectedArticleFileName})`,
+      );
+      expect(indexText1).toContain(`<!-- clip-source: ${fixtureServer.articleUrl} -->`);
+
+      const logText1 = getRootFileText('log.md');
+      expect(logText1.startsWith('# Clip Log\n')).toBe(true);
+      expect(logText1).not.toContain('---');
+      const logLines1 = logText1
+        .split('\n')
+        .filter((line) => line.startsWith('- '));
+      expect(logLines1).toHaveLength(1);
+      expect(logLines1[0]).toContain(
+        `| clipped | [Drive Clipper End-to-End Architecture](./${articleFolderName}/${expectedArticleFileName}) | ${fixtureServer.articleUrl}`,
+      );
+
+      // Re-clip the EXACT same URL and verify folder reuse + idempotent index.md + appended log.md
       const firstFolderCount = driveServer.folderCreations.length;
       const firstUploadCount = driveServer.uploads.length;
       const firstArticleFolderId = driveServer.folderCreations[1].id;
@@ -1912,12 +1974,38 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       expect(driveServer.sourceUrlQueries.length).toBe(2);
       expect(driveServer.folderCreations.length).toBe(firstFolderCount);
       const secondRunUploads = driveServer.uploads.slice(firstUploadCount);
-      expect(secondRunUploads).toHaveLength(4);
+      expect(secondRunUploads).toHaveLength(6);
       expect(secondRunUploads.every((u) => u.method === 'PATCH')).toBe(true);
-      expect(secondRunUploads[3].metadata.name).toBe('README.md');
+      expect(secondRunUploads[3].metadata.name).toBe(expectedArticleFileName);
+      expect(
+        secondRunUploads
+          .slice(4, 6)
+          .map((u) => String(u.metadata.name))
+          .sort(),
+      ).toEqual(['index.md', 'log.md']);
       const updatedHref = await reclipRow.locator('.queue-open-link').getAttribute('href');
       expect(updatedHref).toBe(`https://drive.google.com/drive/folders/${firstArticleFolderId}`);
       expect(harness.activeDnrRules.size).toBe(0);
+
+      // Re-clip updated `index.md` in place (still 1 entry, zero duplicates) and appended `updated` to `log.md`
+      const indexText2 = getRootFileText('index.md');
+      const indexEntries2 = indexText2
+        .split('\n')
+        .filter((line) => line.startsWith('- ['));
+      expect(indexEntries2).toHaveLength(1);
+      expect(indexEntries2[0]).toContain(
+        `./${articleFolderName}/${expectedArticleFileName}`,
+      );
+
+      const logText2 = getRootFileText('log.md');
+      const logLines2 = logText2
+        .split('\n')
+        .filter((line) => line.startsWith('- '));
+      expect(logLines2).toHaveLength(2);
+      expect(logLines2[0]).toContain('| clipped |');
+      expect(logLines2[1]).toContain(
+        `| updated | [Drive Clipper End-to-End Architecture](./${articleFolderName}/${expectedArticleFileName}) | ${fixtureServer.articleUrl}`,
+      );
 
       // Render built dist/options.html in a 900px viewport wired to the SAME live dist/background.js
       const optionsPage = await context.newPage();
@@ -1934,7 +2022,6 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
         waitUntil: 'networkidle',
       });
 
-      const rootFolderId = driveServer.folderCreations[0].id;
       await expect(optionsPage.locator('#auth-status-text')).toHaveText('Connected');
       await expect(optionsPage.locator('#root-folder-id-value')).toHaveText(rootFolderId);
       await expect(optionsPage.locator('#open-root-folder-link')).toBeVisible();
@@ -1998,8 +2085,8 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       await expect(popup1.page.locator('#title-input')).toHaveValue(
         '华硕 ProArt 显示器色彩评测',
       );
-      await expect(popup1.page.locator('#folder-preview')).toContainText(
-        '-华硕-proart-显示器色彩评测',
+      await expect(popup1.page.locator('#folder-preview')).toHaveText(
+        /^\d{4}-\d{2}-\d{2}-华硕-proart-显示器色彩评测\/\d{4}-\d{2}-\d{2}-华硕-proart-显示器色彩评测\.md$/,
       );
       await expect(popup1.page.locator('#folder-preview')).not.toContainText('私信');
 
@@ -2015,8 +2102,8 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       await expect(popup2.page.locator('#title-input')).toHaveValue(
         '(2026) Annual Systems Architecture Report',
       );
-      await expect(popup2.page.locator('#folder-preview')).toContainText(
-        '-2026-annual-systems-architecture-report',
+      await expect(popup2.page.locator('#folder-preview')).toHaveText(
+        /^\d{4}-\d{2}-\d{2}-2026-annual-systems-architecture-report\/\d{4}-\d{2}-\d{2}-2026-annual-systems-architecture-report\.md$/,
       );
 
       await popup2.page.locator('#clip-submit-btn').click();
@@ -2032,13 +2119,40 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
         expect.stringMatching(/^\d{4}-\d{2}-\d{2}-2026-annual-systems-architecture-report$/),
       ]);
 
-      const readmes = driveServer.uploads
-        .filter((u) => u.metadata.name === 'README.md')
-        .map((u) => u.contentBytes.toString('utf8'));
-      expect(readmes).toHaveLength(2);
-      expect(readmes[0]).toContain('title: "华硕 ProArt 显示器色彩评测"');
-      expect(readmes[0]).not.toContain('20 封私信');
-      expect(readmes[1]).toContain('title: "(2026) Annual Systems Architecture Report"');
+      const articleUploads = driveServer.uploads.filter((u) => {
+        const name = String(u.metadata.name);
+        return name.endsWith('.md') && name !== 'index.md' && name !== 'log.md';
+      });
+      expect(articleUploads.map((u) => u.metadata.name)).toEqual([
+        `${folderNames[1]}.md`,
+        `${folderNames[2]}.md`,
+      ]);
+      const articleTexts = articleUploads.map((u) => u.contentBytes.toString('utf8'));
+      expect(articleTexts[0]).toContain('type: "web-clip"');
+      expect(articleTexts[0]).toContain('title: "华硕 ProArt 显示器色彩评测"');
+      expect(articleTexts[0]).not.toContain('20 封私信');
+      expect(articleTexts[1]).toContain('title: "(2026) Annual Systems Architecture Report"');
+
+      // Root index.md has both articles newest-first; log.md has both chronologically
+      const rootId = driveServer.folderCreations[0].id;
+      const rootIndex = Array.from(driveServer.files.values()).find(
+        (f) => f.parents.includes(rootId) && f.name === 'index.md',
+      );
+      const rootLog = Array.from(driveServer.files.values()).find(
+        (f) => f.parents.includes(rootId) && f.name === 'log.md',
+      );
+      expect(rootIndex?.content?.toString('utf8')).toContain(
+        `./${folderNames[1]}/${folderNames[1]}.md`,
+      );
+      expect(rootIndex?.content?.toString('utf8')).toContain(
+        `./${folderNames[2]}/${folderNames[2]}.md`,
+      );
+      const rootLogLines = (rootLog?.content?.toString('utf8') ?? '')
+        .split('\n')
+        .filter((line) => line.startsWith('- '));
+      expect(rootLogLines).toHaveLength(2);
+      expect(rootLogLines[0]).toContain(folderNames[1]);
+      expect(rootLogLines[1]).toContain(folderNames[2]);
 
       expect(popup1.consoleErrors).toEqual([]);
       expect(popup1.pageErrors).toEqual([]);
@@ -2254,18 +2368,80 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       );
       expect(smallProtectedUpload?.uploadType).toBe('multipart');
 
-      // 9. Verify per-image Drive upload failure on Tab 303 degraded gracefully AND still uploaded README.md with warning!
-      const tab3Readme = driveServer.uploads.find(
-        (u) =>
-          u.metadata.name === 'README.md' &&
-          u.contentBytes.toString('utf8').includes('Resilient Drive Upload Fallback Guide'),
+      // 9. Verify per-image Drive upload failure on Tab 303 degraded gracefully AND still uploaded `<folderName>.md` with warning!
+      const tab3Article = driveServer.uploads.find((u) => {
+        const name = String(u.metadata.name);
+        return (
+          name.endsWith('-resilient-drive-upload-fallback-guide.md') &&
+          u.contentBytes.toString('utf8').includes('Resilient Drive Upload Fallback Guide')
+        );
+      });
+      expect(tab3Article).toBeDefined();
+      const tab3ArticleText = tab3Article!.contentBytes.toString('utf8');
+      expect(tab3ArticleText).toContain('type: "web-clip"');
+      expect(tab3ArticleText).toContain('./images/01-queue-3-protected.jpg');
+      expect(tab3ArticleText).toContain(`${fixtureServer.baseUrl}/media/queue-3-upload-fail.png`);
+      expect(tab3ArticleText).toContain('warnings:');
+      expect(tab3ArticleText).toContain('Simulated Drive upload rejection');
+
+      // 9b. Verify serialized `WebClips/index.md` and `WebClips/log.md` captured ALL 5 concurrent clips with ZERO lost updates!
+      const webClipsRootId = rootFolders[0].id;
+      const rootIndexFiles = Array.from(driveServer.files.values()).filter(
+        (f) => f.parents.includes(webClipsRootId) && f.name === 'index.md',
       );
-      expect(tab3Readme).toBeDefined();
-      const tab3ReadmeText = tab3Readme!.contentBytes.toString('utf8');
-      expect(tab3ReadmeText).toContain('./images/01-queue-3-protected.jpg');
-      expect(tab3ReadmeText).toContain(`${fixtureServer.baseUrl}/media/queue-3-upload-fail.png`);
-      expect(tab3ReadmeText).toContain('warnings:');
-      expect(tab3ReadmeText).toContain('Simulated Drive upload rejection');
+      const rootLogFiles = Array.from(driveServer.files.values()).filter(
+        (f) => f.parents.includes(webClipsRootId) && f.name === 'log.md',
+      );
+      expect(rootIndexFiles).toHaveLength(1);
+      expect(rootLogFiles).toHaveLength(1);
+
+      const concurrentIndexText = rootIndexFiles[0].content?.toString('utf8') ?? '';
+      expect(concurrentIndexText).toContain('okf_version: "0.2"');
+      expect(concurrentIndexText).toContain('## Clips');
+      const concurrentIndexLines = concurrentIndexText
+        .split('\n')
+        .filter((line) => line.startsWith('- ['));
+      expect(concurrentIndexLines).toHaveLength(5);
+
+      const concurrentLogText = rootLogFiles[0].content?.toString('utf8') ?? '';
+      expect(concurrentLogText.startsWith('# Clip Log\n')).toBe(true);
+      expect(concurrentLogText).not.toContain('---');
+      const concurrentLogLines = concurrentLogText
+        .split('\n')
+        .filter((line) => line.startsWith('- '));
+      expect(concurrentLogLines).toHaveLength(5);
+
+      for (let i = 1; i <= 5; i += 1) {
+        const expectedUrl = `${fixtureServer.baseUrl}/articles/queue-${i}`;
+        const matchingIndexLine = concurrentIndexLines.find((line) =>
+          line.includes(`<!-- clip-source: ${expectedUrl} -->`),
+        );
+        expect(
+          matchingIndexLine,
+          `index.md missing entry for concurrent Tab ${i} (${expectedUrl})`,
+        ).toBeDefined();
+
+        const relMatch = /\]\(\.\/([^/]+)\/([^)]+\.md)\)/.exec(matchingIndexLine!);
+        expect(relMatch, `index.md link for Tab ${i} must point to ./<folder>/<folder>.md`).not.toBeNull();
+        expect(relMatch![2]).toBe(`${relMatch![1]}.md`);
+
+        const matchingFolder = driveServer.folderCreations.find((f) => f.name === relMatch![1]);
+        expect(matchingFolder).toBeDefined();
+        const matchingArticleFile = Array.from(driveServer.files.values()).find(
+          (f) => f.parents.includes(matchingFolder!.id) && f.name === relMatch![2],
+        );
+        expect(matchingArticleFile).toBeDefined();
+
+        expect(
+          concurrentLogLines.some(
+            (line) =>
+              line.includes('| clipped |') &&
+              line.includes(`./${relMatch![1]}/${relMatch![2]}`) &&
+              line.includes(expectedUrl),
+          ),
+          `log.md missing chronological entry for Tab ${i}`,
+        ).toBe(true);
+      }
 
       // 10. Verify unified toolbar badge transitioned through active counts -> green OK
       expect(
@@ -2522,26 +2698,23 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
         initialTabs: [{ tabId: 501, url: xTweetUrl }],
       });
 
+      // Open Popup on the X.com tab to verify cleaned X title and `<folderName>/<folderName>.md` preview
+      const xPopup = await harness.openPopup();
+      await expect(xPopup.page.locator('#title-input')).toHaveValue(
+        'Testing empty-alt X photos and video poster',
+      );
+      await expect(xPopup.page.locator('#folder-preview')).toHaveText(
+        /^\d{4}-\d{2}-\d{2}-x-testing-empty-alt-x-photos-and-video-poster\/\d{4}-\d{2}-\d{2}-x-testing-empty-alt-x-photos-and-video-poster\.md$/,
+      );
+
       // Clear page-load image requests so we measure only Service Worker fetches below
       fetchedTwimgUrls.length = 0;
 
-      const startRes = (await harness.sendToServiceWorker({
-        type: 'START_CLIP',
-        request: { tabId: 501, mode: 'full' },
-      })) as { ok: boolean };
-      expect(startRes.ok).toBe(true);
-
-      await expect
-        .poll(
-          async () => {
-            const res = (await harness.sendToServiceWorker({
-              type: 'GET_CLIP_JOBS',
-            })) as { ok: boolean; data: Array<{ status: string }> };
-            return res.data[0]?.status;
-          },
-          { timeout: 15_000 },
-        )
-        .toBe('done');
+      await xPopup.page.locator('#clip-submit-btn').click();
+      await expect(
+        xPopup.page.locator('#clip-queue-list .queue-item').first(),
+      ).toHaveAttribute('data-status', 'done', { timeout: 15_000 });
+      await xPopup.page.close();
 
       // Service worker fetched the two media photos upgraded to name=large + the video poster (never avatar or reply image)
       expect(fetchedTwimgUrls.sort()).toEqual([
@@ -2550,31 +2723,193 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
         'https://pbs.twimg.com/media/SecondPhoto9?format=png&name=large',
       ]);
 
-      // Clean deterministic filenames uploaded BEFORE README.md
-      expect(driveServer.uploadOrder).toHaveLength(4);
-      expect(driveServer.uploadOrder[3]).toBe('README.md');
+      // Clean deterministic filenames uploaded BEFORE `<folderName>.md`, followed by root `index.md` + `log.md`
+      const xFolder = driveServer.folderCreations.find((f) =>
+        /^\d{4}-\d{2}-\d{2}-x-testing-empty-alt-x-photos-and-video-poster$/.test(f.name),
+      );
+      expect(xFolder, 'Expected clean X.com folder YYYY-MM-DD-x-<clean-slug>').toBeDefined();
+      const xFileName = `${xFolder!.name}.md`;
+
+      expect(driveServer.uploadOrder).toHaveLength(6);
+      expect(driveServer.uploadOrder[3]).toBe(xFileName);
+      expect(driveServer.uploadOrder.slice(4, 6).sort()).toEqual(['index.md', 'log.md']);
       expect(driveServer.uploadOrder.slice(0, 3).sort()).toEqual([
         '01-abcdefg.jpg',
         '02-secondphoto9.png',
         '03-posterframe1.jpg',
       ]);
 
-      const readmeUpload = driveServer.uploads.find((u) => u.metadata.name === 'README.md')!;
-      const readmeText = readmeUpload.contentBytes.toString('utf8');
-      expect(readmeText).toContain('site: "X (Twitter)"');
-      expect(readmeText).toContain('author: "@e2eauthor"');
-      expect(readmeText).toContain('./images/01-abcdefg.jpg');
-      expect(readmeText).toContain('./images/02-secondphoto9.png');
-      expect(readmeText).toContain('./images/03-posterframe1.jpg');
-      expect(readmeText).not.toContain('ReplyIgnored99');
-      expect(readmeText).not.toContain('profile_images');
-      expect(readmeText).not.toContain('abs-0.twimg.com');
+      const xArticleUpload = driveServer.uploads.find((u) => u.metadata.name === xFileName)!;
+      expect(xArticleUpload).toBeDefined();
+      const xArticleText = xArticleUpload.contentBytes.toString('utf8');
+      expect(xArticleText).toContain('type: "web-clip"');
+      expect(xArticleText).toContain('title: "Testing empty-alt X photos and video poster"');
+      expect(xArticleText).toContain('status: "raw"');
+      expect(xArticleText).toContain('description: "');
+      expect(xArticleText).toContain('site: "X (Twitter)"');
+      expect(xArticleText).toContain('author: "@e2eauthor"');
+      expect(xArticleText).toContain('./images/01-abcdefg.jpg');
+      expect(xArticleText).toContain('./images/02-secondphoto9.png');
+      expect(xArticleText).toContain('./images/03-posterframe1.jpg');
+      expect(xArticleText).not.toContain('ReplyIgnored99');
+      expect(xArticleText).not.toContain('profile_images');
+      expect(xArticleText).not.toContain('abs-0.twimg.com');
 
       // Post images sit before ## Comments
-      const commentsIdx = readmeText.indexOf('## Comments');
-      expect(commentsIdx).toBeGreaterThan(readmeText.indexOf('./images/03-posterframe1.jpg'));
+      const commentsIdx = xArticleText.indexOf('## Comments');
+      expect(commentsIdx).toBeGreaterThan(xArticleText.indexOf('./images/03-posterframe1.jpg'));
 
+      // Root index.md links directly to `./<xFolder>/<xFolder>.md` with `x` source tag
+      const xRootId = driveServer.folderCreations[0].id;
+      const xIndexFile = Array.from(driveServer.files.values()).find(
+        (f) => f.parents.includes(xRootId) && f.name === 'index.md',
+      );
+      const xIndexText = xIndexFile?.content?.toString('utf8') ?? '';
+      expect(xIndexText).toContain('okf_version: "0.2"');
+      expect(xIndexText).toContain(`./${xFolder!.name}/${xFileName}`);
+      expect(xIndexText).toContain('`x`');
+
+      expect(xPopup.consoleErrors).toEqual([]);
+      expect(xPopup.pageErrors).toEqual([]);
       expect(harness.activeDnrRules.size).toBe(0);
+      expect(harness.swErrors).toEqual([]);
+      expect(harness.getAllArticleErrors()).toEqual([]);
+
+      await harness.close();
+    } finally {
+      await context.close();
+      await Promise.all([
+        fixtureServer.close(),
+        driveServer.close(),
+        distServer.close(),
+      ]);
+    }
+  });
+
+  test('persists Popup sticky tags across reload and reopen, including empty [] without snapping back to defaultTags', async ({
+    browser,
+  }) => {
+    const fixtureServer = await startFixtureServer();
+    const driveServer = await startMockDriveServer();
+    const distServer = await startStaticDistServer();
+    const context = await browser.newContext();
+
+    try {
+      const harness = await createExtensionHarness({
+        context,
+        distBaseUrl: distServer.baseUrl,
+        fixtureServer,
+        driveServer,
+        initialTabs: [
+          { tabId: 601, url: `${fixtureServer.baseUrl}/articles/year-2026` },
+        ],
+      });
+
+      const readChipLabels = async (popupPage: Page): Promise<string[]> =>
+        popupPage
+          .locator('#tags-container .tag-chip-label')
+          .allTextContents();
+
+      // 1. Initial Popup open seeds defaultTags (['web-clip'])
+      const popup1 = await harness.openPopup();
+      await expect(popup1.page.locator('#tags-container .tag-chip-label')).toHaveText([
+        'web-clip',
+      ]);
+
+      // 2. Add custom tags -> persisted immediately and restored on fresh Popup reopen
+      await popup1.page.locator('#tags-input').fill('ai, knowledge-base');
+      await popup1.page.locator('#tags-input').press('Enter');
+      await expect(popup1.page.locator('#tags-container .tag-chip-label')).toHaveText([
+        'web-clip',
+        'ai',
+        'knowledge-base',
+      ]);
+      await expect
+        .poll(async () => {
+          const res = (await harness.sendToServiceWorker({
+            type: 'GET_SETTINGS',
+          })) as { ok: boolean; data: { stickyTags: string[] | null } };
+          return res.data.stickyTags;
+        })
+        .toEqual(['web-clip', 'ai', 'knowledge-base']);
+      await popup1.page.close();
+
+      const popup2 = await harness.openPopup();
+      expect(await readChipLabels(popup2.page)).toEqual([
+        'web-clip',
+        'ai',
+        'knowledge-base',
+      ]);
+
+      // 3. Click × on EVERY tag so the list becomes empty []
+      await popup2.page.locator('[data-remove-tag="web-clip"]').click();
+      await popup2.page.locator('[data-remove-tag="ai"]').click();
+      await popup2.page.locator('[data-remove-tag="knowledge-base"]').click();
+      await expect(popup2.page.locator('#tags-container .tag-chip')).toHaveCount(0);
+      await expect
+        .poll(async () => {
+          const res = (await harness.sendToServiceWorker({
+            type: 'GET_SETTINGS',
+          })) as { ok: boolean; data: { stickyTags: string[] | null } };
+          return res.data.stickyTags;
+        })
+        .toEqual([]);
+
+      // 4. Reload AND close/reopen Popup -> MUST remain empty [] (NEVER snap back to ['web-clip'])
+      await popup2.page.reload({ waitUntil: 'networkidle' });
+      await expect(popup2.page.locator('#title-input')).toHaveValue(
+        '(2026) Annual Systems Architecture Report',
+      );
+      await expect(popup2.page.locator('#tags-container .tag-chip')).toHaveCount(0);
+      await popup2.page.close();
+
+      const popup3 = await harness.openPopup();
+      await expect(popup3.page.locator('#title-input')).toHaveValue(
+        '(2026) Annual Systems Architecture Report',
+      );
+      await expect(popup3.page.locator('#tags-container .tag-chip')).toHaveCount(0);
+
+      // 5. Clip with empty tags -> uploaded `<folderName>.md` records `tags: []`
+      await popup3.page.locator('#clip-submit-btn').click();
+      await expect(
+        popup3.page.locator('#clip-queue-list .queue-item').first(),
+      ).toHaveAttribute('data-status', 'done', { timeout: 15_000 });
+
+      const uploadedArticle = driveServer.uploads.find((u) => {
+        const name = String(u.metadata.name);
+        return name.endsWith('.md') && name !== 'index.md' && name !== 'log.md';
+      });
+      expect(uploadedArticle).toBeDefined();
+      expect(uploadedArticle!.contentBytes.toString('utf8')).toContain('tags: []');
+      await popup3.page.close();
+
+      // 6. Editing defaultTags in Options leaves stickyTags: [] untouched
+      const optionsPage = await context.newPage();
+      await optionsPage.setViewportSize({ width: 900, height: 960 });
+      await harness.attachUiChromeBridge(optionsPage);
+      await optionsPage.goto(`${distServer.baseUrl}/options.html`, {
+        waitUntil: 'networkidle',
+      });
+      await optionsPage.locator('#default-tags-input').fill('reading-list');
+      await optionsPage.locator('#default-tags-input').press('Enter');
+      await optionsPage.locator('#save-preferences-btn').click();
+      await expect(optionsPage.locator('#preferences-feedback')).toHaveText('Preferences saved.');
+      await optionsPage.close();
+
+      const popup4 = await harness.openPopup();
+      await expect(popup4.page.locator('#title-input')).toHaveValue(
+        '(2026) Annual Systems Architecture Report',
+      );
+      await expect(popup4.page.locator('#tags-container .tag-chip')).toHaveCount(0);
+
+      expect(popup1.consoleErrors).toEqual([]);
+      expect(popup1.pageErrors).toEqual([]);
+      expect(popup2.consoleErrors).toEqual([]);
+      expect(popup2.pageErrors).toEqual([]);
+      expect(popup3.consoleErrors).toEqual([]);
+      expect(popup3.pageErrors).toEqual([]);
+      expect(popup4.consoleErrors).toEqual([]);
+      expect(popup4.pageErrors).toEqual([]);
       expect(harness.swErrors).toEqual([]);
       expect(harness.getAllArticleErrors()).toEqual([]);
 
