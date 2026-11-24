@@ -545,8 +545,12 @@ function deduplicateImages(images: readonly DiscoveredImage[]): DiscoveredImage[
 }
 
 function sanitizeBaseName(suggestedName: string, fallbackIndex: number): string {
-  const cleaned = suggestedName
-    .trim()
+  const withoutQuery = suggestedName.trim().replace(/[?#].*$/, '');
+  const withoutLegacyTwitterSize = withoutQuery.replace(
+    /:(?:orig|large|medium|small|thumb|\d+x\d+)$/i,
+    '',
+  );
+  const cleaned = withoutLegacyTwitterSize
     .replace(/[/\\:*?"<>|]+/g, '-')
     .replace(/^\.+/, '')
     .replace(/\s+/g, '-')

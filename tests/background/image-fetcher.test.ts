@@ -670,4 +670,56 @@ describe('fetchImages', () => {
       ['img-3', 'image-03.webp'],
     ]);
   });
+
+  it('generates clean deterministic filenames with sniffed extensions for pbs.twimg.com query-based media URLs', async () => {
+    const images: DiscoveredImage[] = [
+      makeImage(
+        1,
+        'https://pbs.twimg.com/media/AbCdEfG?format=jpg&name=large',
+        '01-abcdefg',
+      ),
+      makeImage(
+        2,
+        'https://pbs.twimg.com/media/RawQueryLeak?format=png&name=large',
+        '02-RawQueryLeak?format=png&name=large',
+      ),
+      makeImage(
+        3,
+        'https://pbs.twimg.com/media/LegacySize.jpg:large',
+        '03-LegacySize.jpg:large',
+      ),
+      makeImage(
+        4,
+        'https://pbs.twimg.com/amplify_video_thumb/2125131559464550400/img/dylZ-R9_u72qGM9w.jpg',
+        '04-dylz-r9-u72qgm9w',
+      ),
+    ];
+
+    const fetchImpl: typeof fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('RawQueryLeak')) {
+        return makeBinaryResponse(PNG_BYTES, 'image/png');
+      }
+      return makeBinaryResponse(JPEG_BYTES, 'image/jpeg');
+    });
+
+    const result = await fetchImages(
+      images,
+      'https://x.com/jakevin/status/2125132076768985501',
+      { fetchImpl, dnr: null },
+    );
+
+    expect(result.failed).toEqual([]);
+    expect(result.succeeded.map((img) => img.filename)).toEqual([
+      '01-abcdefg.jpg',
+      '02-RawQueryLeak.png',
+      '03-LegacySize.jpg',
+      '04-dylz-r9-u72qgm9w.jpg',
+    ]);
+    for (const img of result.succeeded) {
+      expect(img.filename).not.toContain('?');
+      expect(img.filename).not.toContain('&');
+      expect(img.filename).not.toContain(':');
+    }
+  });
 });

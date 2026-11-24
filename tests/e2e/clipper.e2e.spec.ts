@@ -2412,4 +2412,180 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       ]);
     }
   });
+
+  test('extracts, fetches (at name=large), and uploads X.com tweet images with empty alt="" and video posters while excluding avatars and replies', async ({
+    browser,
+  }) => {
+    const fixtureServer = await startFixtureServer();
+    const driveServer = await startMockDriveServer();
+    const distServer = await startStaticDistServer();
+    const context = await browser.newContext();
+
+    const xTweetUrl = 'https://x.com/e2eauthor/status/2125132076768985599';
+    const fetchedTwimgUrls: string[] = [];
+
+    const xTweetHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>E2E Author on X: "Testing empty-alt X photos and video poster"</title>
+  </head>
+  <body>
+    <main>
+      <div data-testid="cellInnerDiv">
+        <article data-testid="tweet">
+          <div data-testid="Tweet-User-Avatar">
+            <img src="https://pbs.twimg.com/profile_images/42/avatar_bigger.jpg" alt="E2E Author" />
+          </div>
+          <div data-testid="User-Name">
+            <a href="/e2eauthor">E2E Author</a>
+            <a href="/e2eauthor">@e2eauthor</a>
+            <a href="/e2eauthor/status/2125132076768985599"><time datetime="2026-11-24T08:00:00.000Z">Nov 24</time></a>
+          </div>
+          <div data-testid="tweetText">
+            <span>Clipping an X post whose photos have empty alt text and an embedded video poster.</span>
+            <img src="https://abs-0.twimg.com/emoji/v2/svg/1f680.svg" alt="🚀" />
+          </div>
+          <div data-testid="tweetPhoto">
+            <div style="background-image: url(&quot;https://pbs.twimg.com/media/AbCdEfG?format=jpg&amp;name=small&quot;);"></div>
+            <img src="https://pbs.twimg.com/media/AbCdEfG?format=jpg&amp;name=small" alt="" />
+          </div>
+          <div data-testid="tweetPhoto">
+            <img src="https://pbs.twimg.com/media/SecondPhoto9?format=png&amp;name=small" />
+          </div>
+          <div data-testid="tweetPhoto">
+            <div data-testid="videoPlayer">
+              <video
+                aria-label="Embedded demo video"
+                poster="https://pbs.twimg.com/amplify_video_thumb/2125132076768985599/img/PosterFrame1.jpg"
+                src="blob:https://x.com/mock-blob-id"
+              ></video>
+            </div>
+          </div>
+        </article>
+      </div>
+      <div data-testid="cellInnerDiv">
+        <article data-testid="tweet">
+          <div data-testid="User-Name">
+            <a href="/commenter">Commenter</a>
+            <a href="/commenter">@commenter</a>
+            <a href="/commenter/status/2125132076768985600"><time datetime="2026-11-24T08:05:00.000Z">Nov 24</time></a>
+          </div>
+          <div data-testid="tweetText"><span>Nice post!</span></div>
+          <div data-testid="tweetPhoto">
+            <img src="https://pbs.twimg.com/media/ReplyIgnored99?format=jpg&amp;name=small" alt="" />
+          </div>
+        </article>
+      </div>
+    </main>
+  </body>
+</html>`;
+
+    try {
+      await context.route('https://x.com/**', async (route) => {
+        await route.fulfill({
+          status: 200,
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          body: xTweetHtml,
+        });
+      });
+
+      await context.route('https://pbs.twimg.com/**', async (route) => {
+        const reqUrl = route.request().url();
+        fetchedTwimgUrls.push(reqUrl);
+        const isPng = reqUrl.includes('format=png');
+        const body = isPng ? VALID_PNG_BYTES : VALID_JPEG_BYTES;
+        await route.fulfill({
+          status: 200,
+          headers: {
+            'Content-Type': isPng ? 'image/png' : 'image/jpeg',
+            'Content-Length': String(body.byteLength),
+            'Access-Control-Allow-Origin': '*',
+          },
+          body,
+        });
+      });
+
+      await context.route('https://abs-0.twimg.com/**', async (route) => {
+        await route.fulfill({
+          status: 200,
+          headers: { 'Content-Type': 'image/svg+xml' },
+          body: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"></svg>',
+        });
+      });
+
+      const harness = await createExtensionHarness({
+        context,
+        distBaseUrl: distServer.baseUrl,
+        fixtureServer,
+        driveServer,
+        initialTabs: [{ tabId: 501, url: xTweetUrl }],
+      });
+
+      // Clear page-load image requests so we measure only Service Worker fetches below
+      fetchedTwimgUrls.length = 0;
+
+      const startRes = (await harness.sendToServiceWorker({
+        type: 'START_CLIP',
+        request: { tabId: 501, mode: 'full' },
+      })) as { ok: boolean };
+      expect(startRes.ok).toBe(true);
+
+      await expect
+        .poll(
+          async () => {
+            const res = (await harness.sendToServiceWorker({
+              type: 'GET_CLIP_JOBS',
+            })) as { ok: boolean; data: Array<{ status: string }> };
+            return res.data[0]?.status;
+          },
+          { timeout: 15_000 },
+        )
+        .toBe('done');
+
+      // Service worker fetched the two media photos upgraded to name=large + the video poster (never avatar or reply image)
+      expect(fetchedTwimgUrls.sort()).toEqual([
+        'https://pbs.twimg.com/amplify_video_thumb/2125132076768985599/img/PosterFrame1.jpg',
+        'https://pbs.twimg.com/media/AbCdEfG?format=jpg&name=large',
+        'https://pbs.twimg.com/media/SecondPhoto9?format=png&name=large',
+      ]);
+
+      // Clean deterministic filenames uploaded BEFORE README.md
+      expect(driveServer.uploadOrder).toHaveLength(4);
+      expect(driveServer.uploadOrder[3]).toBe('README.md');
+      expect(driveServer.uploadOrder.slice(0, 3).sort()).toEqual([
+        '01-abcdefg.jpg',
+        '02-secondphoto9.png',
+        '03-posterframe1.jpg',
+      ]);
+
+      const readmeUpload = driveServer.uploads.find((u) => u.metadata.name === 'README.md')!;
+      const readmeText = readmeUpload.contentBytes.toString('utf8');
+      expect(readmeText).toContain('site: "X (Twitter)"');
+      expect(readmeText).toContain('author: "@e2eauthor"');
+      expect(readmeText).toContain('./images/01-abcdefg.jpg');
+      expect(readmeText).toContain('./images/02-secondphoto9.png');
+      expect(readmeText).toContain('./images/03-posterframe1.jpg');
+      expect(readmeText).not.toContain('ReplyIgnored99');
+      expect(readmeText).not.toContain('profile_images');
+      expect(readmeText).not.toContain('abs-0.twimg.com');
+
+      // Post images sit before ## Comments
+      const commentsIdx = readmeText.indexOf('## Comments');
+      expect(commentsIdx).toBeGreaterThan(readmeText.indexOf('./images/03-posterframe1.jpg'));
+
+      expect(harness.activeDnrRules.size).toBe(0);
+      expect(harness.swErrors).toEqual([]);
+      expect(harness.getAllArticleErrors()).toEqual([]);
+
+      await harness.close();
+    } finally {
+      await context.close();
+      await Promise.all([
+        fixtureServer.close(),
+        driveServer.close(),
+        distServer.close(),
+      ]);
+    }
+  });
 });

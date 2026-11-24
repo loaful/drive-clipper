@@ -15,6 +15,11 @@ import {
   LIVE_IMG_ATTRS,
   type FlattenShadowDomOptions,
 } from './shadow-dom.js';
+import {
+  appendMissingXMediaToMarkdown,
+  extractXPostMedia,
+  isXUrl,
+} from './x-media.js';
 
 export const DEFAULT_PARSE_ASYNC_TIMEOUT_MS = 8_000;
 
@@ -313,6 +318,16 @@ export async function extractPage(
   warnings.push(...flattened.warnings);
 
   const domMeta = resolveDomImages(flattened.document, url);
+  const xMedia = isXUrl(url) ? extractXPostMedia(flattened.document, url) : [];
+  for (const item of xMedia) {
+    if (!domMeta.has(item.url)) {
+      const sourceMeta = domMeta.get(item.sourceUrl);
+      if (sourceMeta) {
+        domMeta.set(item.url, sourceMeta);
+      }
+    }
+  }
+
   const parsed = await parseWithTimeoutFallback(
     flattened.document,
     url,
@@ -321,7 +336,11 @@ export async function extractPage(
     warnings,
   );
 
-  const markdown = markdownConverter(parsed.content || '', url).trim();
+  const rawMarkdown = markdownConverter(parsed.content || '', url).trim();
+  const markdown =
+    xMedia.length > 0
+      ? appendMissingXMediaToMarkdown(rawMarkdown, xMedia, url)
+      : rawMarkdown;
   const images = discoverImagesFromMarkdown(markdown, url, domMeta);
 
   const parsedTitle = nonEmptyOrNull(parsed.title);

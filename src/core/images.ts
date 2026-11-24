@@ -729,7 +729,11 @@ function buildSuggestedImageName(resolvedUrl: string, index: number): string {
     const segments = parsed.pathname.split('/').filter(Boolean);
     const lastSegment = segments[segments.length - 1] ?? '';
     const decoded = decodeURIComponent(lastSegment);
-    const withoutExt = decoded.replace(/\.[a-zA-Z0-9]{1,8}$/, '');
+    const withoutSizeSuffix = decoded.replace(
+      /:(?:orig|large|medium|small|thumb|\d+x\d+)$/i,
+      '',
+    );
+    const withoutExt = withoutSizeSuffix.replace(/\.[a-zA-Z0-9]{1,8}$/, '');
     const slug = slugifyTitle(withoutExt, 40);
     if (slug !== 'untitled') {
       return `${prefix}-${slug}`;

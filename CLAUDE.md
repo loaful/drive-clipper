@@ -8,7 +8,8 @@ Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Mar
 | --- | --- |
 | `src/types.ts` | Shared domain models, storage keys, settings defaults, and UI/content/background message unions. |
 | `src/core/shadow-dom.ts` | Bounded-timeout Shadow DOM flattening prior to article extraction. |
-| `src/core/extract.ts` | Page extraction using `defuddle/full` (`parseAsync()` with timeout fallback to `parse()`), unread-prefix title cleanup via `cleanPageTitle()`, full-page and selection modes. |
+| `src/core/extract.ts` | Page extraction using `defuddle/full` (`parseAsync()` with timeout fallback to `parse()`), X.com media supplementation via `src/core/x-media.ts`, unread-prefix title cleanup via `cleanPageTitle()`, full-page and selection modes. |
+| `src/core/x-media.ts` | X.com / Twitter post media extraction and normalization (`pbs.twimg.com/media/` high-res `name=large`, empty/missing `alt`, CSS `background-image` fallbacks, video posters, card images, self-thread & quoted tweets) with strict avatar/emoji/reply exclusion and Markdown deduplication. |
 | `src/core/frontmatter.ts` | YAML frontmatter generation, `cleanPageTitle()` unread-prefix cleanup, Unicode title slugification, and canonical `YYYY-MM-DD-<slug>` folder naming. |
 | `src/core/images.ts` | DOM lazy-load image resolution, placeholder/tracking-pixel filtering, URL deduplication, and Markdown `./images/<name>` rewriting. |
 | `src/content/content.ts` | Content script injected via `chrome.scripting.executeScript` to report page info and run extraction. |
