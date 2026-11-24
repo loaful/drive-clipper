@@ -45,9 +45,10 @@
           <p class="callout-title">Google OAuth Client ID is not configured</p>
           <p class="callout-body">
             This unpacked build still has the placeholder <code>client_id</code>. Copy
-            <code>config.local.example.json</code> to <code>config.local.json</code>, add your Chrome
-            Extension OAuth Client ID, run <code>npm run build</code>, and reload the extension in
-            <code>chrome://extensions</code>.
+            <code>config.local.example.json</code> to <code>config.local.json</code>, add your Google OAuth
+            Client ID (<strong>Chrome Extension</strong> type for Chrome Sync, or <strong>Web application</strong>
+            type with the Redirect URI below for Chromium browsers without Chrome sign-in), run
+            <code>npm run build</code>, and reload the extension in <code>chrome://extensions</code>.
           </p>
         </div>
 
@@ -55,6 +56,14 @@
           <div class="meta-item">
             <span class="meta-label">OAuth Scope</span>
             <code class="meta-code">https://www.googleapis.com/auth/drive.file</code>
+          </div>
+          <div id="extension-id-meta" class="meta-item" hidden>
+            <span class="meta-label">Extension ID</span>
+            <code id="extension-id-value" class="meta-code"></code>
+          </div>
+          <div id="oauth-redirect-uri-meta" class="meta-item" hidden>
+            <span class="meta-label">OAuth Redirect URI (Web App Client)</span>
+            <code id="oauth-redirect-uri-value" class="meta-code"></code>
           </div>
         </div>
 

@@ -13,7 +13,7 @@ Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Mar
 | `src/core/images.ts` | DOM lazy-load image resolution, placeholder/tracking-pixel filtering, URL deduplication, and Markdown `./images/<name>` rewriting. |
 | `src/content/content.ts` | Content script injected via `chrome.scripting.executeScript` to report page info and run extraction. |
 | `src/background/image-fetcher.ts` | Service worker image downloader with bounded concurrency, `Content-Type` + magic-byte format detection, temporary `declarativeNetRequest` `Referer` session rules, and per-image fallback results. |
-| `src/drive/drive-client.ts` | Google Drive API v3 client (`chrome.identity`, extension-owned root folder tracked by `rootFolderId`, `appProperties.sourceUrl` idempotency, `multipart/related` uploads with retry, images uploaded before `README.md`). |
+| `src/drive/drive-client.ts` | Google Drive API v3 client (`chrome.identity.getAuthToken` with automatic `launchWebAuthFlow` + `chrome.storage.session` fallback for non-Sync Chromium browsers, extension-owned root folder tracked by `rootFolderId`, `appProperties.sourceUrl` idempotency, `multipart/related` uploads with retry, images uploaded before `README.md`). |
 | `src/background/service-worker.ts` | Orchestrates popup/context-menu clips, settings/history persistence, auth actions, and `CLIP_PROGRESS` broadcasts. |
 | `src/ui/` | Popup UI (`popup.{html,css,ts}`), Options UI (`options.{html,css,ts}`), and shared UI runtime/tag helpers (`shared.ts`). |
 | `src/icons/` | Vector source (`icon.svg`) and raster PNG extension icons (`icon16.png`, `icon48.png`, `icon128.png`). |

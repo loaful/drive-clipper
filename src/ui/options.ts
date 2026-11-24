@@ -78,6 +78,14 @@ export async function mountOptions(
     root,
     '#auth-feedback',
   );
+  const extensionIdMeta = root.querySelector<HTMLDivElement>('#extension-id-meta');
+  const extensionIdValue = root.querySelector<HTMLElement>('#extension-id-value');
+  const oauthRedirectUriMeta = root.querySelector<HTMLDivElement>(
+    '#oauth-redirect-uri-meta',
+  );
+  const oauthRedirectUriValue = root.querySelector<HTMLElement>(
+    '#oauth-redirect-uri-value',
+  );
 
   const rootFolderNameInput = queryRequired<HTMLInputElement>(
     root,
@@ -465,6 +473,28 @@ export async function mountOptions(
       setFeedback(preferencesFeedback, response.error, 'error');
     }
   };
+
+  const renderIdentityMetadata = (): void => {
+    const info = runtime.getExtensionIdentityInfo?.();
+    if (extensionIdMeta && extensionIdValue) {
+      if (info?.extensionId) {
+        extensionIdValue.textContent = info.extensionId;
+        extensionIdMeta.hidden = false;
+      } else {
+        extensionIdMeta.hidden = true;
+      }
+    }
+    if (oauthRedirectUriMeta && oauthRedirectUriValue) {
+      if (info?.redirectUri) {
+        oauthRedirectUriValue.textContent = info.redirectUri;
+        oauthRedirectUriMeta.hidden = false;
+      } else {
+        oauthRedirectUriMeta.hidden = true;
+      }
+    }
+  };
+
+  renderIdentityMetadata();
 
   signInBtn.addEventListener('click', handleSignIn);
   signOutBtn.addEventListener('click', handleSignOut);

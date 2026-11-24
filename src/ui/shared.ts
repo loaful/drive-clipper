@@ -8,6 +8,11 @@ import {
   type UiToBackgroundMessage,
 } from '../types.js';
 
+export interface ExtensionIdentityInfo {
+  extensionId: string | null;
+  redirectUri: string | null;
+}
+
 export interface UiRuntimeClient {
   sendMessage<K extends UiToBackgroundMessage['type']>(
     message: Extract<UiToBackgroundMessage, { type: K }>,
@@ -15,6 +20,7 @@ export interface UiRuntimeClient {
   onClipProgress(listener: (event: ClipProgressEvent) => void): () => void;
   openOptionsPage(): void;
   getManifestOAuthConfigured(): boolean | null;
+  getExtensionIdentityInfo?: () => ExtensionIdentityInfo;
 }
 
 const TAG_SPLIT_RE = /[,;\r\n]+/;
@@ -443,6 +449,27 @@ export function createChromeRuntimeClient(): UiRuntimeClient {
       } catch {
         return null;
       }
+    },
+
+    getExtensionIdentityInfo(): ExtensionIdentityInfo {
+      const runtime = globalThis.chrome?.runtime;
+      const identity = globalThis.chrome?.identity;
+      const extensionId =
+        typeof runtime?.id === 'string' && runtime.id.trim().length > 0
+          ? runtime.id.trim()
+          : null;
+      let redirectUri: string | null = null;
+      if (typeof identity?.getRedirectURL === 'function') {
+        try {
+          const url = identity.getRedirectURL();
+          if (typeof url === 'string' && url.trim().length > 0) {
+            redirectUri = url.trim();
+          }
+        } catch {
+          redirectUri = null;
+        }
+      }
+      return { extensionId, redirectUri };
     },
   };
 }

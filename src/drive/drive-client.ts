@@ -6,6 +6,8 @@ import {
 import { rewriteMarkdownImageUrls } from '../core/images.js';
 import {
   DRIVE_FILE_SCOPE,
+  OAUTH_CLIENT_ID_PLACEHOLDER,
+  STORAGE_KEYS,
   buildDriveFolderUrl,
   type ClipResult,
   type ExtractedPage,
@@ -18,7 +20,10 @@ import {
 
 export const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 export const DEFAULT_DRIVE_BASE_URL = 'https://www.googleapis.com';
+const GOOGLE_OAUTH_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
+const WEB_AUTH_TOKEN_EXPIRY_SKEW_MS = 60_000;
+const DEFAULT_WEB_AUTH_EXPIRES_IN_SECONDS = 3600;
 
 // Google Drive v3 appProperties limits each entry to 124 UTF-8 bytes (key + value).
 const DRIVE_APP_PROPERTY_MAX_BYTES = 124;
@@ -176,6 +181,13 @@ export function buildMultipartRelatedBody(params: {
   };
 }
 
+interface CachedWebAuthToken {
+  token: string;
+  expiresAt: number;
+}
+
+let inMemoryWebAuthToken: CachedWebAuthToken | null = null;
+
 function extractTokenValue(
   result: chrome.identity.GetAuthTokenResult | string | undefined,
 ): string | null {
@@ -188,50 +200,389 @@ function extractTokenValue(
   return null;
 }
 
+function isUsableOAuthClientId(clientId: unknown): clientId is string {
+  if (typeof clientId !== 'string') {
+    return false;
+  }
+  const trimmed = clientId.trim();
+  return (
+    trimmed.length > 0 &&
+    trimmed !== OAUTH_CLIENT_ID_PLACEHOLDER &&
+    !trimmed.startsWith('YOUR_')
+  );
+}
+
+function getSessionStorageArea():
+  | {
+      get(keys: string): Promise<Record<string, unknown>>;
+      set(items: Record<string, unknown>): Promise<void>;
+      remove(keys: string): Promise<void>;
+    }
+  | null {
+  if (
+    typeof chrome !== 'undefined' &&
+    chrome.storage?.session &&
+    typeof chrome.storage.session.get === 'function' &&
+    typeof chrome.storage.session.set === 'function' &&
+    typeof chrome.storage.session.remove === 'function'
+  ) {
+    return chrome.storage.session;
+  }
+  return null;
+}
+
+function isValidCachedWebAuthToken(
+  value: unknown,
+  nowMs: number = Date.now(),
+): value is CachedWebAuthToken {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<CachedWebAuthToken>;
+  return (
+    typeof candidate.token === 'string' &&
+    candidate.token.trim().length > 0 &&
+    typeof candidate.expiresAt === 'number' &&
+    Number.isFinite(candidate.expiresAt) &&
+    candidate.expiresAt - WEB_AUTH_TOKEN_EXPIRY_SKEW_MS > nowMs
+  );
+}
+
+async function readCachedWebAuthToken(nowMs: number = Date.now()): Promise<string | null> {
+  const session = getSessionStorageArea();
+  if (session) {
+    try {
+      const stored = await session.get(STORAGE_KEYS.webAuthToken);
+      const entry = stored[STORAGE_KEYS.webAuthToken];
+      if (isValidCachedWebAuthToken(entry, nowMs)) {
+        inMemoryWebAuthToken = entry;
+        return entry.token;
+      }
+      if (entry !== undefined) {
+        await session.remove(STORAGE_KEYS.webAuthToken).catch(() => undefined);
+      }
+    } catch {
+      // Fall back to in-memory cache if session storage is temporarily inaccessible.
+    }
+  }
+
+  if (isValidCachedWebAuthToken(inMemoryWebAuthToken, nowMs)) {
+    return inMemoryWebAuthToken.token;
+  }
+  inMemoryWebAuthToken = null;
+  return null;
+}
+
+async function writeCachedWebAuthToken(entry: CachedWebAuthToken): Promise<void> {
+  inMemoryWebAuthToken = entry;
+  const session = getSessionStorageArea();
+  if (session) {
+    try {
+      await session.set({ [STORAGE_KEYS.webAuthToken]: entry });
+    } catch {
+      // In-memory cache still holds the token for this service worker lifetime.
+    }
+  }
+}
+
+export async function clearCachedWebAuthToken(matchingToken?: string): Promise<void> {
+  if (!matchingToken || inMemoryWebAuthToken?.token === matchingToken) {
+    inMemoryWebAuthToken = null;
+  }
+  const session = getSessionStorageArea();
+  if (!session) {
+    return;
+  }
+  try {
+    if (!matchingToken) {
+      await session.remove(STORAGE_KEYS.webAuthToken);
+      return;
+    }
+    const stored = await session.get(STORAGE_KEYS.webAuthToken);
+    const entry = stored[STORAGE_KEYS.webAuthToken] as Partial<CachedWebAuthToken> | undefined;
+    if (entry?.token === matchingToken) {
+      await session.remove(STORAGE_KEYS.webAuthToken);
+    }
+  } catch {
+    // Ignore storage cleanup errors when clearing expired or revoked tokens.
+  }
+}
+
 /**
- * Acquires a Google OAuth2 access token via `chrome.identity.getAuthToken`
+ * Determines whether a `chrome.identity.getAuthToken` failure indicates that
+ * Chromium browser sign-in is unavailable or the configured OAuth Client ID is
+ * a Web Application client meant for `chrome.identity.launchWebAuthFlow`.
+ */
+export function shouldFallbackToWebAuthFlow(errorMessage: string): boolean {
+  const normalized = errorMessage.trim().toLowerCase();
+  if (normalized.length === 0) {
+    return false;
+  }
+  if (
+    normalized.includes('did not approve') ||
+    normalized.includes('user canceled') ||
+    normalized.includes('user cancelled') ||
+    normalized.includes('access_denied')
+  ) {
+    return false;
+  }
+  return (
+    normalized.includes('browser signin') ||
+    normalized.includes('not signed in') ||
+    normalized.includes('not supported') ||
+    normalized.includes('bad client id') ||
+    normalized.includes('invalid_client') ||
+    normalized.includes('oauth2 request failed') ||
+    normalized.includes('oauth2 not granted') ||
+    normalized.includes('no account') ||
+    normalized.includes('chrome sign-in')
+  );
+}
+
+/**
+ * Builds the Google OAuth 2.0 authorization URL for `launchWebAuthFlow`
  * strictly scoped to `https://www.googleapis.com/auth/drive.file`.
+ */
+export function buildGoogleWebAuthUrl(params: {
+  clientId: string;
+  redirectUri: string;
+  state: string;
+  authEndpoint?: string;
+}): string {
+  const url = new URL(params.authEndpoint ?? GOOGLE_OAUTH_AUTH_ENDPOINT);
+  url.searchParams.set('client_id', params.clientId.trim());
+  url.searchParams.set('response_type', 'token');
+  url.searchParams.set('redirect_uri', params.redirectUri);
+  url.searchParams.set('scope', DRIVE_FILE_SCOPE);
+  url.searchParams.set('state', params.state);
+  return url.toString();
+}
+
+/**
+ * Parses and validates the redirect callback URL returned by
+ * `chrome.identity.launchWebAuthFlow`, verifying the CSRF `state` nonce.
+ */
+export function parseWebAuthFlowRedirect(
+  redirectUrl: string,
+  expectedState: string,
+  nowMs: number = Date.now(),
+): CachedWebAuthToken {
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUrl);
+  } catch {
+    throw new DriveApiError('Google authentication returned a malformed redirect URL.', {
+      status: 401,
+      code: 'AUTH_REQUIRED',
+    });
+  }
+
+  const fragmentParams = new URLSearchParams(
+    parsed.hash.startsWith('#') ? parsed.hash.slice(1) : parsed.hash,
+  );
+  const queryParams = parsed.searchParams;
+  const readParam = (key: string): string | null =>
+    fragmentParams.get(key) ?? queryParams.get(key);
+
+  const oauthError = readParam('error');
+  if (oauthError) {
+    const description = readParam('error_description');
+    const detail = description ? `${oauthError}: ${description}` : oauthError;
+    throw new DriveApiError(`Google web sign-in failed (${detail}).`, {
+      status: 401,
+      code: 'AUTH_REQUIRED',
+    });
+  }
+
+  const returnedState = readParam('state');
+  if (!returnedState || returnedState !== expectedState) {
+    throw new DriveApiError(
+      'Google web sign-in failed: OAuth state verification mismatch.',
+      {
+        status: 401,
+        code: 'AUTH_REQUIRED',
+      },
+    );
+  }
+
+  const token = readParam('access_token')?.trim();
+  if (!token) {
+    throw new DriveApiError(
+      'Google web sign-in did not return an access token.',
+      {
+        status: 401,
+        code: 'AUTH_REQUIRED',
+      },
+    );
+  }
+
+  const expiresInRaw = Number(readParam('expires_in'));
+  const expiresInSeconds =
+    Number.isFinite(expiresInRaw) && expiresInRaw > 0
+      ? Math.max(60, Math.floor(expiresInRaw))
+      : DEFAULT_WEB_AUTH_EXPIRES_IN_SECONDS;
+
+  return {
+    token,
+    expiresAt: nowMs + expiresInSeconds * 1000,
+  };
+}
+
+async function launchChromeDriveWebAuthFlow(options: {
+  interactive: boolean;
+}): Promise<string> {
+  if (
+    typeof chrome === 'undefined' ||
+    !chrome.identity?.launchWebAuthFlow ||
+    !chrome.identity?.getRedirectURL
+  ) {
+    throw new DriveApiError('chrome.identity.launchWebAuthFlow is unavailable.', {
+      status: 401,
+      code: 'AUTH_REQUIRED',
+    });
+  }
+
+  const clientId = chrome.runtime?.getManifest?.()?.oauth2?.client_id;
+  if (!isUsableOAuthClientId(clientId)) {
+    throw new DriveApiError(
+      'Google OAuth Client ID is not configured in manifest.json.',
+      {
+        status: 401,
+        code: 'AUTH_REQUIRED',
+      },
+    );
+  }
+
+  const redirectUri = chrome.identity.getRedirectURL();
+  const state = crypto.randomUUID();
+  const authUrl = buildGoogleWebAuthUrl({ clientId, redirectUri, state });
+
+  let responseUrl: string | undefined;
+  try {
+    responseUrl = await chrome.identity.launchWebAuthFlow({
+      url: authUrl,
+      interactive: options.interactive,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new DriveApiError(`Google web sign-in failed: ${message}`, {
+      status: 401,
+      code: 'AUTH_REQUIRED',
+    });
+  }
+
+  if (!responseUrl) {
+    throw new DriveApiError('Google web sign-in was cancelled before completing.', {
+      status: 401,
+      code: 'AUTH_REQUIRED',
+    });
+  }
+
+  const parsed = parseWebAuthFlowRedirect(responseUrl, state);
+  await writeCachedWebAuthToken(parsed);
+  return parsed.token;
+}
+
+/**
+ * Acquires a Google OAuth2 access token strictly scoped to
+ * `https://www.googleapis.com/auth/drive.file`.
+ *
+ * Uses `chrome.identity.getAuthToken` when Chrome browser sign-in is active,
+ * and falls back to `chrome.identity.launchWebAuthFlow` with session token
+ * caching on Chromium browsers where browser sign-in is disabled (such as Ego
+ * Lite, Brave, Arc, or unbranded Chromium) or when using a Web Application
+ * OAuth Client ID.
  */
 export async function getChromeDriveAuthToken(options: {
   interactive: boolean;
 }): Promise<string> {
-  if (typeof chrome === 'undefined' || !chrome.identity?.getAuthToken) {
+  const cachedWebToken = await readCachedWebAuthToken();
+  if (cachedWebToken) {
+    return cachedWebToken;
+  }
+
+  const hasGetAuthToken =
+    typeof chrome !== 'undefined' && typeof chrome.identity?.getAuthToken === 'function';
+  const hasWebAuthFlow =
+    typeof chrome !== 'undefined' &&
+    typeof chrome.identity?.launchWebAuthFlow === 'function' &&
+    typeof chrome.identity?.getRedirectURL === 'function';
+
+  if (!hasGetAuthToken && !hasWebAuthFlow) {
     throw new DriveApiError('chrome.identity API is unavailable.', {
       status: 401,
       code: 'AUTH_REQUIRED',
     });
   }
 
-  try {
-    const result = await chrome.identity.getAuthToken({
-      interactive: options.interactive,
-      scopes: [DRIVE_FILE_SCOPE],
-    });
-    const token = extractTokenValue(result);
-    if (!token) {
-      throw new DriveApiError('Google authentication did not return an access token.', {
-        status: 401,
-        code: 'AUTH_REQUIRED',
+  let getAuthTokenError: Error | null = null;
+  if (hasGetAuthToken) {
+    try {
+      const result = await chrome.identity.getAuthToken({
+        interactive: options.interactive,
+        scopes: [DRIVE_FILE_SCOPE],
       });
+      const token = extractTokenValue(result);
+      if (token) {
+        return token;
+      }
+      getAuthTokenError = new DriveApiError(
+        'Google authentication did not return an access token.',
+        { status: 401, code: 'AUTH_REQUIRED' },
+      );
+    } catch (error) {
+      getAuthTokenError =
+        error instanceof Error ? error : new Error(String(error));
     }
-    return token;
-  } catch (error) {
-    if (error instanceof DriveApiError) {
-      throw error;
-    }
-    const message = error instanceof Error ? error.message : String(error);
-    throw new DriveApiError(`Google authentication failed: ${message}`, {
-      status: 401,
-      code: 'AUTH_REQUIRED',
-    });
   }
+
+  if (
+    options.interactive &&
+    hasWebAuthFlow &&
+    (!hasGetAuthToken ||
+      (getAuthTokenError !== null &&
+        shouldFallbackToWebAuthFlow(getAuthTokenError.message)))
+  ) {
+    return launchChromeDriveWebAuthFlow({ interactive: true });
+  }
+
+  if (getAuthTokenError instanceof DriveApiError) {
+    throw getAuthTokenError;
+  }
+
+  const message = getAuthTokenError?.message ?? 'User is not signed in.';
+  throw new DriveApiError(`Google authentication failed: ${message}`, {
+    status: 401,
+    code: 'AUTH_REQUIRED',
+  });
 }
 
 export async function removeCachedChromeAuthToken(token: string): Promise<void> {
+  await clearCachedWebAuthToken(token);
   if (typeof chrome === 'undefined' || !chrome.identity?.removeCachedAuthToken) {
     return;
   }
-  await chrome.identity.removeCachedAuthToken({ token });
+  try {
+    await chrome.identity.removeCachedAuthToken({ token });
+  } catch {
+    // Non-Sync Chromium builds may reject Chrome token-cache APIs; session cache is already cleared.
+  }
+}
+
+export async function clearAllCachedChromeAuthTokens(): Promise<void> {
+  await clearCachedWebAuthToken();
+  if (
+    typeof chrome === 'undefined' ||
+    !chrome.identity ||
+    typeof chrome.identity.clearAllCachedAuthTokens !== 'function'
+  ) {
+    return;
+  }
+  try {
+    await chrome.identity.clearAllCachedAuthTokens();
+  } catch {
+    // Non-Sync Chromium builds may reject clearAllCachedAuthTokens when browser sign-in is disabled.
+  }
 }
 
 /**

@@ -37,8 +37,14 @@ The repository ships with a placeholder OAuth Client ID in `src/manifest.templat
    - Enable the **Google Drive API** (`APIs & Services` > `Library` > `Google Drive API` > `Enable`).
    - Configure the **OAuth consent screen** (`Google Auth Platform` > `Branding` / `Audience`). Add your Google account as a Test User while the app is in Testing status, and add the single scope `https://www.googleapis.com/auth/drive.file`.
    - Create an OAuth Client ID (`Clients` > `Create Client`):
-     - Application type: **Chrome Extension**
-     - Item ID: your 32-character Chrome Extension ID
+     - **Option A — Web application (recommended for Chromium browsers without Chrome Sync such as Ego Lite, Brave, Arc, Dia, or Edge; also works in Google Chrome):**
+       - Application type: **Web application**
+       - Authorized redirect URIs: `https://<your-32-character-extension-id>.chromiumapp.org/` (also displayed inside Drive Clipper's Options page)
+       - Drive Clipper automatically falls back to `chrome.identity.launchWebAuthFlow` and caches the short-lived token in `chrome.storage.session`.
+     - **Option B — Chrome Extension (Google Chrome with Chrome Sync signed in):**
+       - Application type: **Chrome Extension**
+       - Item ID: your 32-character Chrome Extension ID
+       - Uses Chrome's native `chrome.identity.getAuthToken` cache directly.
 
 4. Put the Client ID into `config.local.json`:
 

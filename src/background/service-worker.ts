@@ -1,6 +1,7 @@
 import {
   DriveApiError,
   DriveClient,
+  clearAllCachedChromeAuthTokens,
   getChromeDriveAuthToken,
   removeCachedChromeAuthToken,
   revokeChromeAuthToken,
@@ -263,16 +264,7 @@ export function createServiceWorkerController(
     deps.revokeAuthToken ??
     ((token: string) => revokeChromeAuthToken(token, fetchImpl));
   const clearAllCachedAuthTokens =
-    deps.clearAllCachedAuthTokens ??
-    (async () => {
-      if (
-        typeof chrome !== 'undefined' &&
-        chrome.identity &&
-        typeof chrome.identity.clearAllCachedAuthTokens === 'function'
-      ) {
-        await chrome.identity.clearAllCachedAuthTokens();
-      }
-    });
+    deps.clearAllCachedAuthTokens ?? clearAllCachedChromeAuthTokens;
   const driveClient =
     deps.driveClient ??
     new DriveClient({

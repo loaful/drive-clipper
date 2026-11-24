@@ -11,6 +11,7 @@ export const DRIVE_FOLDER_URL_PREFIX = 'https://drive.google.com/drive/folders/'
 export const STORAGE_KEYS = {
   settings: 'driveClipper.settings',
   history: 'driveClipper.history',
+  webAuthToken: 'driveClipper.webAuthToken',
 } as const;
 
 export type ClipMode = 'full' | 'selection';

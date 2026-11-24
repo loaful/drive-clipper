@@ -378,4 +378,30 @@ describe('Options UI', () => {
     );
     expect(statusText.textContent).toBe('Signed out');
   });
+
+  it('displays Extension ID and OAuth Redirect URI when exposed by the extension runtime', async () => {
+    const root = loadOptionsDom();
+    const mock = createMockOptionsRuntime({
+      authStatus: { oauthConfigured: false, authenticated: false },
+      manifestOAuthConfigured: false,
+    });
+    mock.runtime.getExtensionIdentityInfo = () => ({
+      extensionId: 'lliikkoebahbliapkdchhdahfodpcach',
+      redirectUri: 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/',
+    });
+
+    controller = await mountOptions(root, { runtime: mock.runtime });
+
+    const extMeta = root.querySelector<HTMLElement>('#extension-id-meta')!;
+    const extVal = root.querySelector<HTMLElement>('#extension-id-value')!;
+    const redirectMeta = root.querySelector<HTMLElement>('#oauth-redirect-uri-meta')!;
+    const redirectVal = root.querySelector<HTMLElement>('#oauth-redirect-uri-value')!;
+
+    expect(extMeta.hidden).toBe(false);
+    expect(extVal.textContent).toBe('lliikkoebahbliapkdchhdahfodpcach');
+    expect(redirectMeta.hidden).toBe(false);
+    expect(redirectVal.textContent).toBe(
+      'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/',
+    );
+  });
 });
