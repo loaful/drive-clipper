@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   OAUTH_CLIENT_ID_PLACEHOLDER,
+  type ClipJob,
   type ClipProgressEvent,
 } from '../../src/types.js';
 import {
@@ -147,6 +148,55 @@ describe('shared UI helpers', () => {
 
     expect(received).toHaveLength(1);
     expect(received[0]?.stage).toBe('extracting');
+
+    unsubscribe();
+    expect(listeners).toHaveLength(0);
+  });
+
+  it('subscribes and unsubscribes to CLIP_JOBS_UPDATED push messages only', () => {
+    const listeners: Array<(message: unknown) => void> = [];
+    vi.stubGlobal('chrome', {
+      runtime: {
+        onMessage: {
+          addListener: (fn: (message: unknown) => void) => listeners.push(fn),
+          removeListener: (fn: (message: unknown) => void) => {
+            const idx = listeners.indexOf(fn);
+            if (idx >= 0) listeners.splice(idx, 1);
+          },
+        },
+      },
+    });
+
+    const received: ClipJob[][] = [];
+    const client = createChromeRuntimeClient();
+    const unsubscribe = client.onClipJobsUpdated((jobs) => received.push(jobs));
+
+    for (const listener of listeners) {
+      listener({ type: 'CLIP_PROGRESS', event: { clipId: 'c1', stage: 'extracting', message: '...' } });
+      listener({ type: 'CLIP_JOBS_UPDATED', jobs: 'not-an-array' });
+      listener({
+        type: 'CLIP_JOBS_UPDATED',
+        jobs: [
+          {
+            id: 'job-1',
+            url: 'https://example.com/a',
+            title: 'Article A',
+            folderName: '2026-11-24-article-a',
+            mode: 'full',
+            status: 'downloading',
+            message: 'Downloading images (3/10)...',
+            completed: 3,
+            total: 10,
+            createdAt: '2026-11-24T10:00:00Z',
+            updatedAt: '2026-11-24T10:00:05Z',
+          },
+        ],
+      });
+    }
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toHaveLength(1);
+    expect(received[0]?.[0]?.id).toBe('job-1');
 
     unsubscribe();
     expect(listeners).toHaveLength(0);

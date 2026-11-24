@@ -144,6 +144,7 @@ function createMockOptionsRuntime(config: MockOptionsRuntimeConfig = {}) {
       }
     },
     onClipProgress: () => () => undefined,
+    onClipJobsUpdated: () => () => undefined,
     openOptionsPage: vi.fn(),
     getManifestOAuthConfigured: () => config.manifestOAuthConfigured ?? true,
   };

@@ -5,6 +5,7 @@ import {
   type AuthStatus,
   type BackgroundPushMessage,
   type BackgroundResponse,
+  type ClipJob,
   type ClipProgressEvent,
   type UiMessageResponseMap,
   type UiToBackgroundMessage,
@@ -20,6 +21,7 @@ export interface UiRuntimeClient {
     message: Extract<UiToBackgroundMessage, { type: K }>,
   ): Promise<BackgroundResponse<UiMessageResponseMap[K]>>;
   onClipProgress(listener: (event: ClipProgressEvent) => void): () => void;
+  onClipJobsUpdated(listener: (jobs: ClipJob[]) => void): () => void;
   openOptionsPage(): void;
   getManifestOAuthConfigured(): boolean | null;
   getExtensionIdentityInfo?: () => ExtensionIdentityInfo;
@@ -308,7 +310,9 @@ export function createTagEditor(options: TagEditorOptions): TagEditorController 
   };
 }
 
-function isClipProgressPushMessage(value: unknown): value is BackgroundPushMessage {
+function isClipProgressPushMessage(
+  value: unknown,
+): value is Extract<BackgroundPushMessage, { type: 'CLIP_PROGRESS' }> {
   if (!value || typeof value !== 'object') {
     return false;
   }
@@ -318,6 +322,16 @@ function isClipProgressPushMessage(value: unknown): value is BackgroundPushMessa
     Boolean(candidate.event) &&
     typeof candidate.event === 'object'
   );
+}
+
+function isClipJobsUpdatedPushMessage(
+  value: unknown,
+): value is Extract<BackgroundPushMessage, { type: 'CLIP_JOBS_UPDATED' }> {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return candidate.type === 'CLIP_JOBS_UPDATED' && Array.isArray(candidate.jobs);
 }
 
 export function createChromeRuntimeClient(): UiRuntimeClient {
@@ -410,6 +424,24 @@ export function createChromeRuntimeClient(): UiRuntimeClient {
       const handler = (message: unknown): void => {
         if (isClipProgressPushMessage(message)) {
           listener(message.event);
+        }
+      };
+
+      onMessage.addListener(handler);
+      return () => {
+        onMessage.removeListener?.(handler);
+      };
+    },
+
+    onClipJobsUpdated(listener: (jobs: ClipJob[]) => void): () => void {
+      const onMessage = globalThis.chrome?.runtime?.onMessage;
+      if (!onMessage?.addListener) {
+        return () => undefined;
+      }
+
+      const handler = (message: unknown): void => {
+        if (isClipJobsUpdatedPushMessage(message)) {
+          listener(message.jobs);
         }
       };
 

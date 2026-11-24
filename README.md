@@ -1,6 +1,12 @@
 # Drive Clipper
 
-Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Markdown with local images and uploads each clip to Google Drive. It uses `defuddle/full` for article extraction, downloads page images in the background service worker, rewrites image links to relative paths, and authenticates through `chrome.identity` with the minimal `drive.file` OAuth scope.
+Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Markdown with local images and uploads each clip to Google Drive. It uses `defuddle/full` for article extraction, cleans site unread prefixes from default titles, queues multi-tab downloads and uploads in the background service worker, rewrites image links to relative paths, and authenticates through `chrome.identity` with the minimal `drive.file` OAuth scope.
+
+## Multi-tab background queue & title cleanup
+
+- **Clip across tabs without waiting:** Clicking **Clip to Google Drive** runs fast page extraction while the tab is open, enqueues background image download and Google Drive upload (up to 2 concurrent jobs to avoid API rate-limit bursts), and immediately lets you switch tabs or close the popup.
+- **Unified Clip queue & toolbar badge:** Reopening the popup from any tab restores live job progress from `chrome.storage.session` (`clipJobs`) and streams updates in real time (`Queued`, `Extracting...`, `Downloading`, `Uploading`, `Saved` with `Open ↗` link and collapsible warnings, plus single-job dismiss and `Clear done`). The toolbar badge reflects queue state across both popup and context-menu clips: blue active count (`1`, `3`, …) while jobs run, green `OK` briefly when finished cleanly, and red `!` if any undismissed clip failed.
+- **Automatic unread-prefix title cleanup:** Default page titles strip leading notification counters such as Zhihu `(20 封私信 / 17 条消息) ...`, `(3) ...`, `(99+) ...`, and `[12] ...` before computing the article title and `YYYY-MM-DD-<slug>` folder name, while preserving legitimate parentheticals like `(2026) Annual Report` and `(Part 1) Guide` as well as any manual edits you type in the popup.
 
 ## Output folder structure
 

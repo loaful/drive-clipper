@@ -8,14 +8,14 @@ Drive Clipper is a Chrome Manifest V3 extension that extracts web pages into Mar
 | --- | --- |
 | `src/types.ts` | Shared domain models, storage keys, settings defaults, and UI/content/background message unions. |
 | `src/core/shadow-dom.ts` | Bounded-timeout Shadow DOM flattening prior to article extraction. |
-| `src/core/extract.ts` | Page extraction using `defuddle/full` (`parseAsync()` with timeout fallback to `parse()`), full-page and selection modes. |
-| `src/core/frontmatter.ts` | YAML frontmatter generation, Unicode title slugification, and canonical `YYYY-MM-DD-<slug>` folder naming. |
+| `src/core/extract.ts` | Page extraction using `defuddle/full` (`parseAsync()` with timeout fallback to `parse()`), unread-prefix title cleanup via `cleanPageTitle()`, full-page and selection modes. |
+| `src/core/frontmatter.ts` | YAML frontmatter generation, `cleanPageTitle()` unread-prefix cleanup, Unicode title slugification, and canonical `YYYY-MM-DD-<slug>` folder naming. |
 | `src/core/images.ts` | DOM lazy-load image resolution, placeholder/tracking-pixel filtering, URL deduplication, and Markdown `./images/<name>` rewriting. |
 | `src/content/content.ts` | Content script injected via `chrome.scripting.executeScript` to report page info and run extraction. |
-| `src/background/image-fetcher.ts` | Service worker image downloader with bounded concurrency, `Content-Type` + magic-byte format detection, temporary `declarativeNetRequest` `Referer` session rules, and per-image fallback results. |
+| `src/background/image-fetcher.ts` | Service worker image downloader with bounded concurrency, `Content-Type` + magic-byte format detection, per-URL temporary `declarativeNetRequest` `Referer` session rules (with non-colliding rule IDs and startup orphan cleanup), and per-image fallback results. |
 | `src/drive/drive-client.ts` | Google Drive API v3 client (`chrome.identity.getAuthToken` with automatic `launchWebAuthFlow` + `chrome.storage.session` fallback for non-Sync Chromium browsers, extension-owned root folder tracked by `rootFolderId`, `appProperties.sourceUrl` idempotency, `multipart/related` uploads with retry, images uploaded before `README.md`). |
-| `src/background/service-worker.ts` | Orchestrates popup/context-menu clips, settings/history persistence, auth actions, and `CLIP_PROGRESS` broadcasts. |
-| `src/ui/` | Popup UI (`popup.{html,css,ts}`), Options UI (`options.{html,css,ts}`), and shared UI runtime/tag helpers (`shared.ts`). |
+| `src/background/service-worker.ts` | Orchestrates popup/context-menu clips via a bounded background job queue (`maxConcurrentJobs = 2`, persisted in `chrome.storage.session` under `clipJobs` with SW-restart orphan recovery), single-flight `ensureRootFolder`, unified toolbar icon badge (blue count / green `OK` / red `!`), settings/history persistence, auth actions, and `CLIP_JOBS_UPDATED` / `CLIP_PROGRESS` broadcasts. |
+| `src/ui/` | Popup UI (`popup.{html,css,ts}` with unified multi-tab `Clip queue` process list and duplicate-active-URL guard), Options UI (`options.{html,css,ts}`), and shared UI runtime/tag helpers (`shared.ts`). |
 | `src/icons/` | Vector source (`icon.svg`) and raster PNG extension icons (`icon16.png`, `icon48.png`, `icon128.png`). |
 | `scripts/build.mjs` | esbuild bundler for the four entrypoints (injecting optional gitignored `webAuthClientId` at build time), static UI/icon copier, and `dist/manifest.json` generator with scope and remote-script checks. |
 | `tests/` | Unit tests (`tests/core/`, `tests/background/`, `tests/drive/`, `tests/ui/`) and Playwright E2E suite (`tests/e2e/`). |
@@ -39,5 +39,6 @@ npm run test:e2e
 - **No remote scripts in MV3.** `content_security_policy.extension_pages` stays `script-src 'self'; object-src 'self'`. Do not load Google Picker or any external `<script>` in `popup.html` or `options.html`; `scripts/build.mjs` rejects remote script URLs in HTML files.
 - **Root folder tracked by ID.** Always persist and query the extension-owned root folder by `rootFolderId` so users can move or rename `WebClips` in Google Drive without breaking clips.
 - **Upload ordering and graceful image fallback.** All downloaded images upload before `README.md` is written. Per-image download failures never abort the clip; keep the remote URL in Markdown and record a warning in YAML frontmatter.
-- **Clean DNR rule lifecycle.** Every temporary `declarativeNetRequest` session rule added for anti-hotlink `Referer` headers must be removed in a `finally` block using unique rule IDs.
-- **Single source of truth for folder slugs.** UI folder previews import `buildArticleFolderName` from `src/core/frontmatter.ts` instead of duplicating slugification logic.
+- **Clean DNR rule lifecycle.** Every temporary `declarativeNetRequest` session rule added for anti-hotlink `Referer` headers must use unique non-colliding IDs scoped per URL, be removed in a `finally` block, and sweep any orphaned SW rules on startup.
+- **Single source of truth for title cleanup and folder slugs.** Extraction and UI previews import `cleanPageTitle` and `buildArticleFolderName` from `src/core/frontmatter.ts` instead of duplicating regex or slugification logic.
+- **Non-blocking multi-tab queue safety.** `START_CLIP` runs fast extraction while the tab is open, persists `ClipJob` state in `chrome.storage.session` (`clipJobs`, capped at 20), bounds background download/upload concurrency (`maxConcurrentJobs = 2`), deduplicates concurrent `ensureRootFolder()` calls via single-flight promises, and marks orphaned active jobs as errors after a service worker restart.

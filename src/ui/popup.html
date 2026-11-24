@@ -126,54 +126,51 @@
           <span id="clip-btn-spinner" class="spinner" hidden aria-hidden="true"></span>
           <span id="clip-btn-label">Clip to Google Drive</span>
         </button>
+        <p id="clip-submit-hint" class="submit-hint" hidden aria-live="polite"></p>
       </form>
 
-      <section id="progress-panel" class="progress-panel" hidden aria-live="polite">
-        <ol class="stage-steps" aria-label="Clip stages">
-          <li class="stage-step" data-step="0">
-            <span class="stage-dot"></span>
-            <span>Extract</span>
-          </li>
-          <li class="stage-step" data-step="1">
-            <span class="stage-dot"></span>
-            <span>Images</span>
-          </li>
-          <li class="stage-step" data-step="2">
-            <span class="stage-dot"></span>
-            <span>Upload</span>
-          </li>
-        </ol>
-
-        <div class="progress-header">
-          <span id="progress-status-label" class="progress-status-label"></span>
-          <span id="progress-badge" class="progress-badge" hidden></span>
+      <section id="submit-error-panel" class="submit-error-panel" hidden role="alert">
+        <div class="submit-error-content">
+          <p id="submit-error-title" class="submit-error-title"></p>
+          <p id="submit-error-message" class="submit-error-message"></p>
         </div>
+        <button
+          type="button"
+          id="submit-error-dismiss-btn"
+          class="queue-dismiss-btn"
+          aria-label="Dismiss error"
+          title="Dismiss"
+        >
+          ×
+        </button>
+      </section>
 
-        <div id="progress-bar-track" class="progress-bar-track" hidden>
-          <div id="progress-bar-fill" class="progress-bar-fill"></div>
-        </div>
-
-        <p id="progress-detail" class="progress-detail" hidden></p>
-
-        <div id="progress-result-actions" class="progress-result-actions" hidden>
-          <a
-            id="result-drive-link"
-            class="drive-link-btn"
-            href="#"
-            target="_blank"
-            rel="noopener noreferrer"
+      <section
+        id="clip-queue-panel"
+        class="queue-panel"
+        hidden
+        aria-live="polite"
+        aria-label="Clip queue"
+      >
+        <div class="queue-header">
+          <div class="queue-heading-group">
+            <h2 class="queue-title">Clip queue</h2>
+            <span
+              id="clip-queue-summary"
+              class="queue-summary-badge"
+              data-testid="clip-queue-summary"
+            ></span>
+          </div>
+          <button
+            type="button"
+            id="clear-done-jobs-btn"
+            class="queue-clear-btn"
+            hidden
           >
-            <span>Open folder in Google Drive</span>
-            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M6.5 3.5h6v6m0-6-8 8" />
-            </svg>
-          </a>
+            Clear done
+          </button>
         </div>
-
-        <details id="warnings-details" class="warnings-details" hidden>
-          <summary id="warnings-summary" class="warnings-summary"></summary>
-          <ul id="warnings-list" class="warnings-list"></ul>
-        </details>
+        <ul id="clip-queue-list" class="queue-list" data-testid="clip-queue-list"></ul>
       </section>
 
       <details id="recent-clips-section" class="recent-clips">

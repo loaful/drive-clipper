@@ -8,6 +8,7 @@ import {
   type AuthStatus,
   type BackgroundResponse,
   type ClipHistoryItem,
+  type ClipJob,
   type ClipProgressEvent,
   type ClipResult,
   type ExtensionSettings,
@@ -15,7 +16,12 @@ import {
   type UiMessageResponseMap,
   type UiToBackgroundMessage,
 } from '../../src/types.js';
-import { mountPopup, type PopupController } from '../../src/ui/popup.js';
+import {
+  describeClipJob,
+  formatQueueSummary,
+  mountPopup,
+  type PopupController,
+} from '../../src/ui/popup.js';
 import type { UiRuntimeClient } from '../../src/ui/shared.js';
 
 const POPUP_HTML = readFileSync(
@@ -38,28 +44,76 @@ function loadPopupDom(): HTMLElement {
   return root;
 }
 
+function makeClipResult(overrides: Partial<ClipResult> = {}): ClipResult {
+  return {
+    folderId: 'fld-1',
+    folderUrl: 'https://drive.google.com/drive/folders/fld-1',
+    folderName: '2026-11-24-how-v8-compiles-javascript',
+    readmeFileId: 'file-1',
+    title: 'How V8 Compiles JavaScript',
+    sourceUrl: 'https://example.com/articles/v8-compiler',
+    clippedAt: FIXED_NOW.toISOString(),
+    uploadedImages: [],
+    failedImages: [],
+    warnings: [],
+    reusedFolder: false,
+    ...overrides,
+  };
+}
+
+function makeJob(overrides: Partial<ClipJob> = {}): ClipJob {
+  return {
+    id: 'job-1',
+    tabId: 42,
+    url: 'https://example.com/articles/v8-compiler',
+    title: 'How V8 Compiles JavaScript',
+    folderName: '2026-11-24-how-v8-compiles-javascript',
+    mode: 'full',
+    status: 'queued',
+    message: 'Queued for background upload',
+    createdAt: '2026-11-24T10:29:00.000Z',
+    updatedAt: '2026-11-24T10:29:01.000Z',
+    ...overrides,
+  };
+}
+
 interface MockRuntimeConfig {
   settings?: ExtensionSettings;
   authStatus?: AuthStatus;
   pageInfo?: BackgroundResponse<PageInfo>;
   history?: ClipHistoryItem[];
+  jobs?: ClipJob[];
   manifestOAuthConfigured?: boolean | null;
   onStartClip?: (
     message: Extract<UiToBackgroundMessage, { type: 'START_CLIP' }>,
-    emitProgress: (event: ClipProgressEvent) => void,
-  ) => Promise<BackgroundResponse<ClipResult>>;
+    helpers: {
+      emitJobs: (jobs: ClipJob[]) => void;
+      emitProgress: (event: ClipProgressEvent) => void;
+    },
+  ) => Promise<BackgroundResponse<ClipJob>>;
+  onDismissJob?: (jobId: string, currentJobs: ClipJob[]) => Promise<BackgroundResponse<ClipJob[]>>;
+  onClearCompleted?: (currentJobs: ClipJob[]) => Promise<BackgroundResponse<ClipJob[]>>;
   onSignIn?: () => Promise<BackgroundResponse<AuthStatus>>;
 }
 
 function createMockRuntime(config: MockRuntimeConfig = {}) {
   const progressListeners = new Set<(event: ClipProgressEvent) => void>();
+  const jobsListeners = new Set<(jobs: ClipJob[]) => void>();
   const sentMessages: UiToBackgroundMessage[] = [];
   const openOptionsPage = vi.fn();
   let currentHistory = [...(config.history ?? [])];
+  let currentJobs = [...(config.jobs ?? [])];
 
   const emitProgress = (event: ClipProgressEvent): void => {
     for (const listener of progressListeners) {
       listener(event);
+    }
+  };
+
+  const emitJobs = (jobs: ClipJob[]): void => {
+    currentJobs = [...jobs];
+    for (const listener of jobsListeners) {
+      listener([...currentJobs]);
     }
   };
 
@@ -105,6 +159,36 @@ function createMockRuntime(config: MockRuntimeConfig = {}) {
             ok: true,
             data: currentHistory as UiMessageResponseMap[K],
           };
+        case 'GET_CLIP_JOBS':
+          return {
+            ok: true,
+            data: [...currentJobs] as UiMessageResponseMap[K],
+          };
+        case 'DISMISS_CLIP_JOB':
+          if (config.onDismissJob) {
+            return (await config.onDismissJob(
+              msg.jobId,
+              currentJobs,
+            )) as BackgroundResponse<UiMessageResponseMap[K]>;
+          }
+          currentJobs = currentJobs.filter((job) => job.id !== msg.jobId);
+          return {
+            ok: true,
+            data: [...currentJobs] as UiMessageResponseMap[K],
+          };
+        case 'CLEAR_COMPLETED_JOBS':
+          if (config.onClearCompleted) {
+            return (await config.onClearCompleted(currentJobs)) as BackgroundResponse<
+              UiMessageResponseMap[K]
+            >;
+          }
+          currentJobs = currentJobs.filter(
+            (job) => job.status !== 'done' && job.status !== 'error',
+          );
+          return {
+            ok: true,
+            data: [...currentJobs] as UiMessageResponseMap[K],
+          };
         case 'SIGN_IN':
           if (config.onSignIn) {
             return (await config.onSignIn()) as BackgroundResponse<
@@ -120,10 +204,10 @@ function createMockRuntime(config: MockRuntimeConfig = {}) {
           };
         case 'START_CLIP':
           if (config.onStartClip) {
-            return (await config.onStartClip(
-              msg,
+            return (await config.onStartClip(msg, {
+              emitJobs,
               emitProgress,
-            )) as BackgroundResponse<UiMessageResponseMap[K]>;
+            })) as BackgroundResponse<UiMessageResponseMap[K]>;
           }
           return {
             ok: false,
@@ -139,6 +223,12 @@ function createMockRuntime(config: MockRuntimeConfig = {}) {
         progressListeners.delete(listener);
       };
     },
+    onClipJobsUpdated(listener) {
+      jobsListeners.add(listener);
+      return () => {
+        jobsListeners.delete(listener);
+      };
+    },
     openOptionsPage,
     getManifestOAuthConfigured: () => config.manifestOAuthConfigured ?? true,
   };
@@ -148,8 +238,12 @@ function createMockRuntime(config: MockRuntimeConfig = {}) {
     sentMessages,
     openOptionsPage,
     emitProgress,
+    emitJobs,
     setHistory(items: ClipHistoryItem[]) {
       currentHistory = [...items];
+    },
+    setJobs(jobs: ClipJob[]) {
+      currentJobs = [...jobs];
     },
   };
 }
@@ -163,12 +257,23 @@ describe('Popup UI', () => {
     document.body.innerHTML = '';
   });
 
-  it('renders page title and updates YYYY-MM-DD-<slug> folder preview live', async () => {
+  it('renders cleaned page title preview and updates YYYY-MM-DD-<slug> folder preview live', async () => {
     const root = loadPopupDom();
     const mock = createMockRuntime({
       settings: {
         ...DEFAULT_EXTENSION_SETTINGS,
         rootFolderName: 'MyArchive',
+      },
+      pageInfo: {
+        ok: true,
+        data: {
+          tabId: 42,
+          url: 'https://www.zhihu.com/question/12345',
+          title: '(20 封私信 / 17 条消息) 华硕 ProArt 显示器评测',
+          hasSelection: false,
+          selectionLength: 0,
+          site: 'zhihu.com',
+        },
       },
     });
 
@@ -181,15 +286,16 @@ describe('Popup UI', () => {
     const folderPreview = root.querySelector<HTMLElement>('#folder-preview')!;
     const rootPrefix = root.querySelector<HTMLElement>('#root-folder-prefix')!;
 
-    expect(titleInput.value).toBe('How V8 Compiles JavaScript');
+    expect(titleInput.value).toBe('华硕 ProArt 显示器评测');
     expect(rootPrefix.textContent).toBe('MyArchive/');
-    expect(folderPreview.textContent).toBe(
-      '2026-11-24-how-v8-compiles-javascript',
-    );
+    expect(folderPreview.textContent).toBe('2026-11-24-华硕-proart-显示器评测');
 
-    titleInput.value = '深入理解 Chrome MV3 & OAuth!';
+    // Preserves legitimate parenthetical years and never alters manual edits
+    titleInput.value = '(2026) 深入理解 Chrome MV3 & OAuth!';
     titleInput.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(folderPreview.textContent).toBe('2026-11-24-深入理解-chrome-mv3-oauth');
+    expect(folderPreview.textContent).toBe(
+      '2026-11-24-2026-深入理解-chrome-mv3-oauth',
+    );
 
     titleInput.value = '   ';
     titleInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -209,19 +315,12 @@ describe('Popup UI', () => {
         clipRequests.push(msg);
         return {
           ok: true,
-          data: {
-            folderId: 'fld-1',
-            folderUrl: 'https://drive.google.com/drive/folders/fld-1',
-            folderName: '2026-11-24-how-v8-compiles-javascript',
-            readmeFileId: 'file-1',
-            title: msg.request.title ?? '',
-            sourceUrl: 'https://example.com/articles/v8-compiler',
-            clippedAt: FIXED_NOW.toISOString(),
-            uploadedImages: [],
-            failedImages: [],
-            warnings: [],
-            reusedFolder: false,
-          },
+          data: makeJob({
+            id: 'job-tags',
+            title: msg.request.title ?? 'Untitled',
+            folderName: msg.request.folderName ?? '2026-11-24-how-v8-compiles-javascript',
+            status: 'queued',
+          }),
         };
       },
     });
@@ -339,16 +438,335 @@ describe('Popup UI', () => {
     expect(selBtn2.disabled).toBe(true);
   });
 
-  it('tracks live stage transitions and renders saved Drive link with collapsible warnings', async () => {
+  it('hydrates active and finished multi-tab jobs immediately from GET_CLIP_JOBS when reopening popup mid-clip', async () => {
     const root = loadPopupDom();
-    let resolveClip!: (res: BackgroundResponse<ClipResult>) => void;
-    let pushProgress!: (event: ClipProgressEvent) => void;
+    const jobs: ClipJob[] = [
+      makeJob({
+        id: 'job-dl',
+        tabId: 10,
+        url: 'https://tab-a.example.com/post',
+        title: 'Tab A Deep Dive',
+        status: 'downloading',
+        completed: 14,
+        total: 29,
+      }),
+      makeJob({
+        id: 'job-up',
+        tabId: 11,
+        url: 'https://tab-b.example.com/post',
+        title: 'Tab B Architecture',
+        status: 'uploading',
+        completed: 8,
+        total: 30,
+      }),
+      makeJob({
+        id: 'job-queued',
+        tabId: 12,
+        url: 'https://tab-c.example.com/post',
+        title: 'Tab C Waiting',
+        status: 'queued',
+      }),
+      makeJob({
+        id: 'job-done',
+        tabId: 13,
+        url: 'https://tab-d.example.com/post',
+        title: 'Tab D Finished',
+        status: 'done',
+        result: makeClipResult({
+          folderId: 'drive-folder-d',
+          folderUrl: 'https://drive.google.com/drive/folders/drive-folder-d',
+          uploadedImages: Array.from({ length: 29 }, (_, idx) => ({
+            id: `img-${idx}`,
+            filename: `${idx}.png`,
+            fileId: `f-${idx}`,
+            mimeType: 'image/png',
+            resolvedUrl: `https://tab-d.example.com/${idx}.png`,
+          })),
+          warnings: ['Kept remote URL for https://tab-d.example.com/missing.png (HTTP 404)'],
+        }),
+      }),
+      makeJob({
+        id: 'job-err',
+        tabId: 14,
+        url: 'https://tab-e.example.com/post',
+        title: 'Tab E Failed',
+        status: 'error',
+        error: 'Drive quota exceeded',
+        errorCode: 'DRIVE_ERROR',
+      }),
+    ];
 
     const mock = createMockRuntime({
-      onStartClip: async (_msg, emitProgress) => {
-        pushProgress = emitProgress;
+      jobs,
+      pageInfo: {
+        ok: true,
+        data: {
+          tabId: 99,
+          url: 'https://fresh-tab.example.com/article',
+          title: 'Fresh Unclipped Tab',
+          hasSelection: false,
+          selectionLength: 0,
+          site: 'fresh-tab.example.com',
+        },
+      },
+    });
+
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    expect(mock.sentMessages.some((m) => m.type === 'GET_CLIP_JOBS')).toBe(true);
+    expect(controller.getJobs()).toHaveLength(5);
+
+    const queuePanel = root.querySelector<HTMLElement>('#clip-queue-panel')!;
+    const summary = root.querySelector<HTMLElement>('#clip-queue-summary')!;
+    const clearBtn = root.querySelector<HTMLButtonElement>('#clear-done-jobs-btn')!;
+    const rows = Array.from(root.querySelectorAll<HTMLLIElement>('.queue-item'));
+
+    expect(queuePanel.hidden).toBe(false);
+    expect(summary.textContent).toBe('2 running · 1 queued');
+    expect(clearBtn.hidden).toBe(false);
+    expect(rows).toHaveLength(5);
+
+    // Downloading row with progress bar and no dismiss button
+    expect(rows[0]?.querySelector('.queue-item-title')?.textContent).toBe('Tab A Deep Dive');
+    expect(rows[0]?.querySelector('.queue-item-detail')?.textContent).toBe('Downloading 14/29');
+    expect(rows[0]?.querySelector<HTMLElement>('.queue-progress-fill')?.style.width).toBe('48%');
+    expect(rows[0]?.querySelector('[data-dismiss-job]')).toBeNull();
+
+    // Uploading row
+    expect(rows[1]?.querySelector('.queue-item-detail')?.textContent).toBe('Uploading 8/30');
+    expect(rows[1]?.querySelector<HTMLElement>('.queue-progress-fill')?.style.width).toBe('27%');
+
+    // Queued row
+    expect(rows[2]?.querySelector('.queue-item-detail')?.textContent).toBe('Queued');
+    expect(rows[2]?.querySelector('.queue-progress-track')).toBeNull();
+
+    // Done row with Open ↗ link, collapsible warning badge, and dismiss button
+    expect(rows[3]?.querySelector('.queue-item-detail')?.textContent).toBe('Saved · 29 images');
+    expect(rows[3]?.querySelector<HTMLAnchorElement>('.queue-open-link')?.href).toBe(
+      'https://drive.google.com/drive/folders/drive-folder-d',
+    );
+    expect(rows[3]?.querySelector('.queue-open-link')?.textContent).toBe('Open ↗');
+    const warnDetails = rows[3]?.querySelector<HTMLDetailsElement>('.queue-warnings')!;
+    expect(warnDetails.open).toBe(false);
+    expect(warnDetails.querySelector('.queue-warning-badge')?.textContent).toContain('1 warning');
+    expect(warnDetails.querySelectorAll('.queue-warnings-list li')).toHaveLength(1);
+    expect(rows[3]?.querySelector('[data-dismiss-job="job-done"]')).not.toBeNull();
+
+    // Error row with error detail and dismiss button
+    expect(rows[4]?.querySelector('.queue-item-detail')?.textContent).toBe('Drive quota exceeded');
+    expect(rows[4]?.querySelector('.queue-open-link')).toBeNull();
+    expect(rows[4]?.querySelector('[data-dismiss-job="job-err"]')).not.toBeNull();
+
+    // Opening Popup on an unclipped tab allows clipping immediately while others run
+    expect(root.querySelector<HTMLButtonElement>('#clip-submit-btn')!.disabled).toBe(false);
+    expect(root.querySelector<HTMLElement>('#clip-submit-hint')!.hidden).toBe(true);
+  });
+
+  it('tracks live CLIP_JOBS_UPDATED transitions, refreshes Recent clips on done, and preserves expanded warnings', async () => {
+    const root = loadPopupDom();
+    const mock = createMockRuntime();
+
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    const queuePanel = root.querySelector<HTMLElement>('#clip-queue-panel')!;
+    expect(queuePanel.hidden).toBe(true);
+
+    // Push live extracting -> downloading -> uploading -> done transitions
+    mock.emitJobs([
+      makeJob({
+        id: 'job-live',
+        url: 'https://other.example.com/live',
+        title: 'Live Streaming Clip',
+        status: 'extracting',
+      }),
+    ]);
+
+    expect(queuePanel.hidden).toBe(false);
+    expect(root.querySelector('#clip-queue-summary')?.textContent).toBe('1 running');
+    expect(root.querySelector('.queue-item-detail')?.textContent).toBe('Extracting...');
+
+    mock.emitJobs([
+      makeJob({
+        id: 'job-live',
+        url: 'https://other.example.com/live',
+        title: 'Live Streaming Clip',
+        status: 'downloading',
+        completed: 2,
+        total: 5,
+      }),
+    ]);
+    expect(root.querySelector('.queue-item-detail')?.textContent).toBe('Downloading 2/5');
+    expect(root.querySelector<HTMLElement>('.queue-progress-fill')?.style.width).toBe('40%');
+
+    mock.emitJobs([
+      makeJob({
+        id: 'job-live',
+        url: 'https://other.example.com/live',
+        title: 'Live Streaming Clip',
+        status: 'uploading',
+        completed: 4,
+        total: 5,
+      }),
+    ]);
+    expect(root.querySelector('.queue-item-detail')?.textContent).toBe('Uploading 4/5');
+    expect(root.querySelector<HTMLElement>('.queue-progress-fill')?.style.width).toBe('80%');
+
+    // Update history store before transitioning job to done
+    mock.setHistory([
+      {
+        id: 'hist-live',
+        title: 'Live Streaming Clip',
+        sourceUrl: 'https://other.example.com/live',
+        folderId: 'drive-folder-live',
+        folderUrl: 'https://drive.google.com/drive/folders/drive-folder-live',
+        folderName: '2026-11-24-live-streaming-clip',
+        clippedAt: FIXED_NOW.toISOString(),
+        imageCount: 1,
+        warningCount: 1,
+      },
+    ]);
+
+    const doneJob = makeJob({
+      id: 'job-live',
+      url: 'https://other.example.com/live',
+      title: 'Live Streaming Clip',
+      status: 'done',
+      result: makeClipResult({
+        folderId: 'drive-folder-live',
+        folderUrl: 'https://drive.google.com/drive/folders/drive-folder-live',
+        title: 'Live Streaming Clip',
+        uploadedImages: [
+          {
+            id: 'img-1',
+            filename: '01-hero.webp',
+            fileId: 'f1',
+            mimeType: 'image/webp',
+            resolvedUrl: 'https://other.example.com/hero.webp',
+          },
+        ],
+        warnings: ['Kept remote URL for https://other.example.com/missing.png (HTTP 404)'],
+      }),
+    });
+    mock.emitJobs([doneJob]);
+
+    expect(root.querySelector('#clip-queue-summary')?.textContent).toBe('1 saved');
+    expect(root.querySelector('.queue-item-detail')?.textContent).toBe('Saved · 1 image');
+    expect(root.querySelector<HTMLAnchorElement>('.queue-open-link')?.href).toBe(
+      'https://drive.google.com/drive/folders/drive-folder-live',
+    );
+
+    // Recent clips auto-refreshed when job transitioned to done
+    await vi.waitFor(() =>
+      expect(root.querySelector('#recent-clips-count')?.textContent).toBe('1'),
+    );
+
+    // Expand warnings on job-live, then push a progress tick for a second job and verify details stays open
+    const details = root.querySelector<HTMLDetailsElement>(
+      '[data-job-warnings="job-live"]',
+    )!;
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+
+    mock.emitJobs([
+      makeJob({
+        id: 'job-second',
+        url: 'https://second.example.com/post',
+        title: 'Second Tab',
+        status: 'downloading',
+        completed: 1,
+        total: 4,
+      }),
+      doneJob,
+    ]);
+
+    const reRenderedDetails = root.querySelector<HTMLDetailsElement>(
+      '[data-job-warnings="job-live"]',
+    )!;
+    expect(reRenderedDetails.open).toBe(true);
+  });
+
+  it('supports non-blocking submit, guards duplicate active URL on current tab, and re-enables once finished', async () => {
+    const root = loadPopupDom();
+    let resolveStartClip!: (res: BackgroundResponse<ClipJob>) => void;
+
+    const mock = createMockRuntime({
+      onStartClip: async () =>
+        new Promise<BackgroundResponse<ClipJob>>((resolve) => {
+          resolveStartClip = resolve;
+        }),
+    });
+
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    const submitBtn = root.querySelector<HTMLButtonElement>('#clip-submit-btn')!;
+    const submitLabel = root.querySelector<HTMLElement>('#clip-btn-label')!;
+    const submitSpinner = root.querySelector<HTMLElement>('#clip-btn-spinner')!;
+    const submitHint = root.querySelector<HTMLElement>('#clip-submit-hint')!;
+    const titleInput = root.querySelector<HTMLInputElement>('#title-input')!;
+
+    root
+      .querySelector<HTMLFormElement>('#clip-form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    // Brief submitting state while START_CLIP is accepted
+    expect(submitBtn.disabled).toBe(true);
+    expect(submitSpinner.hidden).toBe(false);
+    expect(submitLabel.textContent).toBe('Starting clip...');
+
+    const acceptedJob = makeJob({
+      id: 'job-current',
+      tabId: 42,
+      url: 'https://example.com/articles/v8-compiler#intro',
+      title: 'How V8 Compiles JavaScript',
+      status: 'queued',
+      updatedAt: '2026-11-24T10:30:01.000Z',
+    });
+
+    resolveStartClip({ ok: true, data: acceptedJob });
+
+    await vi.waitFor(() => expect(submitSpinner.hidden).toBe(true));
+    expect(submitLabel.textContent).toBe('Clip to Google Drive');
+    // Inputs re-enabled immediately, while button stays guarded for duplicate active URL
+    expect(titleInput.disabled).toBe(false);
+    expect(submitBtn.disabled).toBe(true);
+    expect(submitHint.hidden).toBe(false);
+    expect(submitHint.textContent).toBe('Already clipping this page');
+    expect(root.querySelectorAll('.queue-item')).toHaveLength(1);
+
+    // Once job completes, submit button automatically re-enables for idempotent re-clip
+    mock.emitJobs([
+      {
+        ...acceptedJob,
+        status: 'done',
+        updatedAt: '2026-11-24T10:30:10.000Z',
+        result: makeClipResult({ reusedFolder: true }),
+      },
+    ]);
+
+    expect(submitBtn.disabled).toBe(false);
+    expect(submitHint.hidden).toBe(true);
+    expect(root.querySelector('.queue-item-detail')?.textContent).toBe('Updated');
+  });
+
+  it('does not regress a newer CLIP_JOBS_UPDATED state when START_CLIP resolves later', async () => {
+    const root = loadPopupDom();
+    let resolveStartClip!: (res: BackgroundResponse<ClipJob>) => void;
+    let pushJobs!: (jobs: ClipJob[]) => void;
+
+    const mock = createMockRuntime({
+      onStartClip: async (_msg, helpers) => {
+        pushJobs = helpers.emitJobs;
         return new Promise((resolve) => {
-          resolveClip = resolve;
+          resolveStartClip = resolve;
         });
       },
     });
@@ -358,109 +776,148 @@ describe('Popup UI', () => {
       now: () => FIXED_NOW,
     });
 
-    const submitBtn = root.querySelector<HTMLButtonElement>('#clip-submit-btn')!;
-    const panel = root.querySelector<HTMLElement>('#progress-panel')!;
-    const statusLabel = root.querySelector<HTMLElement>('#progress-status-label')!;
-    const barFill = root.querySelector<HTMLElement>('#progress-bar-fill')!;
-    const driveLink = root.querySelector<HTMLAnchorElement>('#result-drive-link')!;
-    const warningsDetails =
-      root.querySelector<HTMLDetailsElement>('#warnings-details')!;
-    const warningsSummary = root.querySelector<HTMLElement>('#warnings-summary')!;
-    const warningsList = root.querySelector<HTMLUListElement>('#warnings-list')!;
-
-    expect(panel.hidden).toBe(true);
-
     root
       .querySelector<HTMLFormElement>('#clip-form')!
       .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
 
-    expect(panel.hidden).toBe(false);
-    expect(submitBtn.disabled).toBe(true);
-    expect(statusLabel.textContent).toBe('Extracting page...');
-
-    pushProgress({
-      clipId: 'c1',
-      stage: 'downloading',
-      message: 'Downloading images...',
-      completed: 2,
-      total: 5,
-    });
-    expect(statusLabel.textContent).toBe('Downloading images (2/5)...');
-    expect(barFill.style.width).toBe('40%');
-
-    pushProgress({
-      clipId: 'c1',
-      stage: 'uploading',
-      message: 'Uploading to Drive...',
-      completed: 4,
-      total: 5,
-    });
-    expect(statusLabel.textContent).toBe('Uploading to Google Drive (4/5)...');
-    expect(barFill.style.width).toBe('80%');
-
-    mock.setHistory([
-      {
-        id: 'hist-1',
-        title: 'How V8 Compiles JavaScript',
-        sourceUrl: 'https://example.com/articles/v8-compiler',
-        folderId: 'drive-folder-99',
-        folderUrl: 'https://drive.google.com/drive/folders/drive-folder-99',
-        folderName: '2026-11-24-how-v8-compiles-javascript',
-        clippedAt: FIXED_NOW.toISOString(),
-        imageCount: 4,
-        warningCount: 1,
-      },
+    // Newer push arrives before START_CLIP RPC callback resolves
+    pushJobs([
+      makeJob({
+        id: 'job-race',
+        status: 'downloading',
+        completed: 3,
+        total: 10,
+        updatedAt: '2026-11-24T10:30:05.000Z',
+      }),
     ]);
 
-    resolveClip({
+    resolveStartClip({
       ok: true,
-      data: {
-        folderId: 'drive-folder-99',
-        folderUrl: 'https://drive.google.com/drive/folders/drive-folder-99',
-        folderName: '2026-11-24-how-v8-compiles-javascript',
-        readmeFileId: 'readme-1',
-        title: 'How V8 Compiles JavaScript',
-        sourceUrl: 'https://example.com/articles/v8-compiler',
-        clippedAt: FIXED_NOW.toISOString(),
-        uploadedImages: [
-          {
-            id: 'img-01',
-            filename: '01-hero.webp',
-            fileId: 'f1',
-            mimeType: 'image/webp',
-            resolvedUrl: 'https://example.com/hero.webp',
-          },
-        ],
-        failedImages: [
-          {
-            id: 'img-02',
-            originalUrl: 'https://example.com/missing.png',
-            resolvedUrl: 'https://example.com/missing.png',
-            sourceUrls: ['https://example.com/missing.png'],
-            reason: 'HTTP 404',
-            status: 404,
-          },
-        ],
-        warnings: ['Kept remote URL for https://example.com/missing.png (HTTP 404)'],
-        reusedFolder: false,
-      },
+      data: makeJob({
+        id: 'job-race',
+        status: 'queued',
+        updatedAt: '2026-11-24T10:30:01.000Z',
+      }),
     });
 
-    await vi.waitFor(() => expect(statusLabel.textContent).toBe('Saved'));
-    expect(submitBtn.disabled).toBe(false);
-    expect(driveLink.href).toBe(
-      'https://drive.google.com/drive/folders/drive-folder-99',
-    );
-    expect(warningsDetails.hidden).toBe(false);
-    expect(warningsDetails.open).toBe(false);
-    expect(warningsSummary.textContent).toContain('1 warning');
-    expect(warningsList.querySelectorAll('li')).toHaveLength(1);
-    expect(warningsList.textContent).toContain('HTTP 404');
-
-    // History refreshed after save
     await vi.waitFor(() =>
-      expect(root.querySelector('#recent-clips-count')?.textContent).toBe('1'),
+      expect(root.querySelector<HTMLElement>('#clip-btn-spinner')!.hidden).toBe(true),
     );
+    expect(root.querySelector('.queue-item-detail')?.textContent).toBe('Downloading 3/10');
+  });
+
+  it('renders 12 concurrent multi-tab jobs cleanly and supports single-job dismiss and Clear done', async () => {
+    const root = loadPopupDom();
+    const twelveJobs: ClipJob[] = Array.from({ length: 12 }, (_, idx) => {
+      const n = idx + 1;
+      if (idx < 2) {
+        return makeJob({
+          id: `job-${n}`,
+          tabId: 100 + n,
+          url: `https://site-${n}.example.com/article`,
+          title: `Concurrent Article ${n} with a very long headline that truncates cleanly`,
+          status: idx === 0 ? 'downloading' : 'uploading',
+          completed: n * 3,
+          total: 20,
+        });
+      }
+      if (idx < 9) {
+        return makeJob({
+          id: `job-${n}`,
+          tabId: 100 + n,
+          url: `https://site-${n}.example.com/article`,
+          title: `Queued Article ${n}`,
+          status: 'queued',
+        });
+      }
+      if (idx < 11) {
+        return makeJob({
+          id: `job-${n}`,
+          tabId: 100 + n,
+          url: `https://site-${n}.example.com/article`,
+          title: `Finished Article ${n}`,
+          status: 'done',
+          result: makeClipResult({
+            folderId: `fld-${n}`,
+            folderUrl: `https://drive.google.com/drive/folders/fld-${n}`,
+            title: `Finished Article ${n}`,
+          }),
+        });
+      }
+      return makeJob({
+        id: `job-${n}`,
+        tabId: 100 + n,
+        url: `https://site-${n}.example.com/article`,
+        title: `Failed Article ${n}`,
+        status: 'error',
+        error: 'Network timeout',
+      });
+    });
+
+    const mock = createMockRuntime({ jobs: twelveJobs });
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    const summary = root.querySelector<HTMLElement>('#clip-queue-summary')!;
+    const clearBtn = root.querySelector<HTMLButtonElement>('#clear-done-jobs-btn')!;
+    const rows = root.querySelectorAll<HTMLLIElement>('.queue-item');
+
+    expect(rows).toHaveLength(12);
+    expect(summary.textContent).toBe('2 running · 7 queued');
+    expect(clearBtn.hidden).toBe(false);
+    expect(rows[0]?.querySelector<HTMLElement>('.queue-item-title')?.title).toContain(
+      'Concurrent Article 1',
+    );
+    // Only finished/failed rows (jobs 10, 11, 12) have dismiss buttons
+    expect(root.querySelectorAll('[data-dismiss-job]')).toHaveLength(3);
+    // Only done rows (jobs 10, 11) have Open links
+    expect(root.querySelectorAll('.queue-open-link')).toHaveLength(2);
+
+    // Dismiss single failed job
+    root.querySelector<HTMLButtonElement>('[data-dismiss-job="job-12"]')!.click();
+    await vi.waitFor(() =>
+      expect(root.querySelectorAll('.queue-item')).toHaveLength(11),
+    );
+    expect(mock.sentMessages).toContainEqual({
+      type: 'DISMISS_CLIP_JOB',
+      jobId: 'job-12',
+    });
+
+    // Clear remaining completed jobs
+    clearBtn.click();
+    await vi.waitFor(() =>
+      expect(root.querySelectorAll('.queue-item')).toHaveLength(9),
+    );
+    expect(mock.sentMessages).toContainEqual({ type: 'CLEAR_COMPLETED_JOBS' });
+    expect(clearBtn.hidden).toBe(true);
+    expect(summary.textContent).toBe('2 running · 7 queued');
+  });
+
+  it('hides Clip queue when the final completed job is cleared', async () => {
+    const root = loadPopupDom();
+    const mock = createMockRuntime({
+      jobs: [
+        makeJob({
+          id: 'job-only',
+          status: 'done',
+          result: makeClipResult(),
+        }),
+      ],
+    });
+
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    const panel = root.querySelector<HTMLElement>('#clip-queue-panel')!;
+    expect(panel.hidden).toBe(false);
+    expect(root.querySelector('#clip-queue-summary')?.textContent).toBe('1 saved');
+
+    root.querySelector<HTMLButtonElement>('#clear-done-jobs-btn')!.click();
+    await vi.waitFor(() => expect(panel.hidden).toBe(true));
   });
 
   it('shows first-run onboarding banner for unconfigured OAuth and opens Options', async () => {
@@ -627,13 +1084,43 @@ describe('Popup UI', () => {
 
     await vi.waitFor(() =>
       expect(
-        rootError.querySelector<HTMLElement>('#progress-status-label')!
-          .textContent,
+        rootError.querySelector<HTMLElement>('#submit-error-title')!.textContent,
       ).toBe('Sign in required'),
     );
+    expect(
+      rootError.querySelector<HTMLElement>('#submit-error-panel')!.hidden,
+    ).toBe(false);
     expect(controller.getBannerState().kind).toBe('signed-out');
     expect(
       rootError.querySelector<HTMLButtonElement>('#banner-signin-btn')!.hidden,
     ).toBe(false);
+
+    // Dismissing inline submit error hides it cleanly
+    rootError.querySelector<HTMLButtonElement>('#submit-error-dismiss-btn')!.click();
+    expect(
+      rootError.querySelector<HTMLElement>('#submit-error-panel')!.hidden,
+    ).toBe(true);
+  });
+
+  it('formats queue summaries and job presentations accurately across all states', () => {
+    expect(
+      formatQueueSummary([
+        makeJob({ id: '1', status: 'done' }),
+        makeJob({ id: '2', status: 'done' }),
+        makeJob({ id: '3', status: 'error' }),
+      ]),
+    ).toBe('2 saved · 1 failed');
+
+    const authErrPresentation = describeClipJob(
+      makeJob({
+        id: 'err-auth',
+        status: 'error',
+        error: 'raw',
+        errorCode: 'AUTH_REQUIRED',
+      }),
+    );
+    expect(authErrPresentation.detail).toContain('Sign in to Google Drive');
+    expect(authErrPresentation.canDismiss).toBe(true);
+    expect(authErrPresentation.canOpen).toBe(false);
   });
 });

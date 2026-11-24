@@ -1,12 +1,13 @@
-import { buildArticleFolderName } from '../core/frontmatter.js';
+import { buildArticleFolderName, cleanPageTitle } from '../core/frontmatter.js';
 import {
   DEFAULT_EXTENSION_SETTINGS,
+  isActiveClipJobStatus,
   type AuthStatus,
   type BackgroundErrorCode,
   type ClipHistoryItem,
+  type ClipJob,
+  type ClipJobStatus,
   type ClipMode,
-  type ClipProgressEvent,
-  type ClipResult,
   type ExtensionSettings,
   type PageInfo,
 } from '../types.js';
@@ -26,21 +27,19 @@ export type PopupBannerState =
   | { kind: 'signed-out'; message?: string }
   | { kind: 'unsupported-page'; url: string };
 
-export type ClipProgressViewState =
-  | { status: 'idle' }
-  | { status: 'extracting'; message: string }
-  | { status: 'downloading'; message: string; completed: number; total: number }
-  | { status: 'uploading'; message: string; completed: number; total: number }
-  | { status: 'done'; result: ClipResult }
-  | { status: 'error'; message: string; code?: BackgroundErrorCode };
+export type QueueSummaryState = 'active' | 'done' | 'error';
 
-export interface ProgressPresentation {
-  label: string;
+export type JobIndicatorKind = 'queued' | 'active' | 'done' | 'error';
+
+export interface ClipJobPresentation {
+  title: string;
   detail: string;
-  badge: string;
-  activeStep: number;
   percent: number | null;
-  stateAttr: 'running' | 'done' | 'error';
+  indicatorKind: JobIndicatorKind;
+  canOpen: boolean;
+  canDismiss: boolean;
+  folderUrl: string | null;
+  warnings: readonly string[];
 }
 
 export interface PopupMountOptions {
@@ -50,111 +49,121 @@ export interface PopupMountOptions {
 
 export interface PopupController {
   refresh(): Promise<void>;
-  getProgressState(): ClipProgressViewState;
+  getJobs(): ClipJob[];
   getBannerState(): PopupBannerState;
   destroy(): void;
 }
 
 const MAX_RECENT_CLIPS = 10;
 
-export function progressEventToViewState(
-  event: ClipProgressEvent,
-): ClipProgressViewState {
-  switch (event.stage) {
-    case 'extracting':
-      return { status: 'extracting', message: event.message };
-    case 'downloading':
-      return {
-        status: 'downloading',
-        message: event.message,
-        completed: event.completed,
-        total: event.total,
-      };
-    case 'uploading':
-      return {
-        status: 'uploading',
-        message: event.message,
-        completed: event.completed,
-        total: event.total,
-      };
-    case 'done':
-      return { status: 'done', result: event.result };
-    case 'error':
-      return { status: 'error', message: event.error || event.message };
+const JOB_STATUS_RANK: Record<ClipJobStatus, number> = {
+  extracting: 0,
+  queued: 1,
+  downloading: 2,
+  uploading: 3,
+  done: 4,
+  error: 4,
+};
+
+function isExistingJobNewerOrEqual(existing: ClipJob, incoming: ClipJob): boolean {
+  if (existing.updatedAt !== incoming.updatedAt) {
+    return existing.updatedAt > incoming.updatedAt;
+  }
+  const existingRank = JOB_STATUS_RANK[existing.status];
+  const incomingRank = JOB_STATUS_RANK[incoming.status];
+  if (existingRank !== incomingRank) {
+    return existingRank > incomingRank;
+  }
+  return (existing.completed ?? -1) >= (incoming.completed ?? -1);
+}
+
+export function normalizeComparableUrl(url: string): string {
+  const trimmed = url.trim();
+  if (trimmed.length === 0) {
+    return '';
+  }
+  try {
+    const parsed = new URL(trimmed);
+    parsed.hash = '';
+    return parsed.href;
+  } catch {
+    return trimmed;
   }
 }
 
-export function describeProgressState(
-  state: Exclude<ClipProgressViewState, { status: 'idle' }>,
-): ProgressPresentation {
-  switch (state.status) {
-    case 'extracting':
-      return {
-        label: 'Extracting page...',
-        detail: state.message && state.message !== 'Extracting page...' ? state.message : '',
-        badge: 'Step 1 of 3',
-        activeStep: 0,
-        percent: null,
-        stateAttr: 'running',
-      };
-    case 'downloading': {
-      const countText =
-        state.total > 0 ? ` (${state.completed}/${state.total})` : '';
-      const percent =
-        state.total > 0
-          ? Math.max(0, Math.min(100, Math.round((state.completed / state.total) * 100)))
-          : null;
-      return {
-        label: `Downloading images${countText}...`,
-        detail: '',
-        badge: 'Step 2 of 3',
-        activeStep: 1,
-        percent,
-        stateAttr: 'running',
-      };
-    }
-    case 'uploading': {
-      const countText =
-        state.total > 0 ? ` (${state.completed}/${state.total})` : '';
-      const percent =
-        state.total > 0
-          ? Math.max(0, Math.min(100, Math.round((state.completed / state.total) * 100)))
-          : null;
-      return {
-        label: `Uploading to Google Drive${countText}...`,
-        detail: '',
-        badge: 'Step 3 of 3',
-        activeStep: 2,
-        percent,
-        stateAttr: 'running',
-      };
-    }
-    case 'done': {
-      const imageCount = state.result.uploadedImages.length;
-      const imageSummary =
-        imageCount === 1 ? '1 image uploaded' : `${imageCount} images uploaded`;
-      const detail = state.result.reusedFolder
-        ? `Updated existing folder · ${imageSummary}`
-        : `${state.result.folderName} · ${imageSummary}`;
-      return {
-        label: 'Saved',
-        detail,
-        badge: state.result.reusedFolder ? 'Updated' : 'Complete',
-        activeStep: 3,
-        percent: 100,
-        stateAttr: 'done',
-      };
-    }
-    case 'error':
-      return {
-        label: formatErrorHeading(state.code),
-        detail: formatFriendlyErrorMessage(state.message, state.code),
-        badge: 'Failed',
-        activeStep: -1,
-        percent: null,
-        stateAttr: 'error',
-      };
+export function findActiveJobForUrl(
+  jobs: readonly ClipJob[],
+  url: string | null | undefined,
+): ClipJob | null {
+  if (!url) {
+    return null;
   }
+  const target = normalizeComparableUrl(url);
+  if (target.length === 0) {
+    return null;
+  }
+  return (
+    jobs.find(
+      (job) =>
+        isActiveClipJobStatus(job.status) &&
+        normalizeComparableUrl(job.url) === target,
+    ) ?? null
+  );
+}
+
+export function formatQueueSummary(jobs: readonly ClipJob[]): string {
+  let running = 0;
+  let queued = 0;
+  let done = 0;
+  let failed = 0;
+
+  for (const job of jobs) {
+    switch (job.status) {
+      case 'extracting':
+      case 'downloading':
+      case 'uploading':
+        running += 1;
+        break;
+      case 'queued':
+        queued += 1;
+        break;
+      case 'done':
+        done += 1;
+        break;
+      case 'error':
+        failed += 1;
+        break;
+    }
+  }
+
+  const parts: string[] = [];
+  if (running > 0) {
+    parts.push(`${running} running`);
+  }
+  if (queued > 0) {
+    parts.push(`${queued} queued`);
+  }
+  if (parts.length > 0) {
+    return parts.join(' · ');
+  }
+
+  if (done > 0) {
+    parts.push(`${done} saved`);
+  }
+  if (failed > 0) {
+    parts.push(`${failed} failed`);
+  }
+  return parts.join(' · ');
+}
+
+export function getQueueSummaryState(jobs: readonly ClipJob[]): QueueSummaryState {
+  if (jobs.some((job) => isActiveClipJobStatus(job.status))) {
+    return 'active';
+  }
+  if (jobs.some((job) => job.status === 'error')) {
+    return 'error';
+  }
+  return 'done';
 }
 
 function formatErrorHeading(code?: BackgroundErrorCode): string {
@@ -186,6 +195,117 @@ function formatFriendlyErrorMessage(
   return rawMessage || 'An unexpected error occurred while clipping this page.';
 }
 
+function computeProgressPercent(
+  completed: number | undefined,
+  total: number | undefined,
+): number | null {
+  if (typeof total !== 'number' || total <= 0) {
+    return null;
+  }
+  const safeCompleted =
+    typeof completed === 'number' && Number.isFinite(completed) && completed >= 0
+      ? completed
+      : 0;
+  return Math.max(0, Math.min(100, Math.round((safeCompleted / total) * 100)));
+}
+
+export function describeClipJob(job: ClipJob): ClipJobPresentation {
+  const title = job.title.trim() || job.folderName || job.url || 'Untitled';
+
+  switch (job.status) {
+    case 'queued':
+      return {
+        title,
+        detail: 'Queued',
+        percent: null,
+        indicatorKind: 'queued',
+        canOpen: false,
+        canDismiss: false,
+        folderUrl: null,
+        warnings: [],
+      };
+    case 'extracting':
+      return {
+        title,
+        detail: 'Extracting...',
+        percent: null,
+        indicatorKind: 'active',
+        canOpen: false,
+        canDismiss: false,
+        folderUrl: null,
+        warnings: [],
+      };
+    case 'downloading': {
+      const percent = computeProgressPercent(job.completed, job.total);
+      const detail =
+        typeof job.total === 'number' && job.total > 0
+          ? `Downloading ${job.completed ?? 0}/${job.total}`
+          : 'Downloading images...';
+      return {
+        title,
+        detail,
+        percent,
+        indicatorKind: 'active',
+        canOpen: false,
+        canDismiss: false,
+        folderUrl: null,
+        warnings: [],
+      };
+    }
+    case 'uploading': {
+      const percent = computeProgressPercent(job.completed, job.total);
+      const detail =
+        typeof job.total === 'number' && job.total > 0
+          ? `Uploading ${job.completed ?? 0}/${job.total}`
+          : 'Uploading...';
+      return {
+        title,
+        detail,
+        percent,
+        indicatorKind: 'active',
+        canOpen: false,
+        canDismiss: false,
+        folderUrl: null,
+        warnings: [],
+      };
+    }
+    case 'done': {
+      const result = job.result;
+      let detail = job.message || 'Saved';
+      if (result) {
+        const imageCount = result.uploadedImages.length;
+        const verb = result.reusedFolder ? 'Updated' : 'Saved';
+        detail =
+          imageCount > 0
+            ? `${verb} · ${imageCount === 1 ? '1 image' : `${imageCount} images`}`
+            : verb;
+      }
+      const folderUrl = result?.folderUrl || null;
+      return {
+        title,
+        detail,
+        percent: null,
+        indicatorKind: 'done',
+        canOpen: folderUrl !== null,
+        canDismiss: true,
+        folderUrl,
+        warnings: result?.warnings ?? [],
+      };
+    }
+    case 'error':
+      return {
+        title,
+        detail: formatFriendlyErrorMessage(job.error || job.message, job.errorCode),
+        percent: null,
+        indicatorKind: 'error',
+        canOpen: false,
+        canDismiss: true,
+        folderUrl: null,
+        warnings: [],
+      };
+  }
+}
+
 function queryRequired<T extends HTMLElement>(
   root: HTMLElement,
   selector: string,
@@ -195,6 +315,26 @@ function queryRequired<T extends HTMLElement>(
     throw new Error(`Popup markup missing required element: ${selector}`);
   }
   return element;
+}
+
+function createWarningChevron(): SVGSVGElement {
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('class', 'queue-warnings-chevron');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('width', '11');
+  svg.setAttribute('height', '11');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.8');
+  svg.setAttribute('aria-hidden', 'true');
+
+  const path = document.createElementNS(svgNS, 'path');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  path.setAttribute('d', 'm6 4 4 4-4 4');
+  svg.append(path);
+  return svg;
 }
 
 export async function mountPopup(
@@ -249,42 +389,35 @@ export async function mountPopup(
     '#clip-btn-spinner',
   );
   const clipBtnLabel = queryRequired<HTMLSpanElement>(root, '#clip-btn-label');
+  const clipSubmitHint = queryRequired<HTMLParagraphElement>(
+    root,
+    '#clip-submit-hint',
+  );
 
-  const progressPanel = queryRequired<HTMLElement>(root, '#progress-panel');
-  const stageSteps = Array.from(
-    root.querySelectorAll<HTMLLIElement>('.stage-step'),
-  );
-  const progressStatusLabel = queryRequired<HTMLSpanElement>(
+  const submitErrorPanel = queryRequired<HTMLElement>(root, '#submit-error-panel');
+  const submitErrorTitle = queryRequired<HTMLParagraphElement>(
     root,
-    '#progress-status-label',
+    '#submit-error-title',
   );
-  const progressBadge = queryRequired<HTMLSpanElement>(root, '#progress-badge');
-  const progressBarTrack = queryRequired<HTMLDivElement>(
+  const submitErrorMessage = queryRequired<HTMLParagraphElement>(
     root,
-    '#progress-bar-track',
+    '#submit-error-message',
   );
-  const progressBarFill = queryRequired<HTMLDivElement>(
+  const submitErrorDismissBtn = queryRequired<HTMLButtonElement>(
     root,
-    '#progress-bar-fill',
+    '#submit-error-dismiss-btn',
   );
-  const progressDetail = queryRequired<HTMLParagraphElement>(
+
+  const clipQueuePanel = queryRequired<HTMLElement>(root, '#clip-queue-panel');
+  const clipQueueSummary = queryRequired<HTMLSpanElement>(
     root,
-    '#progress-detail',
+    '#clip-queue-summary',
   );
-  const progressResultActions = queryRequired<HTMLDivElement>(
+  const clearDoneJobsBtn = queryRequired<HTMLButtonElement>(
     root,
-    '#progress-result-actions',
+    '#clear-done-jobs-btn',
   );
-  const resultDriveLink = queryRequired<HTMLAnchorElement>(
-    root,
-    '#result-drive-link',
-  );
-  const warningsDetails = queryRequired<HTMLDetailsElement>(
-    root,
-    '#warnings-details',
-  );
-  const warningsSummary = queryRequired<HTMLElement>(root, '#warnings-summary');
-  const warningsList = queryRequired<HTMLUListElement>(root, '#warnings-list');
+  const clipQueueList = queryRequired<HTMLUListElement>(root, '#clip-queue-list');
 
   const recentClipsCount = queryRequired<HTMLSpanElement>(
     root,
@@ -305,10 +438,17 @@ export async function mountPopup(
   let pageUnsupported = false;
   let pageUnsupportedUrl = '';
   let clipMode: ClipMode = 'full';
-  let isClipping = false;
+  let isSubmitting = false;
   let isSigningIn = false;
+  let isClearingDone = false;
+  let destroyed = false;
+  let jobsPushVersion = 0;
   let bannerState: PopupBannerState = { kind: 'none' };
-  let progressState: ClipProgressViewState = { status: 'idle' };
+  let clipJobs: ClipJob[] = [];
+  let submitError: { message: string; code?: BackgroundErrorCode } | null = null;
+  const lastKnownJobStatuses = new Map<string, ClipJobStatus>();
+  const expandedWarningJobIds = new Set<string>();
+  const dismissingJobIds = new Set<string>();
 
   const tagEditor: TagEditorController = createTagEditor({
     container: tagsContainer,
@@ -322,6 +462,22 @@ export async function mountPopup(
     folderPreview.textContent = buildArticleFolderName(titleInput.value, now());
   };
 
+  const renderSubmitError = (): void => {
+    if (!submitError) {
+      submitErrorPanel.hidden = true;
+      submitErrorTitle.textContent = '';
+      submitErrorMessage.textContent = '';
+      return;
+    }
+
+    submitErrorPanel.hidden = false;
+    submitErrorTitle.textContent = formatErrorHeading(submitError.code);
+    submitErrorMessage.textContent = formatFriendlyErrorMessage(
+      submitError.message,
+      submitError.code,
+    );
+  };
+
   const renderModeSwitch = (): void => {
     const hasSelection = Boolean(pageInfo?.hasSelection);
     if (!hasSelection && clipMode === 'selection') {
@@ -333,8 +489,8 @@ export async function mountPopup(
       'aria-checked',
       String(clipMode === 'selection'),
     );
-    modeFullBtn.disabled = isClipping;
-    modeSelectionBtn.disabled = isClipping || !hasSelection;
+    modeFullBtn.disabled = isSubmitting;
+    modeSelectionBtn.disabled = isSubmitting || !hasSelection;
     modeSelectionBtn.title = hasSelection
       ? 'Clip only the selected text on this page'
       : 'Select text on the page first';
@@ -434,86 +590,189 @@ export async function mountPopup(
         break;
     }
 
+    const activeJobForCurrentPage = !pageUnsupported
+      ? findActiveJobForUrl(clipJobs, pageInfo?.url)
+      : null;
+
     const canSubmit =
-      !isClipping &&
+      !isSubmitting &&
+      !activeJobForCurrentPage &&
       oauthConfigured &&
       !pageUnsupported &&
       (!authStatus || authStatus.authenticated);
 
     clipSubmitBtn.disabled = !canSubmit;
-    titleInput.disabled = isClipping;
-    tagEditor.setDisabled(isClipping);
-    clipBtnSpinner.hidden = !isClipping;
-    clipBtnLabel.textContent = isClipping
-      ? 'Clipping...'
+    titleInput.disabled = isSubmitting;
+    tagEditor.setDisabled(isSubmitting);
+    clipBtnSpinner.hidden = !isSubmitting;
+    clipBtnLabel.textContent = isSubmitting
+      ? 'Starting clip...'
       : 'Clip to Google Drive';
+
+    if (!isSubmitting && activeJobForCurrentPage) {
+      clipSubmitHint.hidden = false;
+      clipSubmitHint.textContent = 'Already clipping this page';
+    } else {
+      clipSubmitHint.hidden = true;
+      clipSubmitHint.textContent = '';
+    }
+
     renderModeSwitch();
+    renderSubmitError();
   };
 
-  const renderProgress = (): void => {
-    if (progressState.status === 'idle') {
-      progressPanel.hidden = true;
+  const renderClipQueue = (): void => {
+    if (clipJobs.length === 0) {
+      clipQueuePanel.hidden = true;
+      clipQueueSummary.textContent = '';
+      clearDoneJobsBtn.hidden = true;
+      clipQueueList.replaceChildren();
       return;
     }
 
-    const presentation = describeProgressState(progressState);
-    progressPanel.hidden = false;
-    progressPanel.dataset.state = presentation.stateAttr;
-    progressStatusLabel.textContent = presentation.label;
+    const prevScrollTop = clipQueueList.scrollTop;
+    const hasFinishedJobs = clipJobs.some(
+      (job) => job.status === 'done' || job.status === 'error',
+    );
 
-    progressBadge.hidden = presentation.badge.length === 0;
-    progressBadge.textContent = presentation.badge;
+    clipQueuePanel.hidden = false;
+    clipQueueSummary.textContent = formatQueueSummary(clipJobs);
+    clipQueueSummary.dataset.state = getQueueSummaryState(clipJobs);
+    clearDoneJobsBtn.hidden = !hasFinishedJobs;
+    clearDoneJobsBtn.disabled = isClearingDone;
 
-    progressDetail.hidden = presentation.detail.length === 0;
-    progressDetail.textContent = presentation.detail;
+    const fragment = document.createDocumentFragment();
+    for (const job of clipJobs) {
+      const presentation = describeClipJob(job);
 
-    if (presentation.percent !== null && progressState.status !== 'done') {
-      progressBarTrack.hidden = false;
-      progressBarFill.style.width = `${presentation.percent}%`;
-    } else {
-      progressBarTrack.hidden = true;
-      progressBarFill.style.width = '0%';
-    }
+      const li = document.createElement('li');
+      li.className = 'queue-item';
+      li.dataset.jobId = job.id;
+      li.dataset.status = job.status;
 
-    for (const stepEl of stageSteps) {
-      const index = Number(stepEl.dataset.step);
-      if (progressState.status === 'error') {
-        stepEl.dataset.stepStatus = 'error';
-      } else if (progressState.status === 'done' || index < presentation.activeStep) {
-        stepEl.dataset.stepStatus = 'complete';
-      } else if (index === presentation.activeStep) {
-        stepEl.dataset.stepStatus = 'active';
-      } else {
-        stepEl.dataset.stepStatus = 'pending';
+      const mainRow = document.createElement('div');
+      mainRow.className = 'queue-item-main';
+
+      const indicator = document.createElement('span');
+      indicator.className = `queue-status-indicator queue-status-indicator--${presentation.indicatorKind}`;
+      indicator.setAttribute('aria-hidden', 'true');
+
+      const body = document.createElement('div');
+      body.className = 'queue-item-body';
+
+      const titleEl = document.createElement('div');
+      titleEl.className = 'queue-item-title';
+      titleEl.textContent = presentation.title;
+      titleEl.title = presentation.title;
+
+      const detailEl = document.createElement('div');
+      detailEl.className = 'queue-item-detail';
+      detailEl.textContent = presentation.detail;
+      if (job.status === 'error') {
+        detailEl.title = presentation.detail;
       }
-    }
 
-    if (progressState.status === 'done') {
-      progressResultActions.hidden = false;
-      resultDriveLink.href = progressState.result.folderUrl;
+      body.append(titleEl, detailEl);
 
-      const warnings = progressState.result.warnings;
-      warningsList.replaceChildren();
-      if (warnings.length > 0) {
-        warningsDetails.hidden = false;
-        warningsDetails.open = false;
-        warningsSummary.textContent =
-          warnings.length === 1
-            ? '1 warning (image fell back to remote URL)'
-            : `${warnings.length} warnings (images fell back to remote URLs)`;
-        for (const warning of warnings) {
-          const item = document.createElement('li');
-          item.textContent = warning;
-          warningsList.append(item);
+      if (presentation.percent !== null) {
+        const track = document.createElement('div');
+        track.className = 'queue-progress-track';
+        track.setAttribute('role', 'progressbar');
+        track.setAttribute('aria-valuemin', '0');
+        track.setAttribute('aria-valuemax', '100');
+        track.setAttribute('aria-valuenow', String(presentation.percent));
+
+        const fill = document.createElement('div');
+        fill.className = 'queue-progress-fill';
+        fill.style.width = `${presentation.percent}%`;
+
+        track.append(fill);
+        body.append(track);
+      }
+
+      mainRow.append(indicator, body);
+
+      if (presentation.canOpen || presentation.canDismiss) {
+        const actions = document.createElement('div');
+        actions.className = 'queue-item-actions';
+
+        if (presentation.canOpen && presentation.folderUrl) {
+          const openLink = document.createElement('a');
+          openLink.className = 'queue-open-link';
+          openLink.href = presentation.folderUrl;
+          openLink.target = '_blank';
+          openLink.rel = 'noopener noreferrer';
+          openLink.textContent = 'Open ↗';
+          openLink.setAttribute(
+            'aria-label',
+            `Open ${presentation.title} in Google Drive`,
+          );
+          actions.append(openLink);
         }
-      } else {
-        warningsDetails.hidden = true;
+
+        if (presentation.canDismiss) {
+          const dismissBtn = document.createElement('button');
+          dismissBtn.type = 'button';
+          dismissBtn.className = 'queue-dismiss-btn';
+          dismissBtn.dataset.dismissJob = job.id;
+          dismissBtn.textContent = '×';
+          dismissBtn.title = 'Dismiss';
+          dismissBtn.setAttribute('aria-label', `Dismiss ${presentation.title}`);
+          dismissBtn.disabled = dismissingJobIds.has(job.id);
+          actions.append(dismissBtn);
+        }
+
+        mainRow.append(actions);
       }
-    } else {
-      progressResultActions.hidden = true;
-      warningsDetails.hidden = true;
-      warningsList.replaceChildren();
+
+      li.append(mainRow);
+
+      if (presentation.warnings.length > 0) {
+        const details = document.createElement('details');
+        details.className = 'queue-warnings';
+        details.dataset.jobWarnings = job.id;
+        details.open = expandedWarningJobIds.has(job.id);
+
+        const summary = document.createElement('summary');
+        summary.className = 'queue-warnings-summary';
+
+        const badge = document.createElement('span');
+        badge.className = 'queue-warning-badge';
+        badge.append(
+          createWarningChevron(),
+          document.createTextNode(
+            presentation.warnings.length === 1
+              ? '1 warning'
+              : `${presentation.warnings.length} warnings`,
+          ),
+        );
+        summary.append(badge);
+
+        const list = document.createElement('ul');
+        list.className = 'queue-warnings-list';
+        for (const warning of presentation.warnings) {
+          const warnLi = document.createElement('li');
+          warnLi.textContent = warning;
+          list.append(warnLi);
+        }
+
+        details.addEventListener('toggle', () => {
+          if (details.open) {
+            expandedWarningJobIds.add(job.id);
+          } else {
+            expandedWarningJobIds.delete(job.id);
+          }
+        });
+
+        details.append(summary, list);
+        li.append(details);
+      }
+
+      fragment.append(li);
     }
+
+    clipQueueList.replaceChildren(fragment);
+    clipQueueList.scrollTop = prevScrollTop;
   };
 
   const renderHistory = (items: readonly ClipHistoryItem[]): void => {
@@ -569,7 +828,10 @@ export async function mountPopup(
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
       link.textContent = 'Open';
-      link.setAttribute('aria-label', `Open ${item.title || item.folderName} in Google Drive`);
+      link.setAttribute(
+        'aria-label',
+        `Open ${item.title || item.folderName} in Google Drive`,
+      );
 
       li.append(info, link);
       recentClipsList.append(li);
@@ -578,18 +840,104 @@ export async function mountPopup(
 
   const refreshHistory = async (): Promise<void> => {
     const historyRes = await runtime.sendMessage({ type: 'GET_HISTORY' });
-    if (historyRes.ok) {
+    if (!destroyed && historyRes.ok) {
       renderHistory(historyRes.data);
     }
   };
 
+  const applyJobsUpdate = (
+    incomingJobs: readonly ClipJob[],
+    updateOptions: { isInitialHydration: boolean },
+  ): void => {
+    if (destroyed) {
+      return;
+    }
+
+    let anyNewlyCompleted = false;
+    let newlyAuthFailedJob: ClipJob | null = null;
+    const nextIds = new Set<string>();
+
+    for (const job of incomingJobs) {
+      nextIds.add(job.id);
+      const prevStatus = lastKnownJobStatuses.get(job.id);
+      if (job.status === 'done' && prevStatus !== 'done') {
+        anyNewlyCompleted = true;
+      }
+      if (
+        job.status === 'error' &&
+        prevStatus !== 'error' &&
+        (job.errorCode === 'AUTH_REQUIRED' ||
+          job.errorCode === 'OAUTH_NOT_CONFIGURED')
+      ) {
+        newlyAuthFailedJob = job;
+      }
+    }
+
+    lastKnownJobStatuses.clear();
+    for (const job of incomingJobs) {
+      lastKnownJobStatuses.set(job.id, job.status);
+    }
+
+    for (const id of expandedWarningJobIds) {
+      if (!nextIds.has(id)) {
+        expandedWarningJobIds.delete(id);
+      }
+    }
+
+    clipJobs = incomingJobs.map((job) => ({ ...job }));
+
+    if (!updateOptions.isInitialHydration) {
+      if (newlyAuthFailedJob?.errorCode === 'OAUTH_NOT_CONFIGURED') {
+        authStatus = { oauthConfigured: false, authenticated: false };
+      } else if (newlyAuthFailedJob?.errorCode === 'AUTH_REQUIRED') {
+        authStatus = {
+          oauthConfigured: true,
+          authenticated: false,
+          error: newlyAuthFailedJob.error || newlyAuthFailedJob.message,
+        };
+      }
+    }
+
+    renderAuthAndBanner();
+    renderClipQueue();
+
+    if (!updateOptions.isInitialHydration && anyNewlyCompleted) {
+      void refreshHistory();
+    }
+  };
+
+  const upsertAcceptedJob = (job: ClipJob): void => {
+    const existingIndex = clipJobs.findIndex((item) => item.id === job.id);
+    if (
+      existingIndex !== -1 &&
+      isExistingJobNewerOrEqual(clipJobs[existingIndex]!, job)
+    ) {
+      renderAuthAndBanner();
+      return;
+    }
+
+    const nextJobs =
+      existingIndex === -1
+        ? [job, ...clipJobs]
+        : clipJobs.map((item, idx) => (idx === existingIndex ? job : item));
+
+    jobsPushVersion += 1;
+    applyJobsUpdate(nextJobs, { isInitialHydration: false });
+  };
+
   const refresh = async (): Promise<void> => {
-    const [settingsRes, authRes, pageRes, historyRes] = await Promise.all([
+    const versionAtStart = jobsPushVersion;
+    const [settingsRes, authRes, pageRes, historyRes, jobsRes] = await Promise.all([
       runtime.sendMessage({ type: 'GET_SETTINGS' }),
       runtime.sendMessage({ type: 'GET_AUTH_STATUS' }),
       runtime.sendMessage({ type: 'GET_PAGE_INFO' }),
       runtime.sendMessage({ type: 'GET_HISTORY' }),
+      runtime.sendMessage({ type: 'GET_CLIP_JOBS' }),
     ]);
+
+    if (destroyed) {
+      return;
+    }
 
     if (settingsRes.ok) {
       settings = {
@@ -620,7 +968,8 @@ export async function mountPopup(
       pageInfo = pageRes.data;
       pageUnsupported = !isSupportedClipUrl(pageRes.data.url);
       pageUnsupportedUrl = pageRes.data.url;
-      titleInput.value = pageRes.data.title || '';
+      const cleanedTitle = cleanPageTitle(pageRes.data.title || '');
+      titleInput.value = cleanedTitle || pageRes.data.title || '';
       clipMode = pageRes.data.hasSelection ? 'selection' : 'full';
     } else if (pageRes.code === 'UNSUPPORTED_PAGE') {
       pageInfo = null;
@@ -640,8 +989,13 @@ export async function mountPopup(
     }
 
     updateFolderPreview();
-    renderAuthAndBanner();
-    renderProgress();
+
+    if (jobsRes.ok && jobsPushVersion === versionAtStart) {
+      applyJobsUpdate(jobsRes.data, { isInitialHydration: true });
+    } else {
+      renderAuthAndBanner();
+      renderClipQueue();
+    }
   };
 
   const handleOpenOptions = (): void => {
@@ -656,10 +1010,16 @@ export async function mountPopup(
     renderAuthAndBanner();
 
     const response = await runtime.sendMessage({ type: 'SIGN_IN' });
+    if (destroyed) {
+      return;
+    }
     isSigningIn = false;
 
     if (response.ok) {
       authStatus = response.data;
+      if (response.data.authenticated) {
+        submitError = null;
+      }
     } else if (response.code === 'OAUTH_NOT_CONFIGURED') {
       authStatus = { oauthConfigured: false, authenticated: false };
     } else {
@@ -673,7 +1033,7 @@ export async function mountPopup(
   };
 
   const handleModeClick = (mode: ClipMode): void => {
-    if (isClipping) {
+    if (isSubmitting) {
       return;
     }
     if (mode === 'selection' && !pageInfo?.hasSelection) {
@@ -683,20 +1043,100 @@ export async function mountPopup(
     renderModeSwitch();
   };
 
+  const handleDismissSubmitError = (): void => {
+    submitError = null;
+    renderSubmitError();
+  };
+
+  const handleClearCompletedJobs = async (): Promise<void> => {
+    if (isClearingDone) {
+      return;
+    }
+    isClearingDone = true;
+    clearDoneJobsBtn.disabled = true;
+
+    const versionBefore = jobsPushVersion;
+    const response = await runtime.sendMessage({ type: 'CLEAR_COMPLETED_JOBS' });
+    if (destroyed) {
+      return;
+    }
+    isClearingDone = false;
+
+    if (response.ok) {
+      if (jobsPushVersion === versionBefore) {
+        jobsPushVersion += 1;
+        applyJobsUpdate(response.data, { isInitialHydration: false });
+      } else {
+        const survivingIds = new Set(response.data.map((job) => job.id));
+        const reconciled = clipJobs.filter(
+          (job) => isActiveClipJobStatus(job.status) || survivingIds.has(job.id),
+        );
+        applyJobsUpdate(reconciled, { isInitialHydration: false });
+      }
+    } else {
+      renderClipQueue();
+    }
+  };
+
+  const handleDismissJob = async (jobId: string): Promise<void> => {
+    if (dismissingJobIds.has(jobId)) {
+      return;
+    }
+    dismissingJobIds.add(jobId);
+    renderClipQueue();
+
+    const versionBefore = jobsPushVersion;
+    const response = await runtime.sendMessage({
+      type: 'DISMISS_CLIP_JOB',
+      jobId,
+    });
+    if (destroyed) {
+      return;
+    }
+    dismissingJobIds.delete(jobId);
+
+    if (response.ok) {
+      if (jobsPushVersion === versionBefore) {
+        jobsPushVersion += 1;
+        applyJobsUpdate(response.data, { isInitialHydration: false });
+      } else {
+        const reconciled = clipJobs.filter((job) => job.id !== jobId);
+        applyJobsUpdate(reconciled, { isInitialHydration: false });
+      }
+    } else {
+      renderClipQueue();
+    }
+  };
+
+  const handleQueueListClick = (event: MouseEvent): void => {
+    const target = event.target as HTMLElement | null;
+    const dismissBtn = target?.closest<HTMLButtonElement>('[data-dismiss-job]');
+    const jobId = dismissBtn?.dataset.dismissJob;
+    if (jobId) {
+      void handleDismissJob(jobId);
+    }
+  };
+
   const handleClipSubmit = async (event: SubmitEvent): Promise<void> => {
     event.preventDefault();
-    if (isClipping || clipSubmitBtn.disabled) {
+    if (isSubmitting || clipSubmitBtn.disabled) {
+      return;
+    }
+    if (findActiveJobForUrl(clipJobs, pageInfo?.url)) {
+      renderAuthAndBanner();
       return;
     }
 
     const tags = tagEditor.commitPendingInput();
     const title = titleInput.value.trim() || pageInfo?.title || 'Untitled';
     const folderName = buildArticleFolderName(title, now());
+    const errorIdsBeforeSubmit = new Set(
+      clipJobs.filter((job) => job.status === 'error').map((job) => job.id),
+    );
 
-    isClipping = true;
-    progressState = { status: 'extracting', message: 'Extracting page...' };
+    isSubmitting = true;
+    submitError = null;
     renderAuthAndBanner();
-    renderProgress();
 
     const response = await runtime.sendMessage({
       type: 'START_CLIP',
@@ -709,13 +1149,13 @@ export async function mountPopup(
       },
     });
 
-    isClipping = false;
+    if (destroyed) {
+      return;
+    }
+    isSubmitting = false;
 
     if (response.ok) {
-      progressState = { status: 'done', result: response.data };
-      renderAuthAndBanner();
-      renderProgress();
-      await refreshHistory();
+      upsertAcceptedJob(response.data);
       return;
     }
 
@@ -729,26 +1169,31 @@ export async function mountPopup(
       };
     }
 
-    progressState = {
-      status: 'error',
-      message: response.error,
-      code: response.code,
-    };
+    const currentComparableUrl = pageInfo?.url
+      ? normalizeComparableUrl(pageInfo.url)
+      : '';
+    const jobRowCapturedError =
+      currentComparableUrl.length > 0 &&
+      clipJobs.some(
+        (job) =>
+          job.status === 'error' &&
+          !errorIdsBeforeSubmit.has(job.id) &&
+          normalizeComparableUrl(job.url) === currentComparableUrl,
+      );
+
+    if (!jobRowCapturedError) {
+      submitError = {
+        message: response.error,
+        code: response.code,
+      };
+    }
+
     renderAuthAndBanner();
-    renderProgress();
   };
 
-  const unsubscribeProgress = runtime.onClipProgress((event) => {
-    const wasClippingFromPopup = isClipping;
-    progressState = progressEventToViewState(event);
-    if (event.stage === 'done' || event.stage === 'error') {
-      isClipping = false;
-      renderAuthAndBanner();
-      if (event.stage === 'done' && !wasClippingFromPopup) {
-        void refreshHistory();
-      }
-    }
-    renderProgress();
+  const unsubscribeJobs = runtime.onClipJobsUpdated((jobs) => {
+    jobsPushVersion += 1;
+    applyJobsUpdate(jobs, { isInitialHydration: false });
   });
 
   const onModeFullClick = (): void => handleModeClick('full');
@@ -761,15 +1206,19 @@ export async function mountPopup(
   modeFullBtn.addEventListener('click', onModeFullClick);
   modeSelectionBtn.addEventListener('click', onModeSelectionClick);
   form.addEventListener('submit', handleClipSubmit);
+  submitErrorDismissBtn.addEventListener('click', handleDismissSubmitError);
+  clearDoneJobsBtn.addEventListener('click', handleClearCompletedJobs);
+  clipQueueList.addEventListener('click', handleQueueListClick);
 
   await refresh();
 
   return {
     refresh,
-    getProgressState: () => progressState,
+    getJobs: () => clipJobs.map((job) => ({ ...job })),
     getBannerState: () => bannerState,
     destroy: () => {
-      unsubscribeProgress();
+      destroyed = true;
+      unsubscribeJobs();
       tagEditor.destroy();
       titleInput.removeEventListener('input', updateFolderPreview);
       openOptionsHeaderBtn.removeEventListener('click', handleOpenOptions);
@@ -778,6 +1227,9 @@ export async function mountPopup(
       modeFullBtn.removeEventListener('click', onModeFullClick);
       modeSelectionBtn.removeEventListener('click', onModeSelectionClick);
       form.removeEventListener('submit', handleClipSubmit);
+      submitErrorDismissBtn.removeEventListener('click', handleDismissSubmitError);
+      clearDoneJobsBtn.removeEventListener('click', handleClearCompletedJobs);
+      clipQueueList.removeEventListener('click', handleQueueListClick);
     },
   };
 }
