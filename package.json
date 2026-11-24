@@ -1,0 +1,27 @@
+{
+  "name": "drive-clipper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome Manifest V3 extension that clips web pages as Markdown with images to Google Drive.",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "defuddle": "^0.19.13"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@types/chrome": "^0.3.7",
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "jsdom": "^31.0.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  }
+}
