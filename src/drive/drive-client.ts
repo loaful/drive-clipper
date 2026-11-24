@@ -228,6 +228,8 @@ export function buildMultipartRelatedBody(params: {
 interface CachedWebAuthToken {
   token: string;
   expiresAt: number;
+  clientId?: string;
+  isCustomClient?: boolean;
 }
 
 let inMemoryWebAuthToken: CachedWebAuthToken | null = null;
@@ -311,7 +313,20 @@ function isValidCachedWebAuthToken(
   );
 }
 
-async function readCachedWebAuthToken(nowMs: number = Date.now()): Promise<string | null> {
+function isMatchingCachedWebAuthToken(
+  entry: CachedWebAuthToken,
+  customClientId: string | null,
+): boolean {
+  if (customClientId !== null) {
+    return entry.isCustomClient === true && entry.clientId === customClientId;
+  }
+  return entry.isCustomClient !== true;
+}
+
+async function readCachedWebAuthToken(
+  customClientId: string | null = null,
+  nowMs: number = Date.now(),
+): Promise<string | null> {
   const session = getSessionStorageArea();
   if (session) {
     try {
@@ -319,7 +334,9 @@ async function readCachedWebAuthToken(nowMs: number = Date.now()): Promise<strin
       const entry = stored[STORAGE_KEYS.webAuthToken];
       if (isValidCachedWebAuthToken(entry, nowMs)) {
         inMemoryWebAuthToken = entry;
-        return entry.token;
+        return isMatchingCachedWebAuthToken(entry, customClientId)
+          ? entry.token
+          : null;
       }
       if (entry !== undefined) {
         await session.remove(STORAGE_KEYS.webAuthToken).catch(() => undefined);
@@ -330,7 +347,9 @@ async function readCachedWebAuthToken(nowMs: number = Date.now()): Promise<strin
   }
 
   if (isValidCachedWebAuthToken(inMemoryWebAuthToken, nowMs)) {
-    return inMemoryWebAuthToken.token;
+    return isMatchingCachedWebAuthToken(inMemoryWebAuthToken, customClientId)
+      ? inMemoryWebAuthToken.token
+      : null;
   }
   inMemoryWebAuthToken = null;
   return null;
@@ -494,6 +513,7 @@ export function parseWebAuthFlowRedirect(
 async function launchChromeDriveWebAuthFlow(options: {
   interactive: boolean;
   webAuthClientId?: string | null;
+  isCustomClient?: boolean;
 }): Promise<string> {
   if (
     typeof chrome === 'undefined' ||
@@ -506,14 +526,18 @@ async function launchChromeDriveWebAuthFlow(options: {
     });
   }
 
-  const clientId = resolveWebAuthClientId(
-    'webAuthClientId' in options
-      ? { webAuthClientId: options.webAuthClientId }
-      : undefined,
-  );
+  const clientId = options.isCustomClient
+    ? isConfiguredOAuthClientIdValue(options.webAuthClientId)
+      ? options.webAuthClientId.trim()
+      : null
+    : resolveWebAuthClientId(
+        'webAuthClientId' in options
+          ? { webAuthClientId: options.webAuthClientId }
+          : undefined,
+      );
   if (!clientId) {
     throw new DriveApiError(
-      'Google OAuth Client ID is not configured in config.local.json.',
+      'Google OAuth Client ID is not configured. Configure a Custom Web OAuth Client ID in Settings or config.local.json.',
       {
         status: 401,
         code: 'AUTH_REQUIRED',
@@ -549,7 +573,11 @@ async function launchChromeDriveWebAuthFlow(options: {
   }
 
   const parsed = parseWebAuthFlowRedirect(responseUrl, state);
-  await writeCachedWebAuthToken(parsed);
+  await writeCachedWebAuthToken({
+    ...parsed,
+    clientId,
+    isCustomClient: Boolean(options.isCustomClient),
+  });
   return parsed.token;
 }
 
@@ -557,27 +585,68 @@ async function launchChromeDriveWebAuthFlow(options: {
  * Acquires a Google OAuth2 access token strictly scoped to
  * `https://www.googleapis.com/auth/drive.file`.
  *
- * Uses `chrome.identity.getAuthToken` when Chrome browser sign-in is active,
- * and falls back to `chrome.identity.launchWebAuthFlow` with session token
- * caching on Chromium browsers where browser sign-in is disabled (such as Ego
- * Lite, Brave, Arc, or unbranded Chromium) or when using a Web Application
+ * When a valid non-placeholder `customWebAuthClientId` is provided, bypasses
+ * `chrome.identity.getAuthToken()` completely and authenticates directly via
+ * `chrome.identity.launchWebAuthFlow` with session caching so users on any
+ * Chromium browser can connect their own GCP Web Application OAuth Client ID
+ * at runtime.
+ *
+ * Otherwise, uses `chrome.identity.getAuthToken` when Chrome browser sign-in
+ * is active, and falls back to `chrome.identity.launchWebAuthFlow` with session
+ * token caching on Chromium browsers where browser sign-in is disabled (such as
+ * Ego Lite, Brave, Arc, or unbranded Chromium) or when using a Web Application
  * OAuth Client ID.
  */
 export async function getChromeDriveAuthToken(options: {
   interactive: boolean;
   webAuthClientId?: string | null;
+  customWebAuthClientId?: string | null;
 }): Promise<string> {
-  const cachedWebToken = await readCachedWebAuthToken();
+  const customClientId = isConfiguredOAuthClientIdValue(
+    options.customWebAuthClientId,
+  )
+    ? options.customWebAuthClientId.trim()
+    : null;
+
+  const hasWebAuthFlow =
+    typeof chrome !== 'undefined' &&
+    typeof chrome.identity?.launchWebAuthFlow === 'function' &&
+    typeof chrome.identity?.getRedirectURL === 'function';
+
+  if (customClientId !== null) {
+    const cachedCustomToken = await readCachedWebAuthToken(customClientId);
+    if (cachedCustomToken) {
+      return cachedCustomToken;
+    }
+
+    if (!hasWebAuthFlow) {
+      throw new DriveApiError('chrome.identity.launchWebAuthFlow is unavailable.', {
+        status: 401,
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    if (!options.interactive) {
+      throw new DriveApiError('User is not signed in.', {
+        status: 401,
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    return launchChromeDriveWebAuthFlow({
+      interactive: true,
+      webAuthClientId: customClientId,
+      isCustomClient: true,
+    });
+  }
+
+  const cachedWebToken = await readCachedWebAuthToken(null);
   if (cachedWebToken) {
     return cachedWebToken;
   }
 
   const hasGetAuthToken =
     typeof chrome !== 'undefined' && typeof chrome.identity?.getAuthToken === 'function';
-  const hasWebAuthFlow =
-    typeof chrome !== 'undefined' &&
-    typeof chrome.identity?.launchWebAuthFlow === 'function' &&
-    typeof chrome.identity?.getRedirectURL === 'function';
 
   if (!hasGetAuthToken && !hasWebAuthFlow) {
     throw new DriveApiError('chrome.identity API is unavailable.', {
@@ -619,6 +688,7 @@ export async function getChromeDriveAuthToken(options: {
       ...('webAuthClientId' in options
         ? { webAuthClientId: options.webAuthClientId }
         : {}),
+      isCustomClient: false,
     });
   }
 

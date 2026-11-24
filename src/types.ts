@@ -240,6 +240,14 @@ export interface ExtensionSettings {
    * An empty array `[]` is preserved as an explicit user choice ("no tags").
    */
   stickyTags: string[] | null;
+  /**
+   * Optional runtime user-supplied Google Cloud Web Application OAuth Client ID.
+   * When set to a valid non-placeholder client ID, authentication bypasses
+   * `chrome.identity.getAuthToken()` and routes directly through
+   * `chrome.identity.launchWebAuthFlow()` using this client ID.
+   * `null` uses the built-in OAuth configuration.
+   */
+  customWebAuthClientId: string | null;
   frontmatter: FrontmatterPreferences;
   maxImageSizeBytes: number;
   imageConcurrency: number;
@@ -250,6 +258,7 @@ export const DEFAULT_EXTENSION_SETTINGS: ExtensionSettings = {
   rootFolderId: null,
   defaultTags: ['web-clip'],
   stickyTags: null,
+  customWebAuthClientId: null,
   frontmatter: {
     includeAuthor: true,
     includePublished: true,
@@ -261,9 +270,15 @@ export const DEFAULT_EXTENSION_SETTINGS: ExtensionSettings = {
   imageConcurrency: 5,
 };
 
+export type AuthMode = 'chrome-identity' | 'web-auth-flow' | 'custom-client';
+
 export interface AuthStatus {
   oauthConfigured: boolean;
   authenticated: boolean;
+  /** Active OAuth flow mode when explicitly identified (e.g. `'custom-client'` for runtime BYO client ID). */
+  authMode?: AuthMode;
+  /** True when a valid runtime `customWebAuthClientId` overrides the built-in OAuth client. */
+  usingCustomClientId?: boolean;
   error?: string;
 }
 

@@ -70,7 +70,10 @@ export interface ServiceWorkerDependencies {
   driveClient?: DriveClient;
   fetchImagesImpl?: typeof fetchImages;
   fetchImpl?: typeof fetch;
-  getAuthToken?: (options: { interactive: boolean }) => Promise<string>;
+  getAuthToken?: (options: {
+    interactive: boolean;
+    customWebAuthClientId?: string | null;
+  }) => Promise<string>;
   revokeAuthToken?: (token: string) => Promise<void>;
   clearAllCachedAuthTokens?: () => Promise<void>;
   getManifest?: () => chrome.runtime.Manifest;
@@ -207,6 +210,12 @@ function normalizeSettings(raw: unknown): ExtensionSettings {
     ? normalizeTagList(input.stickyTags)
     : null;
 
+  const customWebAuthClientId = isConfiguredOAuthClientIdValue(
+    input.customWebAuthClientId,
+  )
+    ? input.customWebAuthClientId.trim()
+    : null;
+
   const maxImageSizeBytes =
     typeof input.maxImageSizeBytes === 'number' &&
     Number.isFinite(input.maxImageSizeBytes) &&
@@ -225,6 +234,7 @@ function normalizeSettings(raw: unknown): ExtensionSettings {
     rootFolderId,
     defaultTags,
     stickyTags,
+    customWebAuthClientId,
     frontmatter: {
       includeAuthor:
         typeof rawFrontmatter.includeAuthor === 'boolean'
@@ -478,14 +488,6 @@ export function createServiceWorkerController(
     ((token: string) => revokeChromeAuthToken(token, fetchImpl));
   const clearAllCachedAuthTokens =
     deps.clearAllCachedAuthTokens ?? clearAllCachedChromeAuthTokens;
-  const driveClient =
-    deps.driveClient ??
-    new DriveClient({
-      fetchImpl,
-      ...(deps.getAuthToken
-        ? { tokenProvider: deps.getAuthToken }
-        : { onUnauthorizedToken: removeCachedChromeAuthToken }),
-    });
   const fetchImagesImpl = deps.fetchImagesImpl ?? fetchImages;
   const emitPushMessage = deps.emitPushMessage ?? defaultEmitPushMessage;
   const setBadge = deps.setBadge ?? defaultSetBadge;
@@ -588,11 +590,12 @@ export function createServiceWorkerController(
     throw new Error('chrome.scripting API is unavailable.');
   };
 
-  const isOAuthConfigured = (): boolean => {
+  const isOAuthConfigured = (settings?: ExtensionSettings | null): boolean => {
     const manifest = getManifest();
     return (
       isConfiguredOAuthClientId(manifest?.oauth2?.client_id) ||
-      getBuildWebAuthClientId() !== null
+      getBuildWebAuthClientId() !== null ||
+      isConfiguredOAuthClientId(settings?.customWebAuthClientId)
     );
   };
 
@@ -614,11 +617,36 @@ export function createServiceWorkerController(
     return normalizeSettings(stored[STORAGE_KEYS.settings]);
   };
 
+  const resolveLiveAuthToken = async (options: {
+    interactive: boolean;
+    settings?: ExtensionSettings;
+  }): Promise<string> => {
+    const settings = options.settings ?? (await getSettings());
+    const customWebAuthClientId = settings.customWebAuthClientId;
+    return customWebAuthClientId
+      ? getAuthToken({
+          interactive: options.interactive,
+          customWebAuthClientId,
+        })
+      : getAuthToken({ interactive: options.interactive });
+  };
+
+  const driveClient =
+    deps.driveClient ??
+    new DriveClient({
+      fetchImpl,
+      tokenProvider: (options) => resolveLiveAuthToken(options),
+      ...(!deps.getAuthToken
+        ? { onUnauthorizedToken: removeCachedChromeAuthToken }
+        : {}),
+    });
+
   const updateSettings = async (
     patch: Partial<ExtensionSettings>,
   ): Promise<ExtensionSettings> => {
     const operation = settingsWriteChain.then(async () => {
       const current = await getSettings();
+      const previousCustomClientId = current.customWebAuthClientId;
       const merged: ExtensionSettings = normalizeSettings({
         ...current,
         ...patch,
@@ -629,6 +657,10 @@ export function createServiceWorkerController(
           patch.rootFolderId === undefined
             ? current.rootFolderId
             : patch.rootFolderId,
+        customWebAuthClientId:
+          patch.customWebAuthClientId === undefined
+            ? current.customWebAuthClientId
+            : patch.customWebAuthClientId,
         frontmatter: {
           ...current.frontmatter,
           ...(patch.frontmatter ?? {}),
@@ -640,6 +672,10 @@ export function createServiceWorkerController(
         patch.rootFolderId !== undefined
       ) {
         cachedRootFolder = null;
+      }
+      if (merged.customWebAuthClientId !== previousCustomClientId) {
+        cachedRootFolder = null;
+        await clearAllCachedAuthTokens();
       }
       return merged;
     });
@@ -1359,56 +1395,65 @@ export function createServiceWorkerController(
     }
   };
 
+  const buildAuthStatus = (
+    oauthConfigured: boolean,
+    authenticated: boolean,
+    settings: ExtensionSettings,
+  ): AuthStatus => {
+    if (settings.customWebAuthClientId) {
+      return {
+        oauthConfigured,
+        authenticated,
+        authMode: 'custom-client',
+        usingCustomClientId: true,
+      };
+    }
+    return {
+      oauthConfigured,
+      authenticated,
+    };
+  };
+
   const getAuthStatus = async (): Promise<BackgroundResponse<AuthStatus>> => {
-    const oauthConfigured = isOAuthConfigured();
+    const settings = await getSettings();
+    const oauthConfigured = isOAuthConfigured(settings);
     if (!oauthConfigured) {
       return {
         ok: true,
-        data: {
-          oauthConfigured: false,
-          authenticated: false,
-        },
+        data: buildAuthStatus(false, false, settings),
       };
     }
 
     try {
-      await getAuthToken({ interactive: false });
+      await resolveLiveAuthToken({ interactive: false, settings });
       return {
         ok: true,
-        data: {
-          oauthConfigured: true,
-          authenticated: true,
-        },
+        data: buildAuthStatus(true, true, settings),
       };
     } catch {
       return {
         ok: true,
-        data: {
-          oauthConfigured: true,
-          authenticated: false,
-        },
+        data: buildAuthStatus(true, false, settings),
       };
     }
   };
 
   const signIn = async (): Promise<BackgroundResponse<AuthStatus>> => {
-    if (!isOAuthConfigured()) {
+    const settings = await getSettings();
+    if (!isOAuthConfigured(settings)) {
       return {
         ok: false,
         code: 'OAUTH_NOT_CONFIGURED',
         error:
-          'Google OAuth Client ID is still set to the template placeholder. Configure config.local.json and rebuild.',
+          'Google OAuth Client ID is not configured. Open Settings to add a Custom Web OAuth Client ID or configure config.local.json.',
       };
     }
 
     try {
-      await getAuthToken({ interactive: true });
+      await resolveLiveAuthToken({ interactive: true, settings });
       return {
         ok: true,
-        data: {
-          oauthConfigured: true,
-          authenticated: true,
-        },
+        data: buildAuthStatus(true, true, settings),
       };
     } catch (error) {
       return {
@@ -1420,13 +1465,17 @@ export function createServiceWorkerController(
   };
 
   const signOut = async (): Promise<BackgroundResponse<AuthStatus>> => {
-    const oauthConfigured = isOAuthConfigured();
+    const settings = await getSettings();
+    const oauthConfigured = isOAuthConfigured(settings);
     cachedRootFolder = null;
 
     if (oauthConfigured) {
       let currentToken: string | null = null;
       try {
-        currentToken = await getAuthToken({ interactive: false });
+        currentToken = await resolveLiveAuthToken({
+          interactive: false,
+          settings,
+        });
       } catch {
         currentToken = null;
       }
@@ -1439,10 +1488,7 @@ export function createServiceWorkerController(
 
     return {
       ok: true,
-      data: {
-        oauthConfigured,
-        authenticated: false,
-      },
+      data: buildAuthStatus(oauthConfigured, false, settings),
     };
   };
 
@@ -1450,17 +1496,17 @@ export function createServiceWorkerController(
     folderName?: string;
     forceNew?: boolean;
   }): Promise<BackgroundResponse<RootFolderInfo>> => {
-    if (!isOAuthConfigured()) {
+    const settings = await getSettings();
+    if (!isOAuthConfigured(settings)) {
       return {
         ok: false,
         code: 'OAUTH_NOT_CONFIGURED',
         error:
-          'Google OAuth Client ID is not configured. Add config.local.json and rebuild.',
+          'Google OAuth Client ID is not configured. Open Settings to add a Custom Web OAuth Client ID or configure config.local.json.',
       };
     }
 
     try {
-      const settings = await getSettings();
       const targetName =
         options.folderName?.trim() || settings.rootFolderName || 'WebClips';
       const folderInfo = await driveClient.ensureRootFolder({
@@ -1496,12 +1542,13 @@ export function createServiceWorkerController(
   const enqueueClip = async (
     request: ClipRequest,
   ): Promise<BackgroundResponse<ClipJob>> => {
-    if (!isOAuthConfigured()) {
+    const initialSettings = await getSettings();
+    if (!isOAuthConfigured(initialSettings)) {
       return {
         ok: false,
         code: 'OAUTH_NOT_CONFIGURED',
         error:
-          'Google OAuth Client ID is not configured. Open Options for setup instructions.',
+          'Google OAuth Client ID is not configured. Open Settings for setup instructions.',
       };
     }
 

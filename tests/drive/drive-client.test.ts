@@ -1082,6 +1082,133 @@ describe('DriveClient uploadArticle', () => {
     }
   });
 
+  it('bypasses chrome.identity.getAuthToken completely when customWebAuthClientId is provided and scopes cached tokens per client ID', async () => {
+    const sessionStore: Record<string, unknown> = {};
+    const rawRedirectUri = 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/';
+    const expectedRedirectUri = 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org';
+    const seenClientIds: string[] = [];
+    let flowCount = 0;
+
+    // Simulate official Chrome where getAuthToken WOULD succeed if called.
+    const getAuthTokenSpy = vi.fn(async () => ({ token: 'chrome-builtin-token' }));
+    const launchWebAuthFlowSpy = vi.fn(
+      async (details: chrome.identity.WebAuthFlowDetails) => {
+        flowCount += 1;
+        const parsed = new URL(details.url);
+        expect(parsed.searchParams.get('redirect_uri')).toBe(expectedRedirectUri);
+        expect(parsed.searchParams.get('scope')).toBe(DRIVE_FILE_SCOPE);
+        const clientId = parsed.searchParams.get('client_id') ?? '';
+        seenClientIds.push(clientId);
+        const state = parsed.searchParams.get('state')!;
+        return `${rawRedirectUri}#access_token=byo-token-${flowCount}&expires_in=3600&state=${encodeURIComponent(state)}`;
+      },
+    );
+
+    const originalChrome = (globalThis as Record<string, unknown>).chrome;
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        getManifest: () => ({
+          oauth2: {
+            client_id: '222-chromeext.apps.googleusercontent.com',
+            scopes: [DRIVE_FILE_SCOPE],
+          },
+        }),
+      },
+      identity: {
+        getAuthToken: getAuthTokenSpy,
+        getRedirectURL: () => rawRedirectUri,
+        launchWebAuthFlow: launchWebAuthFlowSpy,
+        removeCachedAuthToken: vi.fn(async () => undefined),
+        clearAllCachedAuthTokens: vi.fn(async () => undefined),
+      },
+      storage: {
+        session: {
+          get: async (key: string) =>
+            key in sessionStore ? { [key]: sessionStore[key] } : {},
+          set: async (items: Record<string, unknown>) => {
+            Object.assign(sessionStore, items);
+          },
+          remove: async (key: string) => {
+            delete sessionStore[key];
+          },
+        },
+      },
+    };
+
+    try {
+      await clearAllCachedChromeAuthTokens();
+
+      // 1. Non-interactive check with custom client before sign-in must NOT call getAuthToken OR launchWebAuthFlow.
+      await expect(
+        getChromeDriveAuthToken({
+          interactive: false,
+          customWebAuthClientId: '  999-byo-a.apps.googleusercontent.com  ',
+        }),
+      ).rejects.toMatchObject({ status: 401, code: 'AUTH_REQUIRED' });
+      expect(getAuthTokenSpy).not.toHaveBeenCalled();
+      expect(launchWebAuthFlowSpy).not.toHaveBeenCalled();
+
+      // 2. Interactive sign-in bypasses getAuthToken completely and launches webAuthFlow with custom client ID.
+      const tokenA1 = await getChromeDriveAuthToken({
+        interactive: true,
+        customWebAuthClientId: '  999-byo-a.apps.googleusercontent.com  ',
+      });
+      expect(tokenA1).toBe('byo-token-1');
+      expect(getAuthTokenSpy).not.toHaveBeenCalled();
+      expect(launchWebAuthFlowSpy).toHaveBeenCalledTimes(1);
+      expect(seenClientIds).toEqual(['999-byo-a.apps.googleusercontent.com']);
+
+      // 3. Subsequent non-interactive check for the same custom client reuses the cached session token.
+      const tokenA2 = await getChromeDriveAuthToken({
+        interactive: false,
+        customWebAuthClientId: '999-byo-a.apps.googleusercontent.com',
+      });
+      expect(tokenA2).toBe('byo-token-1');
+      expect(getAuthTokenSpy).not.toHaveBeenCalled();
+      expect(launchWebAuthFlowSpy).toHaveBeenCalledTimes(1);
+
+      // 4. Switching to a different custom client ID never reuses client A's cached token.
+      await expect(
+        getChromeDriveAuthToken({
+          interactive: false,
+          customWebAuthClientId: '888-byo-b.apps.googleusercontent.com',
+        }),
+      ).rejects.toMatchObject({ status: 401, code: 'AUTH_REQUIRED' });
+      const tokenB = await getChromeDriveAuthToken({
+        interactive: true,
+        customWebAuthClientId: '888-byo-b.apps.googleusercontent.com',
+      });
+      expect(tokenB).toBe('byo-token-2');
+      expect(getAuthTokenSpy).not.toHaveBeenCalled();
+      expect(seenClientIds).toEqual([
+        '999-byo-a.apps.googleusercontent.com',
+        '888-byo-b.apps.googleusercontent.com',
+      ]);
+
+      // 5. Reverting to null or placeholder customWebAuthClientId ignores the custom cache and uses built-in getAuthToken.
+      const builtInToken = await getChromeDriveAuthToken({
+        interactive: false,
+        customWebAuthClientId: null,
+      });
+      expect(builtInToken).toBe('chrome-builtin-token');
+      expect(getAuthTokenSpy).toHaveBeenCalledTimes(1);
+
+      const placeholderToken = await getChromeDriveAuthToken({
+        interactive: false,
+        customWebAuthClientId: 'YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com',
+      });
+      expect(placeholderToken).toBe('chrome-builtin-token');
+      expect(getAuthTokenSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      await clearAllCachedChromeAuthTokens();
+      if (originalChrome === undefined) {
+        delete (globalThis as Record<string, unknown>).chrome;
+      } else {
+        (globalThis as Record<string, unknown>).chrome = originalChrome;
+      }
+    }
+  });
+
   it('automatically switches files > 4.5 MiB to uploadType=resumable (both POST create and PATCH update) while keeping <= 4.5 MiB on multipart', async () => {
     const server = createFakeDriveServer();
     const client = new DriveClient({

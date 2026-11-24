@@ -10,9 +10,11 @@ import {
 import {
   DRIVE_FOLDER_MIME_TYPE,
   DriveClient,
+  clearAllCachedChromeAuthTokens,
   type UploadArticleParams,
 } from '../../src/drive/drive-client.js';
 import {
+  DRIVE_FILE_SCOPE,
   OAUTH_CLIENT_ID_PLACEHOLDER,
   STORAGE_KEYS,
   type BackgroundPushMessage,
@@ -1491,5 +1493,276 @@ describe('service-worker controller', () => {
 
     await controller.runClip({ mode: 'full' });
     expect(uploadedTagBatches.at(-1)).toEqual(['reading-list']);
+  });
+
+  it('enables OAuth on a placeholder build when customWebAuthClientId is set and evicts cached tokens only when normalized value changes', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const clearCacheSpy = vi.fn(async () => undefined);
+    const revokeSpy = vi.fn(async () => undefined);
+
+    let signedInForClient: string | null = null;
+    const getAuthTokenSpy = vi.fn(
+      async (options: {
+        interactive: boolean;
+        customWebAuthClientId?: string | null;
+      }) => {
+        const clientId = options.customWebAuthClientId ?? null;
+        if (!options.interactive) {
+          if (signedInForClient && signedInForClient === clientId) {
+            return `tok-${clientId}`;
+          }
+          throw new Error('User is not signed in.');
+        }
+        signedInForClient = clientId;
+        return `tok-${clientId}`;
+      },
+    );
+
+    const controller = createServiceWorkerController({
+      storageSync: syncStorage,
+      storageLocal: localStorage,
+      getManifest: () => makeConfiguredManifest(OAUTH_CLIENT_ID_PLACEHOLDER),
+      getAuthToken: getAuthTokenSpy,
+      revokeAuthToken: revokeSpy,
+      clearAllCachedAuthTokens: async () => {
+        signedInForClient = null;
+        await clearCacheSpy();
+      },
+    });
+
+    // 1. Starts unconfigured on a placeholder build.
+    expect(await controller.handleMessage({ type: 'GET_AUTH_STATUS' })).toEqual({
+      ok: true,
+      data: { oauthConfigured: false, authenticated: false },
+    });
+    expect(await controller.handleMessage({ type: 'SIGN_IN' })).toMatchObject({
+      ok: false,
+      code: 'OAUTH_NOT_CONFIGURED',
+    });
+
+    // 2. Setting customWebAuthClientId trims it, clears cached tokens, and marks OAuth configured.
+    const saved = await controller.handleMessage({
+      type: 'UPDATE_SETTINGS',
+      patch: { customWebAuthClientId: '  777-byo.apps.googleusercontent.com  ' },
+    });
+    expect(saved.ok).toBe(true);
+    if (saved.ok) {
+      expect((saved.data as { customWebAuthClientId: string | null }).customWebAuthClientId).toBe(
+        '777-byo.apps.googleusercontent.com',
+      );
+    }
+    expect(clearCacheSpy).toHaveBeenCalledTimes(1);
+
+    expect(await controller.handleMessage({ type: 'GET_AUTH_STATUS' })).toEqual({
+      ok: true,
+      data: {
+        oauthConfigured: true,
+        authenticated: false,
+        authMode: 'custom-client',
+        usingCustomClientId: true,
+      },
+    });
+    expect(getAuthTokenSpy).toHaveBeenLastCalledWith({
+      interactive: false,
+      customWebAuthClientId: '777-byo.apps.googleusercontent.com',
+    });
+
+    // 3. SIGN_IN passes customWebAuthClientId and reports custom-client mode.
+    expect(await controller.handleMessage({ type: 'SIGN_IN' })).toEqual({
+      ok: true,
+      data: {
+        oauthConfigured: true,
+        authenticated: true,
+        authMode: 'custom-client',
+        usingCustomClientId: true,
+      },
+    });
+    expect(getAuthTokenSpy).toHaveBeenLastCalledWith({
+      interactive: true,
+      customWebAuthClientId: '777-byo.apps.googleusercontent.com',
+    });
+
+    // 4. Unrelated update or saving the same trimmed ID must NOT evict cached auth tokens.
+    await controller.updateSettings({ defaultTags: ['reading'] });
+    await controller.updateSettings({
+      customWebAuthClientId: '777-byo.apps.googleusercontent.com   ',
+    });
+    expect(clearCacheSpy).toHaveBeenCalledTimes(1);
+    expect(await controller.handleMessage({ type: 'GET_AUTH_STATUS' })).toEqual({
+      ok: true,
+      data: {
+        oauthConfigured: true,
+        authenticated: true,
+        authMode: 'custom-client',
+        usingCustomClientId: true,
+      },
+    });
+
+    // 5. Switching to a different custom client ID evicts the cached token from the old GCP project.
+    await controller.updateSettings({
+      customWebAuthClientId: '888-second.apps.googleusercontent.com',
+    });
+    expect(clearCacheSpy).toHaveBeenCalledTimes(2);
+    expect(await controller.handleMessage({ type: 'GET_AUTH_STATUS' })).toEqual({
+      ok: true,
+      data: {
+        oauthConfigured: true,
+        authenticated: false,
+        authMode: 'custom-client',
+        usingCustomClientId: true,
+      },
+    });
+
+    // 6. Clearing with empty string or placeholder normalizes back to null and evicts cached tokens.
+    const cleared = await controller.updateSettings({
+      customWebAuthClientId: '   ',
+    });
+    expect(cleared.customWebAuthClientId).toBeNull();
+    expect(clearCacheSpy).toHaveBeenCalledTimes(3);
+    expect(await controller.handleMessage({ type: 'GET_AUTH_STATUS' })).toEqual({
+      ok: true,
+      data: { oauthConfigured: false, authenticated: false },
+    });
+
+    const placeholderRejected = await controller.updateSettings({
+      customWebAuthClientId: OAUTH_CLIENT_ID_PLACEHOLDER,
+    });
+    expect(placeholderRejected.customWebAuthClientId).toBeNull();
+    expect(clearCacheSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('wires live customWebAuthClientId into default DriveClient tokenProvider and evicts real chrome.storage.session token on switch', async () => {
+    const syncStorage = createMemoryStorage();
+    const localStorage = createMemoryStorage();
+    const chromeSessionStore: Record<string, unknown> = {};
+    const rawRedirectUri = 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/';
+    const seenClientIds: string[] = [];
+    const seenAuthHeaders: string[] = [];
+    let webAuthSeq = 0;
+
+    const getAuthTokenSpy = vi.fn(async () => ({ token: 'chrome-builtin-token' }));
+    const launchWebAuthFlowSpy = vi.fn(
+      async (details: chrome.identity.WebAuthFlowDetails) => {
+        webAuthSeq += 1;
+        const parsed = new URL(details.url);
+        expect(parsed.searchParams.get('scope')).toBe(DRIVE_FILE_SCOPE);
+        seenClientIds.push(parsed.searchParams.get('client_id') ?? '');
+        const state = parsed.searchParams.get('state')!;
+        return `${rawRedirectUri}#access_token=live-custom-tok-${webAuthSeq}&expires_in=3600&state=${encodeURIComponent(state)}`;
+      },
+    );
+
+    const fetchImpl: typeof fetch = vi.fn(async (_input, init) => {
+      const auth = new Headers(init?.headers).get('authorization') ?? '';
+      seenAuthHeaders.push(auth);
+      return new Response(
+        JSON.stringify({ id: 'custom-root-1', name: 'WebClips' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+
+    const originalChrome = (globalThis as Record<string, unknown>).chrome;
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        getManifest: () => makeConfiguredManifest(OAUTH_CLIENT_ID_PLACEHOLDER),
+      },
+      identity: {
+        getAuthToken: getAuthTokenSpy,
+        getRedirectURL: () => rawRedirectUri,
+        launchWebAuthFlow: launchWebAuthFlowSpy,
+        removeCachedAuthToken: vi.fn(async () => undefined),
+        clearAllCachedAuthTokens: vi.fn(async () => undefined),
+      },
+      storage: {
+        session: {
+          get: async (key: string) =>
+            key in chromeSessionStore ? { [key]: chromeSessionStore[key] } : {},
+          set: async (items: Record<string, unknown>) => {
+            Object.assign(chromeSessionStore, items);
+          },
+          remove: async (key: string) => {
+            delete chromeSessionStore[key];
+          },
+        },
+      },
+    };
+
+    try {
+      await clearAllCachedChromeAuthTokens();
+
+      // Default production wiring: omit driveClient, getAuthToken, and clearAllCachedAuthTokens.
+      const controller = createServiceWorkerController({
+        fetchImpl,
+        storageSync: syncStorage,
+        storageLocal: localStorage,
+        getManifest: () => makeConfiguredManifest(OAUTH_CLIENT_ID_PLACEHOLDER),
+      });
+
+      await controller.handleMessage({
+        type: 'UPDATE_SETTINGS',
+        patch: { customWebAuthClientId: '111-proj-a.apps.googleusercontent.com' },
+      });
+
+      const signInRes = await controller.handleMessage({ type: 'SIGN_IN' });
+      expect(signInRes).toEqual({
+        ok: true,
+        data: {
+          oauthConfigured: true,
+          authenticated: true,
+          authMode: 'custom-client',
+          usingCustomClientId: true,
+        },
+      });
+      expect(chromeSessionStore[STORAGE_KEYS.webAuthToken]).toBeDefined();
+
+      // Default DriveClient uses the live custom client token for Drive API requests.
+      const rootRes = await controller.handleMessage({
+        type: 'ENSURE_ROOT_FOLDER',
+        folderName: 'WebClips',
+      });
+      expect(rootRes.ok).toBe(true);
+      expect(seenAuthHeaders).toEqual(['Bearer live-custom-tok-1']);
+
+      // Switching customWebAuthClientId evicts the real chrome.storage.session webAuthToken.
+      await controller.handleMessage({
+        type: 'UPDATE_SETTINGS',
+        patch: { customWebAuthClientId: '222-proj-b.apps.googleusercontent.com' },
+      });
+      expect(chromeSessionStore[STORAGE_KEYS.webAuthToken]).toBeUndefined();
+      expect(await controller.handleMessage({ type: 'GET_AUTH_STATUS' })).toEqual({
+        ok: true,
+        data: {
+          oauthConfigured: true,
+          authenticated: false,
+          authMode: 'custom-client',
+          usingCustomClientId: true,
+        },
+      });
+
+      // Signing in again launches webAuthFlow with the new project's Client ID.
+      const signInRes2 = await controller.handleMessage({ type: 'SIGN_IN' });
+      expect(signInRes2).toEqual({
+        ok: true,
+        data: {
+          oauthConfigured: true,
+          authenticated: true,
+          authMode: 'custom-client',
+          usingCustomClientId: true,
+        },
+      });
+      expect(seenClientIds).toEqual([
+        '111-proj-a.apps.googleusercontent.com',
+        '222-proj-b.apps.googleusercontent.com',
+      ]);
+      expect(getAuthTokenSpy).not.toHaveBeenCalled();
+    } finally {
+      await clearAllCachedChromeAuthTokens();
+      if (originalChrome === undefined) {
+        delete (globalThis as Record<string, unknown>).chrome;
+      } else {
+        (globalThis as Record<string, unknown>).chrome = originalChrome;
+      }
+    }
   });
 });

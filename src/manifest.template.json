@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Drive Clipper",
+  "name": "OKF Clipper for Google Drive",
+  "short_name": "OKF Clipper",
   "version": "0.1.0",
-  "description": "Clip web pages as clean Markdown with local images to Google Drive.",
+  "description": "Clip web pages via Defuddle into Open Knowledge Format (OKF v0.2) Markdown bundles with local images directly to Google Drive.",
   "permissions": [
     "identity",
     "storage",
