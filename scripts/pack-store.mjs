@@ -35,11 +35,29 @@ function isValidOAuthClientId(value) {
 function parseCliArgs(argv) {
   let allowPlaceholder = false;
   let outZip = null;
+  let configPath = null;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--allow-placeholder') {
       allowPlaceholder = true;
+      continue;
+    }
+    if (arg === '--config') {
+      const next = argv[i + 1];
+      if (!next || next.startsWith('--')) {
+        throw new Error('Missing config file path after --config.');
+      }
+      configPath = path.resolve(process.cwd(), next);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--config=')) {
+      const value = arg.slice('--config='.length).trim();
+      if (value.length === 0) {
+        throw new Error('Empty config file path for --config=');
+      }
+      configPath = path.resolve(process.cwd(), value);
       continue;
     }
     if (arg === '--out') {
@@ -62,7 +80,7 @@ function parseCliArgs(argv) {
     throw new Error(`Unknown pack-store argument: ${arg}`);
   }
 
-  return { allowPlaceholder, outZip };
+  return { allowPlaceholder, outZip, configPath };
 }
 
 function listFilesRecursively(dirPath, baseDir = dirPath) {
@@ -86,6 +104,7 @@ function isForbiddenStagedFile(filename) {
   const lower = filename.toLowerCase();
   if (
     lower === 'config.local.json' ||
+    lower === 'config.store.json' ||
     lower === '.ds_store' ||
     lower === '.env' ||
     lower.startsWith('.env.')
@@ -192,6 +211,9 @@ function main() {
     const buildArgs = [buildScriptPath, '--store', '--out-dir', stagingDir];
     if (options.allowPlaceholder) {
       buildArgs.push('--allow-placeholder');
+    }
+    if (options.configPath) {
+      buildArgs.push('--config', options.configPath);
     }
 
     execFileSync(process.execPath, buildArgs, {

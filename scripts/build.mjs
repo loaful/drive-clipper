@@ -43,6 +43,7 @@ function parseCliArgs(argv) {
   let outDir = defaultDistDir;
   let store = false;
   let allowPlaceholder = false;
+  let configPath = null;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -52,6 +53,23 @@ function parseCliArgs(argv) {
     }
     if (arg === '--allow-placeholder') {
       allowPlaceholder = true;
+      continue;
+    }
+    if (arg === '--config') {
+      const next = argv[i + 1];
+      if (!next || next.startsWith('--')) {
+        throw new Error('Missing config file path after --config.');
+      }
+      configPath = path.resolve(process.cwd(), next);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--config=')) {
+      const value = arg.slice('--config='.length).trim();
+      if (value.length === 0) {
+        throw new Error('Empty config file path for --config=');
+      }
+      configPath = path.resolve(process.cwd(), value);
       continue;
     }
     if (arg === '--out-dir') {
@@ -83,14 +101,20 @@ function parseCliArgs(argv) {
     throw new Error(`Refusing to build into unsafe --out-dir: ${normalizedOut}`);
   }
 
-  return { outDir: normalizedOut, store, allowPlaceholder };
+  return { outDir: normalizedOut, store, allowPlaceholder, configPath };
 }
 
 function readJsonFile(filePath) {
   return JSON.parse(readFileSync(filePath, 'utf8'));
 }
 
-function readLocalConfig() {
+function readLocalConfig(explicitConfigPath) {
+  if (explicitConfigPath) {
+    if (!existsSync(explicitConfigPath)) {
+      throw new Error(`Explicit config file not found: ${explicitConfigPath}`);
+    }
+    return readJsonFile(explicitConfigPath);
+  }
   const localConfigPath = path.join(rootDir, 'config.local.json');
   if (!existsSync(localConfigPath)) {
     return {};
@@ -234,7 +258,7 @@ async function bundleScripts(localConfig, outDir, options) {
 
 async function main() {
   const options = parseCliArgs(process.argv.slice(2));
-  const localConfig = readLocalConfig();
+  const localConfig = readLocalConfig(options.configPath);
   rmSync(options.outDir, { recursive: true, force: true });
   mkdirSync(options.outDir, { recursive: true });
 
