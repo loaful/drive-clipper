@@ -1039,6 +1039,7 @@ async function createExtensionHarness(params: {
   initialTabs?: Array<{ tabId: number; url: string }>;
   ignoredConsoleUrls?: string[];
   initialSessionStore?: Record<string, unknown>;
+  initialSignedIn?: boolean;
 }) {
   const { context, distBaseUrl, fixtureServer, driveServer } = params;
 
@@ -1051,9 +1052,21 @@ async function createExtensionHarness(params: {
     ...(params.initialSessionStore ?? {}),
   };
   const recordedAuthScopes: string[][] = [];
+  const recordedGetAuthTokenCalls: Array<{
+    interactive?: boolean;
+    scopes?: string[];
+  }> = [];
+  const recordedWebAuthFlowCalls: Array<{
+    url: string;
+    interactive?: boolean;
+    clientId: string | null;
+    scope: string | null;
+    redirectUri: string | null;
+    state: string | null;
+  }> = [];
   const badgeUpdates: Array<{ text: string; color?: string }> = [];
   let keepalivePings = 0;
-  let signedIn = true;
+  let signedIn = params.initialSignedIn ?? true;
   let injectedContentCount = 0;
   let activeTabId = 101;
   const tabsById = new Map<number, RegisteredTabEntry>();
@@ -1191,6 +1204,18 @@ async function createExtensionHarness(params: {
     });
   });
 
+  // Intercept Google OAuth2 token revocation requests locally during sign-out tests
+  await swPage.route('https://oauth2.googleapis.com/**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
+      body: '{}',
+    });
+  });
+
   // Apply active DNR session rules registered by dist/background.js onto fixture image requests
   await swPage.route(`${fixtureServer.baseUrl}/**`, async (route) => {
     const req = route.request();
@@ -1238,6 +1263,10 @@ async function createExtensionHarness(params: {
   await swPage.exposeFunction(
     '__e2eGetAuthToken',
     (details: { interactive?: boolean; scopes?: string[] }) => {
+      recordedGetAuthTokenCalls.push({
+        interactive: details?.interactive,
+        scopes: Array.isArray(details?.scopes) ? [...details.scopes] : undefined,
+      });
       if (Array.isArray(details?.scopes)) {
         recordedAuthScopes.push([...details.scopes]);
       }
@@ -1249,6 +1278,34 @@ async function createExtensionHarness(params: {
         throw new Error('User is signed out');
       }
       return { token: 'mock-e2e-access-token' };
+    },
+  );
+
+  await swPage.exposeFunction(
+    '__e2eLaunchWebAuthFlow',
+    (details: { url: string; interactive?: boolean }) => {
+      const parsed = new URL(details.url);
+      const clientId = parsed.searchParams.get('client_id');
+      const scope = parsed.searchParams.get('scope');
+      const redirectUri = parsed.searchParams.get('redirect_uri');
+      const state = parsed.searchParams.get('state');
+      recordedWebAuthFlowCalls.push({
+        url: details.url,
+        interactive: details.interactive,
+        clientId,
+        scope,
+        redirectUri,
+        state,
+      });
+      if (scope) {
+        recordedAuthScopes.push(scope.split(/\s+/).filter(Boolean));
+      }
+      if (!details.interactive) {
+        throw new Error('User interaction required');
+      }
+      const callbackBase =
+        redirectUri ?? 'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org';
+      return `${callbackBase}#access_token=mock-e2e-web-auth-token&expires_in=3600&state=${encodeURIComponent(state ?? '')}`;
     },
   );
 
@@ -1462,9 +1519,11 @@ async function createExtensionHarness(params: {
 
     w.chrome = {
       runtime: {
+        id: 'lliikkoebahbliapkdchhdahfodpcach',
         getManifest: () => ({
           manifest_version: 3,
-          name: 'Drive Clipper',
+          name: 'OKF Clipper for Google Drive',
+          short_name: 'OKF Clipper',
           version: '0.1.0',
           oauth2: {
             client_id: clientId,
@@ -1500,8 +1559,12 @@ async function createExtensionHarness(params: {
           (w.__e2eSetBadgeBgColor as (d: unknown) => Promise<void>)(details),
       },
       identity: {
+        getRedirectURL: () =>
+          'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org/',
         getAuthToken: (details: unknown) =>
           (w.__e2eGetAuthToken as (d: unknown) => Promise<unknown>)(details),
+        launchWebAuthFlow: (details: unknown) =>
+          (w.__e2eLaunchWebAuthFlow as (d: unknown) => Promise<string>)(details),
         removeCachedAuthToken: async () =>
           (w.__e2eClearAuth as () => Promise<void>)(),
         clearAllCachedAuthTokens: async () =>
@@ -1605,7 +1668,8 @@ async function createExtensionHarness(params: {
           lastError: undefined,
           getManifest: () => ({
             manifest_version: 3,
-            name: 'Drive Clipper',
+            name: 'OKF Clipper for Google Drive',
+            short_name: 'OKF Clipper',
             version: '0.1.0',
             oauth2: {
               client_id: clientId,
@@ -1665,6 +1729,25 @@ async function createExtensionHarness(params: {
     return { page: popupPage, consoleErrors, pageErrors };
   };
 
+  const openOptions = async (): Promise<{
+    page: Page;
+    consoleErrors: string[];
+    pageErrors: string[];
+  }> => {
+    const optionsPage = await context.newPage();
+    await optionsPage.setViewportSize({ width: 900, height: 960 });
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    optionsPage.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    optionsPage.on('pageerror', (err) => pageErrors.push(err.message));
+
+    await attachUiChromeBridge(optionsPage);
+    await optionsPage.goto(`${distBaseUrl}/options.html`, { waitUntil: 'networkidle' });
+    return { page: optionsPage, consoleErrors, pageErrors };
+  };
+
   return {
     articlePage: firstArticlePage,
     tabsById,
@@ -1679,6 +1762,8 @@ async function createExtensionHarness(params: {
     dnrUpdateLog,
     dnrRuleIdCollisions,
     recordedAuthScopes,
+    recordedGetAuthTokenCalls,
+    recordedWebAuthFlowCalls,
     badgeUpdates,
     sessionStore,
     getKeepalivePings: () => keepalivePings,
@@ -1686,6 +1771,7 @@ async function createExtensionHarness(params: {
     sendToServiceWorker,
     attachUiChromeBridge,
     openPopup,
+    openOptions,
     async close() {
       for (const p of uiPushSubscribers) {
         if (!p.isClosed()) await p.close();
@@ -1705,6 +1791,8 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
 
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
       manifest_version: number;
+      name?: string;
+      short_name?: string;
       oauth2?: { client_id?: string; scopes?: string[] };
       background?: { service_worker?: string };
       action?: { default_popup?: string; default_icon?: Record<string, string> };
@@ -1714,6 +1802,8 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
     };
 
     expect(manifest.manifest_version).toBe(3);
+    expect(manifest.name).toBe('OKF Clipper for Google Drive');
+    expect(manifest.short_name).toBe('OKF Clipper');
     expect(manifest.oauth2?.scopes).toEqual([REQUIRED_DRIVE_SCOPE]);
     expect(manifest.content_security_policy?.extension_pages).toBe(
       "script-src 'self'; object-src 'self'",
@@ -2029,7 +2119,11 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
         'href',
         `https://drive.google.com/drive/folders/${rootFolderId}`,
       );
-      await expect(optionsPage.locator('#drive-file-note')).toContainText('drive.file');
+      await expect(optionsPage.locator('#drive-file-note')).toContainText('Google Drive ID');
+      await expect(optionsPage.locator('#drive-file-note')).toContainText('move or rename');
+      await expect(optionsPage.locator('#drive-file-note')).not.toContainText('drive.file');
+      await expect(optionsPage.locator('#advanced-section')).not.toHaveAttribute('open', '');
+      await expect(optionsPage.locator('#advanced-section')).toContainText(REQUIRED_DRIVE_SCOPE);
 
       const optionsOverflow = await optionsPage.evaluate(
         () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -2910,6 +3004,194 @@ test.describe('Drive Clipper E2E (real Chromium + built dist/ artifacts)', () =>
       expect(popup3.pageErrors).toEqual([]);
       expect(popup4.consoleErrors).toEqual([]);
       expect(popup4.pageErrors).toEqual([]);
+      expect(harness.swErrors).toEqual([]);
+      expect(harness.getAllArticleErrors()).toEqual([]);
+
+      await harness.close();
+    } finally {
+      await context.close();
+      await Promise.all([
+        fixtureServer.close(),
+        driveServer.close(),
+        distServer.close(),
+      ]);
+    }
+  });
+
+  test('renders consumer onboarding Connect Google Drive popup card, transitions to clip form on sign-in, keeps Options Advanced collapsed by default, and routes BYO Custom Web OAuth Client ID through launchWebAuthFlow', async ({
+    browser,
+  }) => {
+    mkdirSync(SCREENSHOT_DIR, { recursive: true });
+
+    const fixtureServer = await startFixtureServer();
+    const driveServer = await startMockDriveServer();
+    const distServer = await startStaticDistServer();
+    const context = await browser.newContext();
+
+    try {
+      const harness = await createExtensionHarness({
+        context,
+        distBaseUrl: distServer.baseUrl,
+        fixtureServer,
+        driveServer,
+        initialSignedIn: false,
+      });
+
+      // 1. Popup consumer onboarding welcome card when signed out
+      const popup = await harness.openPopup();
+      await expect(popup.page.locator('.brand-title')).toHaveText('OKF Clipper');
+      await expect(popup.page.locator('#auth-pill-label')).toHaveText('Signed out');
+      await expect(popup.page.locator('#onboarding-banner')).toBeVisible();
+      await expect(popup.page.locator('#onboarding-banner')).toHaveClass(/banner--welcome/);
+      await expect(popup.page.locator('#banner-title')).toHaveText('Connect Google Drive');
+      await expect(popup.page.locator('#banner-description')).toContainText('WebClips/');
+      await expect(popup.page.locator('#banner-description')).toContainText(
+        'No third-party servers',
+      );
+      await expect(popup.page.locator('#banner-description')).toContainText(
+        'only access files it creates',
+      );
+
+      // Zero internal dev jargon visible to regular signed-out Chrome Web Store users
+      const bannerText = await popup.page.locator('#onboarding-banner').innerText();
+      expect(bannerText).not.toMatch(/config\.local\.json|chrome\.identity|googleapis\.com/i);
+
+      // Single clear Connect CTA; clip form hidden while signed out
+      await expect(popup.page.locator('#banner-signin-btn')).toBeVisible();
+      await expect(popup.page.locator('#banner-signin-btn')).toHaveText('Connect Google Drive');
+      await expect(popup.page.locator('#banner-options-btn')).toBeHidden();
+      await expect(popup.page.locator('#clip-form')).toBeHidden();
+
+      // Clean 360px popup width with zero horizontal overflow
+      const signedOutPopupOverflow = await popup.page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(signedOutPopupOverflow).toBeLessThanOrEqual(0);
+
+      // Fit viewport tightly to popup content height before capturing crisp onboarding screenshot
+      const popupContentHeight = await popup.page.evaluate(() =>
+        Math.ceil(document.documentElement.getBoundingClientRect().height),
+      );
+      await popup.page.setViewportSize({
+        width: 360,
+        height: Math.max(260, popupContentHeight),
+      });
+      const onboardingScreenshotPath = path.join(
+        SCREENSHOT_DIR,
+        'popup-consumer-onboarding.png',
+      );
+      await popup.page.screenshot({ path: onboardingScreenshotPath, fullPage: true });
+      expect(statSync(onboardingScreenshotPath).size).toBeGreaterThan(0);
+
+      // Clicking Connect Google Drive signs in and immediately transitions to the clip form
+      await popup.page.locator('#banner-signin-btn').click();
+      await expect(popup.page.locator('#onboarding-banner')).toBeHidden();
+      await expect(popup.page.locator('#auth-pill-label')).toHaveText('Connected');
+      await expect(popup.page.locator('#clip-form')).toBeVisible();
+      await expect(popup.page.locator('#title-input')).toHaveValue(
+        'Drive Clipper End-to-End Architecture',
+      );
+      await expect(popup.page.locator('#clip-submit-btn')).toBeEnabled();
+      await popup.page.close();
+
+      // 2. Options page: Advanced & Self-hosting collapsed by default when OAuth is configured
+      const options = await harness.openOptions();
+      await expect(options.page.locator('.page-title')).toHaveText('OKF Clipper Settings');
+      await expect(options.page.locator('#auth-status-text')).toHaveText('Connected');
+      await expect(options.page.locator('#custom-client-pill')).toBeHidden();
+      await expect(options.page.locator('#oauth-unconfigured-callout')).toBeHidden();
+
+      const accountCardText = await options.page
+        .locator('section[aria-labelledby="auth-heading"]')
+        .innerText();
+      expect(accountCardText).not.toMatch(
+        /config\.local\.json|chrome\.identity|drive\.file|googleapis\.com/i,
+      );
+
+      const advancedDetails = options.page.locator('#advanced-section');
+      await expect(advancedDetails).toBeVisible();
+      expect(await advancedDetails.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(false);
+      await expect(options.page.locator('#custom-client-id-input')).toBeHidden();
+
+      const optionsOverflow = await options.page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(optionsOverflow).toBeLessThanOrEqual(0);
+
+      const optionsScreenshotPath = path.join(
+        SCREENSHOT_DIR,
+        'options-clean-collapsed-advanced.png',
+      );
+      await options.page.screenshot({ path: optionsScreenshotPath, fullPage: true });
+      expect(statSync(optionsScreenshotPath).size).toBeGreaterThan(0);
+
+      // 3. Expand Advanced & Self-hosting -> shows Custom Web OAuth Client ID + diagnostics
+      await options.page.locator('#advanced-section > summary').click();
+      expect(await advancedDetails.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(true);
+      await expect(options.page.locator('#custom-client-id-input')).toBeVisible();
+      await expect(options.page.locator('#extension-id-value')).toHaveText(
+        'lliikkoebahbliapkdchhdahfodpcach',
+      );
+      await expect(options.page.locator('#oauth-redirect-uri-value')).toHaveText(
+        'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org',
+      );
+      await expect(advancedDetails).toContainText(REQUIRED_DRIVE_SCOPE);
+
+      // 4. Save BYO Custom Web OAuth Client ID -> evicts cached token, routes SIGN_IN via launchWebAuthFlow (bypassing getAuthToken!)
+      const customByoClientId = '999888777666-e2ebyo.apps.googleusercontent.com';
+      await options.page.locator('#custom-client-id-input').fill(customByoClientId);
+      await options.page.locator('#save-custom-client-btn').click();
+
+      await expect(options.page.locator('#custom-client-feedback')).toContainText(
+        'Custom OAuth client saved',
+      );
+      await expect(options.page.locator('#auth-status-text')).toHaveText('Not connected');
+      await expect(options.page.locator('#custom-client-pill')).toBeVisible();
+      await expect(options.page.locator('#advanced-custom-badge')).toBeVisible();
+      await expect(options.page.locator('#sign-in-btn')).toBeVisible();
+
+      const getAuthCallsBeforeByoSignIn = harness.recordedGetAuthTokenCalls.length;
+      const webAuthCallsBeforeByoSignIn = harness.recordedWebAuthFlowCalls.length;
+
+      await options.page.locator('#sign-in-btn').click();
+      await expect(options.page.locator('#auth-status-text')).toHaveText('Connected');
+      await expect(options.page.locator('#custom-client-pill')).toBeVisible();
+
+      // Critical BYO invariant: getAuthToken was NOT invoked; launchWebAuthFlow received the custom Client ID + drive.file scope
+      expect(harness.recordedGetAuthTokenCalls.length).toBe(getAuthCallsBeforeByoSignIn);
+      expect(harness.recordedWebAuthFlowCalls.length).toBe(webAuthCallsBeforeByoSignIn + 1);
+      const byoFlowCall = harness.recordedWebAuthFlowCalls.at(-1)!;
+      expect(byoFlowCall.interactive).toBe(true);
+      expect(byoFlowCall.clientId).toBe(customByoClientId);
+      expect(byoFlowCall.scope).toBe(REQUIRED_DRIVE_SCOPE);
+      expect(byoFlowCall.redirectUri).toBe(
+        'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org',
+      );
+      expect(byoFlowCall.state).toBeTruthy();
+
+      // 5. Clicking "Use built-in" clears customWebAuthClientId, evicts custom web token, and reverts to getAuthToken
+      await options.page.locator('#reset-custom-client-btn').click();
+      await expect(options.page.locator('#custom-client-feedback')).toContainText(
+        'Switched back to the built-in OAuth client.',
+      );
+      await expect(options.page.locator('#custom-client-id-input')).toHaveValue('');
+      await expect(options.page.locator('#custom-client-pill')).toBeHidden();
+      await expect(options.page.locator('#auth-status-text')).toHaveText('Not connected');
+
+      const getAuthCallsBeforeBuiltInSignIn = harness.recordedGetAuthTokenCalls.length;
+      const webAuthCallsBeforeBuiltInSignIn = harness.recordedWebAuthFlowCalls.length;
+
+      await options.page.locator('#sign-in-btn').click();
+      await expect(options.page.locator('#auth-status-text')).toHaveText('Connected');
+      expect(harness.recordedGetAuthTokenCalls.length).toBe(
+        getAuthCallsBeforeBuiltInSignIn + 1,
+      );
+      expect(harness.recordedWebAuthFlowCalls.length).toBe(webAuthCallsBeforeBuiltInSignIn);
+
+      expect(popup.consoleErrors).toEqual([]);
+      expect(popup.pageErrors).toEqual([]);
+      expect(options.consoleErrors).toEqual([]);
+      expect(options.pageErrors).toEqual([]);
       expect(harness.swErrors).toEqual([]);
       expect(harness.getAllArticleErrors()).toEqual([]);
 
