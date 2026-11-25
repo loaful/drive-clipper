@@ -17,10 +17,16 @@
             <rect x="8.2" y="11" width="5.6" height="1.5" rx="0.75" fill="#2563eb" />
             <rect x="8.2" y="14" width="6.8" height="1.5" rx="0.75" fill="#94a3b8" />
           </svg>
-          <span class="brand-title">OKF Clipper</span>
+          <h1 class="brand-title">OKF Clipper</h1>
         </div>
         <div class="header-actions">
-          <span id="auth-pill" class="status-pill status-pill--neutral" data-status="loading">
+          <span
+            id="auth-pill"
+            class="status-pill status-pill--neutral"
+            data-status="loading"
+            role="status"
+            aria-label="Google Drive status: Checking"
+          >
             <span class="status-dot" aria-hidden="true"></span>
             <span id="auth-pill-label">Checking...</span>
           </span>
@@ -31,12 +37,20 @@
             title="Open settings"
             aria-label="Open settings"
           >
-            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-              <circle cx="10" cy="10" r="2.75" />
+            <svg
+              viewBox="0 0 20 20"
+              width="15"
+              height="15"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="10" cy="10" r="2.5" />
               <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                d="M10 2.75v1.5m0 11.5v1.5m7.25-7.25h-1.5m-11.5 0h-1.5m12.37-5.12-1.06 1.06M5.94 14.06l-1.06 1.06m10.24 0-1.06-1.06M5.94 5.94 4.88 4.88"
+                d="M16.1 10a6.1 6.1 0 0 0-.08-.95l1.53-1.18a.45.45 0 0 0 .1-.58l-1.45-2.51a.45.45 0 0 0-.55-.2l-1.8.72a6.1 6.1 0 0 0-1.64-.95l-.27-1.92a.45.45 0 0 0-.45-.38H8.51a.45.45 0 0 0-.45.38l-.27 1.92a6.1 6.1 0 0 0-1.64.95l-1.8-.72a.45.45 0 0 0-.55.2L2.35 7.29a.45.45 0 0 0 .1.58l1.53 1.18a6.2 6.2 0 0 0 0 1.9l-1.53 1.18a.45.45 0 0 0-.1.58l1.45 2.51a.45.45 0 0 0 .55.2l1.8-.72c.5.4 1.05.72 1.64.95l.27 1.92a.45.45 0 0 0 .45.38h2.98a.45.45 0 0 0 .45-.38l.27-1.92c.59-.23 1.14-.55 1.64-.95l1.8.72a.45.45 0 0 0 .55-.2l1.45-2.51a.45.45 0 0 0-.1-.58l-1.53-1.18c.05-.31.08-.63.08-.95Z"
               />
             </svg>
           </button>
@@ -45,7 +59,7 @@
 
       <section id="onboarding-banner" class="banner" hidden aria-live="polite">
         <div id="banner-hero" class="banner-hero" hidden aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.75">
+          <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.75">
             <path
               stroke-linecap="round"
               stroke-linejoin="round"
@@ -78,12 +92,13 @@
             type="text"
             class="text-input"
             placeholder="Page title"
+            aria-describedby="folder-preview-row"
             autocomplete="off"
             spellcheck="false"
           />
           <div id="folder-preview-row" class="folder-preview-row" title="Google Drive path created for this clip">
-            <svg class="folder-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
-              <path d="M2 4.25A1.25 1.25 0 0 1 3.25 3h2.8l1.2 1.5h5.5A1.25 1.25 0 0 1 14 5.75v6A1.25 1.25 0 0 1 12.75 13h-9.5A1.25 1.25 0 0 1 2 11.75v-7.5Z" />
+            <svg class="folder-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.45" aria-hidden="true">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M2 4.25A1.25 1.25 0 0 1 3.25 3h2.8l1.2 1.5h5.5A1.25 1.25 0 0 1 14 5.75v6A1.25 1.25 0 0 1 12.75 13h-9.5A1.25 1.25 0 0 1 2 11.75v-7.5Z" />
             </svg>
             <span id="root-folder-prefix" class="folder-prefix">WebClips/</span>
             <code id="folder-preview" class="folder-slug" data-testid="folder-preview"></code>
@@ -92,16 +107,22 @@
 
         <div class="field">
           <div class="field-label-row">
-            <span class="field-label">Clip scope</span>
+            <span id="clip-scope-label" class="field-label">Clip scope</span>
             <span id="selection-hint" class="field-meta"></span>
           </div>
-          <div class="segmented" role="radiogroup" aria-label="Clip mode">
+          <div
+            class="segmented"
+            role="radiogroup"
+            aria-labelledby="clip-scope-label"
+            aria-describedby="selection-hint"
+          >
             <button
               type="button"
               id="mode-full-btn"
               class="segmented-btn"
               role="radio"
               aria-checked="true"
+              tabindex="0"
               data-mode="full"
             >
               Full page
@@ -112,6 +133,8 @@
               class="segmented-btn"
               role="radio"
               aria-checked="false"
+              tabindex="-1"
+              aria-describedby="selection-hint"
               data-mode="selection"
             >
               Selection
@@ -160,16 +183,18 @@
         id="clip-queue-panel"
         class="queue-panel"
         hidden
-        aria-live="polite"
-        aria-label="Clip queue"
+        aria-labelledby="clip-queue-heading"
       >
         <div class="queue-header">
           <div class="queue-heading-group">
-            <h2 class="queue-title">Clip queue</h2>
+            <h2 id="clip-queue-heading" class="queue-title">Clip queue</h2>
             <span
               id="clip-queue-summary"
               class="queue-summary-badge"
               data-testid="clip-queue-summary"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
             ></span>
           </div>
           <button
@@ -184,10 +209,12 @@
         <ul id="clip-queue-list" class="queue-list" data-testid="clip-queue-list"></ul>
       </section>
 
+      <div id="queue-live-region" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
       <details id="recent-clips-section" class="recent-clips">
         <summary class="recent-clips-summary">
           <span class="recent-clips-heading">
-            <svg class="chevron" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+            <svg class="chevron" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
               <path stroke-linecap="round" stroke-linejoin="round" d="m6 4 4 4-4 4" />
             </svg>
             <span>Recent clips</span>

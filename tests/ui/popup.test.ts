@@ -1423,4 +1423,75 @@ describe('Popup UI', () => {
     expect(authErrPresentation.canDismiss).toBe(true);
     expect(authErrPresentation.canOpen).toBe(false);
   });
+
+  it('supports keyboard arrow navigation on clip scope radiogroup and polite live announcements for job transitions', async () => {
+    const root = loadPopupDom();
+    const mock = createMockRuntime({
+      pageInfo: {
+        ok: true,
+        data: {
+          tabId: 19,
+          url: 'https://example.com/a11y',
+          title: 'Accessible Article',
+          hasSelection: true,
+          selectionLength: 120,
+          site: 'example.com',
+        },
+      },
+    });
+
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    const fullBtn = root.querySelector<HTMLButtonElement>('#mode-full-btn')!;
+    const selBtn = root.querySelector<HTMLButtonElement>('#mode-selection-btn')!;
+    const liveRegion = root.querySelector<HTMLElement>('#queue-live-region')!;
+
+    // Selection is auto-checked with roving tabindex
+    expect(selBtn.getAttribute('aria-checked')).toBe('true');
+    expect(selBtn.tabIndex).toBe(0);
+    expect(fullBtn.tabIndex).toBe(-1);
+
+    // ArrowLeft toggles to Full page and moves roving tabindex
+    selBtn.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true, cancelable: true }),
+    );
+    expect(fullBtn.getAttribute('aria-checked')).toBe('true');
+    expect(fullBtn.tabIndex).toBe(0);
+    expect(selBtn.tabIndex).toBe(-1);
+
+    // ArrowRight toggles back to Selection
+    fullBtn.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }),
+    );
+    expect(selBtn.getAttribute('aria-checked')).toBe('true');
+    expect(selBtn.tabIndex).toBe(0);
+
+    // Progress bar includes accessible label, and terminal transitions announce via live region
+    mock.emitJobs([
+      makeJob({
+        id: 'job-a11y',
+        title: 'Accessible Article',
+        status: 'downloading',
+        completed: 2,
+        total: 4,
+      }),
+    ]);
+    const progressBar = root.querySelector<HTMLElement>('[role="progressbar"]')!;
+    expect(progressBar.getAttribute('aria-label')).toContain('Accessible Article');
+    expect(progressBar.getAttribute('aria-valuenow')).toBe('50');
+
+    mock.emitJobs([
+      makeJob({
+        id: 'job-a11y',
+        title: 'Accessible Article',
+        status: 'done',
+        result: makeClipResult({ title: 'Accessible Article' }),
+      }),
+    ]);
+    expect(liveRegion.textContent).toContain('Accessible Article');
+    expect(liveRegion.textContent).toContain('Saved');
+  });
 });

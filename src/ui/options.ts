@@ -46,11 +46,13 @@ function setFeedback(
   if (message.trim().length === 0) {
     el.hidden = true;
     el.textContent = '';
+    el.setAttribute('role', 'status');
     delete el.dataset.tone;
     return;
   }
   el.hidden = false;
   el.dataset.tone = tone;
+  el.setAttribute('role', tone === 'error' ? 'alert' : 'status');
   el.textContent = message;
 }
 
@@ -222,6 +224,7 @@ export async function mountOptions(
     advancedCustomBadge.hidden = !usingCustomClient;
     customClientIdInput.disabled = busyCustomClient;
     saveCustomClientBtn.disabled = busyCustomClient;
+    saveCustomClientBtn.setAttribute('aria-busy', String(busyCustomClient));
     resetCustomClientBtn.disabled = busyCustomClient || !hasSavedCustomClient;
   };
 
@@ -259,6 +262,9 @@ export async function mountOptions(
       reauthBtn.hidden = false;
       signOutBtn.disabled = busyAuth;
       reauthBtn.disabled = busyAuth;
+      signInBtn.setAttribute('aria-busy', 'false');
+      signOutBtn.setAttribute('aria-busy', String(busyAuth));
+      reauthBtn.setAttribute('aria-busy', String(busyAuth));
     } else {
       authStatusBadge.classList.add('status-pill--warn');
       authStatusBadge.dataset.status = 'signed-out';
@@ -266,11 +272,13 @@ export async function mountOptions(
       oauthUnconfiguredCallout.hidden = true;
       signInBtn.hidden = false;
       signInBtn.disabled = busyAuth;
+      signInBtn.setAttribute('aria-busy', String(busyAuth));
       signOutBtn.hidden = true;
       reauthBtn.hidden = true;
     }
 
     createSwitchFolderBtn.disabled = busyFolder || !oauthConfigured;
+    createSwitchFolderBtn.setAttribute('aria-busy', String(busyFolder));
     renderCustomClientControls();
   };
 
@@ -279,11 +287,13 @@ export async function mountOptions(
 
     if (settings.rootFolderId) {
       rootFolderIdValue.textContent = settings.rootFolderId;
+      delete rootFolderIdValue.dataset.empty;
       openRootFolderLink.href = buildDriveFolderUrl(settings.rootFolderId);
       openRootFolderLink.hidden = false;
     } else {
       rootFolderIdValue.textContent =
         'Not created yet (created automatically on first clip)';
+      rootFolderIdValue.dataset.empty = 'true';
       openRootFolderLink.removeAttribute('href');
       openRootFolderLink.hidden = true;
     }
@@ -295,6 +305,7 @@ export async function mountOptions(
     fmIncludeImages.checked = settings.frontmatter.includeImages;
     fmIncludeWarnings.checked = settings.frontmatter.includeWarnings;
     savePreferencesBtn.disabled = busySave;
+    savePreferencesBtn.setAttribute('aria-busy', String(busySave));
 
     customClientIdInput.value = settings.customWebAuthClientId ?? '';
     renderCustomClientControls();
@@ -431,6 +442,7 @@ export async function mountOptions(
       renderAuth();
       return;
     }
+    authStatus = signOutRes.data;
 
     const signInRes = await runtime.sendMessage({ type: 'SIGN_IN' });
     busyAuth = false;
@@ -460,6 +472,8 @@ export async function mountOptions(
 
     const folderName = rootFolderNameInput.value.trim();
     if (folderName.length === 0) {
+      rootFolderNameInput.setAttribute('aria-invalid', 'true');
+      rootFolderNameInput.setAttribute('aria-describedby', 'folder-feedback');
       setFeedback(
         folderFeedback,
         'Enter a folder name before creating or switching.',
@@ -468,6 +482,8 @@ export async function mountOptions(
       rootFolderNameInput.focus();
       return;
     }
+    rootFolderNameInput.removeAttribute('aria-invalid');
+    rootFolderNameInput.removeAttribute('aria-describedby');
 
     const hadExistingFolder = Boolean(settings.rootFolderId);
     busyFolder = true;
@@ -573,10 +589,17 @@ export async function mountOptions(
 
     const validationError = validateCustomClientIdInput(customClientIdInput.value);
     if (validationError) {
+      customClientIdInput.setAttribute('aria-invalid', 'true');
+      customClientIdInput.setAttribute(
+        'aria-describedby',
+        'custom-client-help custom-client-feedback',
+      );
       setFeedback(customClientFeedback, validationError, 'error');
       customClientIdInput.focus();
       return;
     }
+    customClientIdInput.removeAttribute('aria-invalid');
+    customClientIdInput.setAttribute('aria-describedby', 'custom-client-help');
 
     const nextClientId = customClientIdInput.value.trim();
     busyCustomClient = true;
@@ -682,13 +705,29 @@ export async function mountOptions(
     }
   };
 
+  const handleFolderNameInput = (): void => {
+    if (rootFolderNameInput.getAttribute('aria-invalid') === 'true') {
+      rootFolderNameInput.removeAttribute('aria-invalid');
+      rootFolderNameInput.removeAttribute('aria-describedby');
+    }
+  };
+
+  const handleCustomClientIdInput = (): void => {
+    if (customClientIdInput.getAttribute('aria-invalid') === 'true') {
+      customClientIdInput.removeAttribute('aria-invalid');
+      customClientIdInput.setAttribute('aria-describedby', 'custom-client-help');
+    }
+  };
+
   renderIdentityMetadata();
 
   signInBtn.addEventListener('click', handleSignIn);
   signOutBtn.addEventListener('click', handleSignOut);
   reauthBtn.addEventListener('click', handleReauth);
+  rootFolderNameInput.addEventListener('input', handleFolderNameInput);
   createSwitchFolderBtn.addEventListener('click', handleCreateOrSwitchFolder);
   preferencesForm.addEventListener('submit', handleSavePreferences);
+  customClientIdInput.addEventListener('input', handleCustomClientIdInput);
   customClientForm.addEventListener('submit', handleSaveCustomClient);
   resetCustomClientBtn.addEventListener('click', handleResetCustomClient);
 
@@ -708,11 +747,13 @@ export async function mountOptions(
       signInBtn.removeEventListener('click', handleSignIn);
       signOutBtn.removeEventListener('click', handleSignOut);
       reauthBtn.removeEventListener('click', handleReauth);
+      rootFolderNameInput.removeEventListener('input', handleFolderNameInput);
       createSwitchFolderBtn.removeEventListener(
         'click',
         handleCreateOrSwitchFolder,
       );
       preferencesForm.removeEventListener('submit', handleSavePreferences);
+      customClientIdInput.removeEventListener('input', handleCustomClientIdInput);
       customClientForm.removeEventListener('submit', handleSaveCustomClient);
       resetCustomClientBtn.removeEventListener('click', handleResetCustomClient);
     },

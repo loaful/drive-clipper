@@ -17,7 +17,7 @@
             <rect x="8.2" y="11" width="5.6" height="1.5" rx="0.75" fill="#2563eb" />
             <rect x="8.2" y="14" width="6.8" height="1.5" rx="0.75" fill="#94a3b8" />
           </svg>
-          <div>
+          <div class="brand-copy">
             <h1 class="page-title">OKF Clipper Settings</h1>
             <p class="page-subtitle">
               Connect Google Drive, choose your save folder, and customize tags and Markdown frontmatter.
@@ -28,7 +28,7 @@
 
       <section class="card" aria-labelledby="auth-heading">
         <div class="card-header">
-          <div>
+          <div class="card-heading-copy">
             <h2 id="auth-heading" class="card-title">Google Drive Account</h2>
             <p class="card-description">
               Uploads go directly from your browser to your Google Drive. This extension can only access the folder and clips it creates — never your other Drive files.
@@ -38,7 +38,12 @@
             <span id="custom-client-pill" class="status-pill status-pill--accent" hidden>
               Custom OAuth client
             </span>
-            <span id="auth-status-badge" class="status-pill status-pill--neutral" data-status="loading">
+            <span
+              id="auth-status-badge"
+              class="status-pill status-pill--neutral"
+              data-status="loading"
+              role="status"
+            >
               <span class="status-dot" aria-hidden="true"></span>
               <span id="auth-status-text">Checking...</span>
             </span>
@@ -64,12 +69,12 @@
           </button>
         </div>
 
-        <p id="auth-feedback" class="feedback" hidden aria-live="polite"></p>
+        <p id="auth-feedback" class="feedback" hidden role="status" aria-live="polite"></p>
       </section>
 
       <section class="card" aria-labelledby="folder-heading">
         <div class="card-header">
-          <div>
+          <div class="card-heading-copy">
             <h2 id="folder-heading" class="card-title">Save Folder</h2>
             <p class="card-description">
               Each clipped page creates a dated subfolder with Markdown and local images inside this Google Drive folder, alongside an index and clip log.
@@ -98,7 +103,7 @@
           <div class="folder-id-panel">
             <div class="folder-id-info">
               <span class="meta-label">Save Folder ID</span>
-              <code id="root-folder-id-value" class="folder-id-code" data-testid="root-folder-id">
+              <code id="root-folder-id-value" class="folder-id-code" data-testid="root-folder-id" data-empty="true">
                 Not created yet
               </code>
             </div>
@@ -125,12 +130,12 @@
           </p>
         </div>
 
-        <p id="folder-feedback" class="feedback" hidden aria-live="polite"></p>
+        <p id="folder-feedback" class="feedback" hidden role="status" aria-live="polite"></p>
       </section>
 
       <form id="preferences-form" class="card" aria-labelledby="preferences-heading" novalidate>
         <div class="card-header">
-          <div>
+          <div class="card-heading-copy">
             <h2 id="preferences-heading" class="card-title">Tags &amp; Frontmatter</h2>
             <p class="card-description">
               Set default tags for new clips and choose which metadata fields appear in YAML frontmatter.
@@ -146,6 +151,7 @@
               type="text"
               class="tag-text-input"
               placeholder="Add default tags (comma or Enter)..."
+              aria-describedby="default-tags-help"
               autocomplete="off"
               spellcheck="false"
             />
@@ -158,54 +164,56 @@
         <fieldset class="toggle-group">
           <legend class="field-label">YAML frontmatter fields</legend>
 
-          <label class="toggle-row" for="fm-include-author">
-            <span class="toggle-copy">
-              <span class="toggle-title">Include author</span>
-              <span class="toggle-desc">Adds the extracted <code>author</code> field when available.</span>
-            </span>
-            <input id="fm-include-author" type="checkbox" class="toggle-input" />
-            <span class="toggle-track" aria-hidden="true"></span>
-          </label>
+          <div class="toggle-list">
+            <label class="toggle-row" for="fm-include-author">
+              <span class="toggle-copy">
+                <span class="toggle-title">Include author</span>
+                <span class="toggle-desc">Adds the extracted <code>author</code> field when available.</span>
+              </span>
+              <input id="fm-include-author" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"></span>
+            </label>
 
-          <label class="toggle-row" for="fm-include-published">
-            <span class="toggle-copy">
-              <span class="toggle-title">Include published date</span>
-              <span class="toggle-desc">Adds the article <code>published</code> timestamp.</span>
-            </span>
-            <input id="fm-include-published" type="checkbox" class="toggle-input" />
-            <span class="toggle-track" aria-hidden="true"></span>
-          </label>
+            <label class="toggle-row" for="fm-include-published">
+              <span class="toggle-copy">
+                <span class="toggle-title">Include published date</span>
+                <span class="toggle-desc">Adds the article <code>published</code> timestamp.</span>
+              </span>
+              <input id="fm-include-published" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"></span>
+            </label>
 
-          <label class="toggle-row" for="fm-include-site">
-            <span class="toggle-copy">
-              <span class="toggle-title">Include site name</span>
-              <span class="toggle-desc">Adds the publisher or domain name as <code>site</code>.</span>
-            </span>
-            <input id="fm-include-site" type="checkbox" class="toggle-input" />
-            <span class="toggle-track" aria-hidden="true"></span>
-          </label>
+            <label class="toggle-row" for="fm-include-site">
+              <span class="toggle-copy">
+                <span class="toggle-title">Include site name</span>
+                <span class="toggle-desc">Adds the publisher or domain name as <code>site</code>.</span>
+              </span>
+              <input id="fm-include-site" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"></span>
+            </label>
 
-          <label class="toggle-row" for="fm-include-images">
-            <span class="toggle-copy">
-              <span class="toggle-title">Include local images list</span>
-              <span class="toggle-desc">Lists uploaded <code>./images/*</code> filenames in <code>images</code>.</span>
-            </span>
-            <input id="fm-include-images" type="checkbox" class="toggle-input" />
-            <span class="toggle-track" aria-hidden="true"></span>
-          </label>
+            <label class="toggle-row" for="fm-include-images">
+              <span class="toggle-copy">
+                <span class="toggle-title">Include local images list</span>
+                <span class="toggle-desc">Lists uploaded <code>./images/*</code> filenames in <code>images</code>.</span>
+              </span>
+              <input id="fm-include-images" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"></span>
+            </label>
 
-          <label class="toggle-row" for="fm-include-warnings">
-            <span class="toggle-copy">
-              <span class="toggle-title">Include fallback warnings</span>
-              <span class="toggle-desc">Records a <code>warnings</code> list if any image falls back to its remote URL.</span>
-            </span>
-            <input id="fm-include-warnings" type="checkbox" class="toggle-input" />
-            <span class="toggle-track" aria-hidden="true"></span>
-          </label>
+            <label class="toggle-row" for="fm-include-warnings">
+              <span class="toggle-copy">
+                <span class="toggle-title">Include fallback warnings</span>
+                <span class="toggle-desc">Records a <code>warnings</code> list if any image falls back to its remote URL.</span>
+              </span>
+              <input id="fm-include-warnings" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"></span>
+            </label>
+          </div>
         </fieldset>
 
         <div class="card-footer">
-          <p id="preferences-feedback" class="feedback" hidden aria-live="polite"></p>
+          <p id="preferences-feedback" class="feedback" hidden role="status" aria-live="polite"></p>
           <button type="submit" id="save-preferences-btn" class="btn btn--primary">
             Save preferences
           </button>
@@ -236,7 +244,7 @@
               <label for="custom-client-id-input" class="field-label">
                 Custom Web OAuth Client ID (BYO GCP Project)
               </label>
-              <p class="field-help">
+              <p id="custom-client-help" class="field-help">
                 Connect your own free, unbilled Google Cloud <strong>Web application</strong> OAuth Client ID at runtime without rebuilding the extension. Add the OAuth Redirect URI shown below under Authorized redirect URIs in Google Cloud Console.
               </p>
               <input
@@ -244,6 +252,7 @@
                 type="text"
                 class="text-input text-input--mono"
                 placeholder="1234567890-xxxx.apps.googleusercontent.com"
+                aria-describedby="custom-client-help"
                 autocomplete="off"
                 spellcheck="false"
               />
@@ -258,7 +267,7 @@
               </button>
             </div>
 
-            <p id="custom-client-feedback" class="feedback" hidden aria-live="polite"></p>
+            <p id="custom-client-feedback" class="feedback" hidden role="status" aria-live="polite"></p>
           </form>
 
           <div class="advanced-subsection advanced-diagnostics">

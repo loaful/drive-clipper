@@ -599,4 +599,52 @@ describe('Options UI', () => {
       'https://lliikkoebahbliapkdchhdahfodpcach.chromiumapp.org',
     );
   });
+
+  it('sets aria-invalid and alert roles on validation errors, clears on input, and updates auth status if Reconnect fails after sign-out', async () => {
+    const root = loadOptionsDom();
+    const mock = createMockOptionsRuntime({
+      authStatus: { oauthConfigured: true, authenticated: true },
+    });
+
+    const baseSend = mock.runtime.sendMessage.bind(mock.runtime);
+    mock.runtime.sendMessage = async (msg) => {
+      if (msg.type === 'SIGN_IN') {
+        return {
+          ok: false,
+          error: 'User cancelled sign-in window.',
+        };
+      }
+      return baseSend(msg);
+    };
+
+    controller = await mountOptions(root, { runtime: mock.runtime });
+
+    const folderInput = root.querySelector<HTMLInputElement>('#root-folder-name-input')!;
+    const folderBtn = root.querySelector<HTMLButtonElement>('#create-switch-folder-btn')!;
+    const folderFeedback = root.querySelector<HTMLElement>('#folder-feedback')!;
+    const folderIdEl = root.querySelector<HTMLElement>('#root-folder-id-value')!;
+    const reauthBtn = root.querySelector<HTMLButtonElement>('#reauth-btn')!;
+    const statusText = root.querySelector<HTMLElement>('#auth-status-text')!;
+    const authFeedback = root.querySelector<HTMLElement>('#auth-feedback')!;
+
+    expect(folderIdEl.dataset.empty).toBe('true');
+
+    // Empty folder name triggers aria-invalid + role="alert", cleared on next input
+    folderInput.value = '   ';
+    folderBtn.click();
+    expect(folderInput.getAttribute('aria-invalid')).toBe('true');
+    expect(folderInput.getAttribute('aria-describedby')).toBe('folder-feedback');
+    expect(folderFeedback.getAttribute('role')).toBe('alert');
+
+    folderInput.value = 'NewClips';
+    folderInput.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(folderInput.getAttribute('aria-invalid')).toBeNull();
+
+    // Reconnect where SIGN_OUT succeeds and follow-up SIGN_IN fails must reflect signed-out state
+    reauthBtn.click();
+    await vi.waitFor(() => expect(statusText.textContent).toBe('Not connected'));
+    expect(authFeedback.getAttribute('role')).toBe('alert');
+    expect(authFeedback.textContent).toContain('User cancelled');
+    expect(controller.getAuthStatus()?.authenticated).toBe(false);
+  });
 });

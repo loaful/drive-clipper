@@ -441,6 +441,7 @@ export async function mountPopup(
     '#clear-done-jobs-btn',
   );
   const clipQueueList = queryRequired<HTMLUListElement>(root, '#clip-queue-list');
+  const queueLiveRegion = root.querySelector<HTMLDivElement>('#queue-live-region');
 
   const recentClipsSection = queryRequired<HTMLDetailsElement>(
     root,
@@ -568,6 +569,8 @@ export async function mountPopup(
       'aria-checked',
       String(clipMode === 'selection'),
     );
+    modeFullBtn.tabIndex = clipMode === 'full' ? 0 : -1;
+    modeSelectionBtn.tabIndex = clipMode === 'selection' ? 0 : -1;
     modeFullBtn.disabled = isSubmitting;
     modeSelectionBtn.disabled = isSubmitting || !hasSelection;
     modeSelectionBtn.title = hasSelection
@@ -618,14 +621,17 @@ export async function mountPopup(
       authPill.classList.add('status-pill--warn');
       authPill.dataset.status = 'unconfigured';
       authPillLabel.textContent = 'Setup needed';
+      authPill.setAttribute('aria-label', 'Google Drive status: Setup needed');
     } else if (authenticated) {
       authPill.classList.add('status-pill--ok');
       authPill.dataset.status = 'connected';
       authPillLabel.textContent = 'Connected';
+      authPill.setAttribute('aria-label', 'Google Drive status: Connected');
     } else {
       authPill.classList.add('status-pill--warn');
       authPill.dataset.status = 'signed-out';
       authPillLabel.textContent = 'Signed out';
+      authPill.setAttribute('aria-label', 'Google Drive status: Signed out');
     }
 
     bannerState = computeBannerState();
@@ -671,6 +677,7 @@ export async function mountPopup(
         bannerActions.hidden = false;
         bannerSignInBtn.hidden = false;
         bannerSignInBtn.disabled = isSigningIn;
+        bannerSignInBtn.setAttribute('aria-busy', String(isSigningIn));
         bannerSignInBtn.textContent = isSigningIn
           ? 'Connecting...'
           : 'Connect Google Drive';
@@ -709,6 +716,7 @@ export async function mountPopup(
       (!authStatus || authStatus.authenticated);
 
     clipSubmitBtn.disabled = !canSubmit;
+    clipSubmitBtn.setAttribute('aria-busy', String(isSubmitting));
     titleInput.disabled = isSubmitting;
     tagEditor.setDisabled(isSubmitting);
     clipBtnSpinner.hidden = !isSubmitting;
@@ -719,9 +727,11 @@ export async function mountPopup(
     if (!isSubmitting && activeJobForCurrentPage) {
       clipSubmitHint.hidden = false;
       clipSubmitHint.textContent = 'Already clipping this page';
+      clipSubmitBtn.setAttribute('aria-describedby', 'clip-submit-hint');
     } else {
       clipSubmitHint.hidden = true;
       clipSubmitHint.textContent = '';
+      clipSubmitBtn.removeAttribute('aria-describedby');
     }
 
     syncRecentClipsVisibility();
@@ -789,6 +799,10 @@ export async function mountPopup(
         track.setAttribute('aria-valuemin', '0');
         track.setAttribute('aria-valuemax', '100');
         track.setAttribute('aria-valuenow', String(presentation.percent));
+        track.setAttribute(
+          'aria-label',
+          `${presentation.title}: ${presentation.detail}`,
+        );
 
         const fill = document.createElement('div');
         fill.className = 'queue-progress-fill';
@@ -967,6 +981,7 @@ export async function mountPopup(
 
     let anyNewlyCompleted = false;
     let newlyAuthFailedJob: ClipJob | null = null;
+    const announcements: string[] = [];
     const nextIds = new Set<string>();
 
     for (const job of incomingJobs) {
@@ -974,15 +989,27 @@ export async function mountPopup(
       const prevStatus = lastKnownJobStatuses.get(job.id);
       if (job.status === 'done' && prevStatus !== 'done') {
         anyNewlyCompleted = true;
+        if (!updateOptions.isInitialHydration) {
+          const presentation = describeClipJob(job);
+          announcements.push(`${presentation.title}: ${presentation.detail}.`);
+        }
       }
-      if (
-        job.status === 'error' &&
-        prevStatus !== 'error' &&
-        (job.errorCode === 'AUTH_REQUIRED' ||
-          job.errorCode === 'OAUTH_NOT_CONFIGURED')
-      ) {
-        newlyAuthFailedJob = job;
+      if (job.status === 'error' && prevStatus !== 'error') {
+        if (
+          job.errorCode === 'AUTH_REQUIRED' ||
+          job.errorCode === 'OAUTH_NOT_CONFIGURED'
+        ) {
+          newlyAuthFailedJob = job;
+        }
+        if (!updateOptions.isInitialHydration) {
+          const presentation = describeClipJob(job);
+          announcements.push(`${presentation.title} failed: ${presentation.detail}`);
+        }
       }
+    }
+
+    if (queueLiveRegion && announcements.length > 0) {
+      queueLiveRegion.textContent = announcements.join(' ');
     }
 
     lastKnownJobStatuses.clear();
@@ -1322,6 +1349,24 @@ export async function mountPopup(
 
   const onModeFullClick = (): void => handleModeClick('full');
   const onModeSelectionClick = (): void => handleModeClick('selection');
+  const handleModeKeyDown = (event: KeyboardEvent): void => {
+    if (
+      event.key !== 'ArrowLeft' &&
+      event.key !== 'ArrowRight' &&
+      event.key !== 'ArrowUp' &&
+      event.key !== 'ArrowDown'
+    ) {
+      return;
+    }
+    if (isSubmitting || !pageInfo?.hasSelection) {
+      return;
+    }
+    event.preventDefault();
+    const nextMode: ClipMode = clipMode === 'full' ? 'selection' : 'full';
+    clipMode = nextMode;
+    renderModeSwitch();
+    (nextMode === 'full' ? modeFullBtn : modeSelectionBtn).focus();
+  };
 
   titleInput.addEventListener('input', updateFolderPreview);
   openOptionsHeaderBtn.addEventListener('click', handleOpenOptions);
@@ -1329,6 +1374,8 @@ export async function mountPopup(
   bannerSignInBtn.addEventListener('click', handleBannerSignIn);
   modeFullBtn.addEventListener('click', onModeFullClick);
   modeSelectionBtn.addEventListener('click', onModeSelectionClick);
+  modeFullBtn.addEventListener('keydown', handleModeKeyDown);
+  modeSelectionBtn.addEventListener('keydown', handleModeKeyDown);
   form.addEventListener('submit', handleClipSubmit);
   submitErrorDismissBtn.addEventListener('click', handleDismissSubmitError);
   clearDoneJobsBtn.addEventListener('click', handleClearCompletedJobs);
@@ -1350,6 +1397,8 @@ export async function mountPopup(
       bannerSignInBtn.removeEventListener('click', handleBannerSignIn);
       modeFullBtn.removeEventListener('click', onModeFullClick);
       modeSelectionBtn.removeEventListener('click', onModeSelectionClick);
+      modeFullBtn.removeEventListener('keydown', handleModeKeyDown);
+      modeSelectionBtn.removeEventListener('keydown', handleModeKeyDown);
       form.removeEventListener('submit', handleClipSubmit);
       submitErrorDismissBtn.removeEventListener('click', handleDismissSubmitError);
       clearDoneJobsBtn.removeEventListener('click', handleClearCompletedJobs);
