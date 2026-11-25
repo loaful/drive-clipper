@@ -1133,7 +1133,7 @@ describe('Popup UI', () => {
     await vi.waitFor(() => expect(panel.hidden).toBe(true));
   });
 
-  it('shows first-run onboarding banner for unconfigured OAuth and opens Options', async () => {
+  it('shows friendly unconfigured developer setup card, hides clip form, and opens Settings', async () => {
     const root = loadPopupDom();
     const mock = createMockRuntime({
       authStatus: { oauthConfigured: false, authenticated: false },
@@ -1145,24 +1145,35 @@ describe('Popup UI', () => {
       now: () => FIXED_NOW,
     });
 
+    const brandTitle = root.querySelector<HTMLElement>('.brand-title')!;
     const banner = root.querySelector<HTMLElement>('#onboarding-banner')!;
     const bannerTitle = root.querySelector<HTMLElement>('#banner-title')!;
     const bannerDesc = root.querySelector<HTMLElement>('#banner-description')!;
+    const bannerSignInBtn =
+      root.querySelector<HTMLButtonElement>('#banner-signin-btn')!;
     const bannerOptionsBtn =
       root.querySelector<HTMLButtonElement>('#banner-options-btn')!;
+    const form = root.querySelector<HTMLFormElement>('#clip-form')!;
     const clipBtn = root.querySelector<HTMLButtonElement>('#clip-submit-btn')!;
+    const recentSection = root.querySelector<HTMLElement>('#recent-clips-section')!;
 
+    expect(brandTitle.textContent).toBe('OKF Clipper');
     expect(controller.getBannerState()).toEqual({ kind: 'oauth-unconfigured' });
     expect(banner.hidden).toBe(false);
-    expect(bannerTitle.textContent).toContain('OAuth');
-    expect(bannerDesc.textContent).toContain('config.local.json');
+    expect(bannerTitle.textContent).toBe('Set up Google OAuth to get started');
+    expect(bannerDesc.textContent).toContain('Custom Web OAuth Client ID');
+    expect(bannerSignInBtn.hidden).toBe(true);
+    expect(bannerOptionsBtn.hidden).toBe(false);
+    expect(bannerOptionsBtn.textContent).toBe('Open Settings');
+    expect(form.hidden).toBe(true);
     expect(clipBtn.disabled).toBe(true);
+    expect(recentSection.hidden).toBe(true);
 
     bannerOptionsBtn.click();
     expect(mock.openOptionsPage).toHaveBeenCalledTimes(1);
   });
 
-  it('shows sign-in onboarding banner when signed out and unlocks clipping after sign-in', async () => {
+  it('shows consumer Connect Google Drive welcome card without jargon, hides clip form until connected, and reveals form on sign-in', async () => {
     const root = loadPopupDom();
     const mock = createMockRuntime({
       authStatus: { oauthConfigured: true, authenticated: false },
@@ -1177,18 +1188,94 @@ describe('Popup UI', () => {
       now: () => FIXED_NOW,
     });
 
+    const brandTitle = root.querySelector<HTMLElement>('.brand-title')!;
     const banner = root.querySelector<HTMLElement>('#onboarding-banner')!;
+    const bannerTitle = root.querySelector<HTMLElement>('#banner-title')!;
+    const bannerDesc = root.querySelector<HTMLElement>('#banner-description')!;
     const signInBtn =
       root.querySelector<HTMLButtonElement>('#banner-signin-btn')!;
+    const bannerOptionsBtn =
+      root.querySelector<HTMLButtonElement>('#banner-options-btn')!;
+    const bannerError = root.querySelector<HTMLElement>('#banner-error')!;
+    const form = root.querySelector<HTMLFormElement>('#clip-form')!;
     const clipBtn = root.querySelector<HTMLButtonElement>('#clip-submit-btn')!;
+    const recentSection = root.querySelector<HTMLElement>('#recent-clips-section')!;
 
+    expect(brandTitle.textContent).toBe('OKF Clipper');
     expect(banner.hidden).toBe(false);
+    expect(banner.classList.contains('banner--welcome')).toBe(true);
+    expect(bannerTitle.textContent).toBe('Connect Google Drive');
+    expect(bannerDesc.textContent).toContain('WebClips/');
+    expect(bannerDesc.textContent).toContain('No third-party servers');
+    expect(bannerDesc.textContent).toContain('only access files it creates');
+    // Zero internal jargon for consumer Chrome Web Store onboarding
+    expect(banner.textContent).not.toMatch(/chrome\.identity|config\.local\.json|googleapis\.com/i);
     expect(signInBtn.hidden).toBe(false);
+    expect(signInBtn.textContent).toBe('Connect Google Drive');
+    expect(bannerOptionsBtn.hidden).toBe(true);
+    expect(bannerError.hidden).toBe(true);
+    expect(form.hidden).toBe(true);
     expect(clipBtn.disabled).toBe(true);
+    expect(recentSection.hidden).toBe(true);
 
     signInBtn.click();
     await vi.waitFor(() => expect(banner.hidden).toBe(true));
+    expect(form.hidden).toBe(false);
     expect(clipBtn.disabled).toBe(false);
+    expect(recentSection.hidden).toBe(false);
+  });
+
+  it('keeps existing Clip queue and Recent clips accessible while signed out and sanitizes raw sign-in errors', async () => {
+    const root = loadPopupDom();
+    const mock = createMockRuntime({
+      authStatus: { oauthConfigured: true, authenticated: false },
+      jobs: [
+        makeJob({
+          id: 'job-prev-done',
+          status: 'done',
+          result: makeClipResult(),
+        }),
+      ],
+      history: [
+        {
+          id: 'clip-existing',
+          title: 'Existing Saved Clip',
+          sourceUrl: 'https://example.com/saved',
+          folderId: 'fld-existing',
+          folderUrl: 'https://drive.google.com/drive/folders/fld-existing',
+          folderName: '2026-11-24-existing',
+          clippedAt: FIXED_NOW.toISOString(),
+          imageCount: 2,
+          warningCount: 0,
+        },
+      ],
+      onSignIn: async () => ({
+        ok: false,
+        code: 'AUTH_REQUIRED',
+        error: 'Unexpected config.local.json chrome.identity failure',
+      }),
+    });
+
+    controller = await mountPopup(root, {
+      runtime: mock.runtime,
+      now: () => FIXED_NOW,
+    });
+
+    const form = root.querySelector<HTMLFormElement>('#clip-form')!;
+    const queuePanel = root.querySelector<HTMLElement>('#clip-queue-panel')!;
+    const recentSection = root.querySelector<HTMLElement>('#recent-clips-section')!;
+    const signInBtn = root.querySelector<HTMLButtonElement>('#banner-signin-btn')!;
+    const bannerError = root.querySelector<HTMLElement>('#banner-error')!;
+
+    expect(form.hidden).toBe(true);
+    expect(queuePanel.hidden).toBe(false);
+    expect(recentSection.hidden).toBe(false);
+    expect(root.querySelector('#recent-clips-count')?.textContent).toBe('1');
+
+    signInBtn.click();
+    await vi.waitFor(() => expect(bannerError.hidden).toBe(false));
+    expect(bannerError.textContent).not.toMatch(/config\.local\.json|chrome\.identity/i);
+    expect(bannerError.textContent).toContain('try connecting Google Drive again');
   });
 
   it('renders up to 10 recent clips inside the collapsible Recent clips section', async () => {

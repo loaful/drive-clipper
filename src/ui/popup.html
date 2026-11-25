@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Drive Clipper</title>
+    <title>OKF Clipper</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
@@ -17,7 +17,7 @@
             <rect x="8.2" y="11" width="5.6" height="1.5" rx="0.75" fill="#2563eb" />
             <rect x="8.2" y="14" width="6.8" height="1.5" rx="0.75" fill="#94a3b8" />
           </svg>
-          <span class="brand-title">Drive Clipper</span>
+          <span class="brand-title">OKF Clipper</span>
         </div>
         <div class="header-actions">
           <span id="auth-pill" class="status-pill status-pill--neutral" data-status="loading">
@@ -44,18 +44,29 @@
       </header>
 
       <section id="onboarding-banner" class="banner" hidden aria-live="polite">
+        <div id="banner-hero" class="banner-hero" hidden aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.75">
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d="M3.75 7.5A2.25 2.25 0 0 1 6 5.25h3.88c.59 0 1.16.24 1.58.66l1.13 1.13c.42.42.99.66 1.58.66H18A2.25 2.25 0 0 1 20.25 9.95v6.8A2.25 2.25 0 0 1 18 19H6a2.25 2.25 0 0 1-2.25-2.25V7.5Z"
+            />
+            <path stroke-linecap="round" stroke-linejoin="round" d="m9.25 13.25 1.85 1.85 3.65-3.85" />
+          </svg>
+        </div>
         <div class="banner-body">
-          <p id="banner-title" class="banner-title"></p>
+          <h2 id="banner-title" class="banner-title"></h2>
           <p id="banner-description" class="banner-description"></p>
         </div>
-        <div class="banner-actions">
-          <button type="button" id="banner-signin-btn" class="btn btn--secondary btn--sm" hidden>
-            Sign in with Google
+        <div id="banner-actions" class="banner-actions">
+          <button type="button" id="banner-signin-btn" class="btn btn--primary btn--full" hidden>
+            Connect Google Drive
           </button>
-          <button type="button" id="banner-options-btn" class="btn btn--ghost btn--sm">
-            Open Options
+          <button type="button" id="banner-options-btn" class="btn btn--primary btn--full" hidden>
+            Open Settings
           </button>
         </div>
+        <p id="banner-error" class="banner-error" hidden role="alert"></p>
       </section>
 
       <form id="clip-form" class="clip-form" novalidate>

@@ -62,6 +62,24 @@ function createMockOptionsRuntime(config: MockOptionsRuntimeConfig = {}) {
 
   const sentMessages: UiToBackgroundMessage[] = [];
 
+  const syncAuthForCustomClientChange = (): void => {
+    const manifestConfigured = config.manifestOAuthConfigured ?? true;
+    const customId = currentSettings.customWebAuthClientId;
+    if (customId) {
+      currentAuth = {
+        oauthConfigured: true,
+        authenticated: false,
+        authMode: 'custom-client',
+        usingCustomClientId: true,
+      };
+    } else {
+      currentAuth = {
+        oauthConfigured: Boolean(manifestConfigured),
+        authenticated: false,
+      };
+    }
+  };
+
   const runtime: UiRuntimeClient = {
     async sendMessage<K extends UiToBackgroundMessage['type']>(
       message: Extract<UiToBackgroundMessage, { type: K }>,
@@ -76,13 +94,21 @@ function createMockOptionsRuntime(config: MockOptionsRuntimeConfig = {}) {
             data: currentAuth as UiMessageResponseMap[K],
           };
         case 'SIGN_IN':
-          currentAuth = { oauthConfigured: true, authenticated: true };
+          currentAuth = {
+            ...currentAuth,
+            oauthConfigured: true,
+            authenticated: true,
+          };
           return {
             ok: true,
             data: currentAuth as UiMessageResponseMap[K],
           };
         case 'SIGN_OUT':
-          currentAuth = { oauthConfigured: true, authenticated: false };
+          currentAuth = {
+            ...currentAuth,
+            oauthConfigured: currentAuth.oauthConfigured,
+            authenticated: false,
+          };
           return {
             ok: true,
             data: currentAuth as UiMessageResponseMap[K],
@@ -92,7 +118,8 @@ function createMockOptionsRuntime(config: MockOptionsRuntimeConfig = {}) {
             ok: true,
             data: currentSettings as UiMessageResponseMap[K],
           };
-        case 'UPDATE_SETTINGS':
+        case 'UPDATE_SETTINGS': {
+          const prevCustomClientId = currentSettings.customWebAuthClientId;
           if (config.onUpdateSettings) {
             const res = await config.onUpdateSettings(
               msg.patch,
@@ -100,21 +127,32 @@ function createMockOptionsRuntime(config: MockOptionsRuntimeConfig = {}) {
             );
             if (res.ok) {
               currentSettings = res.data;
+              if (currentSettings.customWebAuthClientId !== prevCustomClientId) {
+                syncAuthForCustomClientChange();
+              }
             }
             return res as BackgroundResponse<UiMessageResponseMap[K]>;
           }
           currentSettings = {
             ...currentSettings,
             ...msg.patch,
+            customWebAuthClientId:
+              msg.patch.customWebAuthClientId === undefined
+                ? currentSettings.customWebAuthClientId
+                : msg.patch.customWebAuthClientId,
             frontmatter: {
               ...currentSettings.frontmatter,
               ...msg.patch.frontmatter,
             },
           };
+          if (currentSettings.customWebAuthClientId !== prevCustomClientId) {
+            syncAuthForCustomClientChange();
+          }
           return {
             ok: true,
             data: currentSettings as UiMessageResponseMap[K],
           };
+        }
         case 'ENSURE_ROOT_FOLDER':
           if (config.onEnsureRootFolder) {
             return (await config.onEnsureRootFolder(
@@ -161,7 +199,7 @@ describe('Options UI', () => {
     document.body.innerHTML = '';
   });
 
-  it('shows OAuth setup guidance and disables sign-in when client_id is unconfigured', async () => {
+  it('shows OAuth setup guidance, disables sign-in, and auto-opens Advanced when client_id is unconfigured', async () => {
     const root = loadOptionsDom();
     const mock = createMockOptionsRuntime({
       authStatus: { oauthConfigured: false, authenticated: false },
@@ -170,19 +208,24 @@ describe('Options UI', () => {
 
     controller = await mountOptions(root, { runtime: mock.runtime });
 
+    const pageTitle = root.querySelector<HTMLElement>('.page-title')!;
     const callout = root.querySelector<HTMLElement>('#oauth-unconfigured-callout')!;
     const signInBtn = root.querySelector<HTMLButtonElement>('#sign-in-btn')!;
     const folderBtn =
       root.querySelector<HTMLButtonElement>('#create-switch-folder-btn')!;
     const statusText = root.querySelector<HTMLElement>('#auth-status-text')!;
+    const advancedSection =
+      root.querySelector<HTMLDetailsElement>('#advanced-section')!;
 
-    expect(statusText.textContent).toBe('OAuth setup required');
+    expect(pageTitle.textContent).toBe('OKF Clipper Settings');
+    expect(statusText.textContent).toBe('Setup required');
     expect(callout.hidden).toBe(false);
     expect(signInBtn.disabled).toBe(true);
     expect(folderBtn.disabled).toBe(true);
+    expect(advancedSection.open).toBe(true);
   });
 
-  it('supports Sign in, Sign out, and Sign out & Re-auth transitions', async () => {
+  it('keeps Advanced collapsed by default when configured and supports Connect, Sign out, and Reconnect transitions', async () => {
     const root = loadOptionsDom();
     const mock = createMockOptionsRuntime({
       authStatus: { oauthConfigured: true, authenticated: false },
@@ -190,14 +233,29 @@ describe('Options UI', () => {
 
     controller = await mountOptions(root, { runtime: mock.runtime });
 
+    const authCard = root.querySelector<HTMLElement>('section[aria-labelledby="auth-heading"]')!;
     const signInBtn = root.querySelector<HTMLButtonElement>('#sign-in-btn')!;
     const signOutBtn = root.querySelector<HTMLButtonElement>('#sign-out-btn')!;
     const reauthBtn = root.querySelector<HTMLButtonElement>('#reauth-btn')!;
     const statusText = root.querySelector<HTMLElement>('#auth-status-text')!;
+    const customPill = root.querySelector<HTMLElement>('#custom-client-pill')!;
+    const advancedSection =
+      root.querySelector<HTMLDetailsElement>('#advanced-section')!;
 
-    expect(statusText.textContent).toBe('Signed out');
+    expect(advancedSection.open).toBe(false);
+    expect(statusText.textContent).toBe('Not connected');
+    expect(customPill.hidden).toBe(true);
     expect(signInBtn.hidden).toBe(false);
+    expect(signInBtn.textContent?.trim()).toBe('Connect Google Drive');
     expect(signOutBtn.hidden).toBe(true);
+    expect(reauthBtn.textContent?.trim()).toBe('Reconnect');
+    // Plain-English everyday Account card hides internal OAuth jargon
+    expect(authCard.querySelector('.card-description')?.textContent).toContain(
+      'directly from your browser to your Google Drive',
+    );
+    expect(authCard.querySelector('.card-description')?.textContent).not.toMatch(
+      /chrome\.identity|drive\.file|config\.local\.json/i,
+    );
 
     signInBtn.click();
     await vi.waitFor(() => expect(statusText.textContent).toBe('Connected'));
@@ -215,11 +273,88 @@ describe('Options UI', () => {
     expect(statusText.textContent).toBe('Connected');
 
     signOutBtn.click();
-    await vi.waitFor(() => expect(statusText.textContent).toBe('Signed out'));
+    await vi.waitFor(() => expect(statusText.textContent).toBe('Not connected'));
     expect(signInBtn.hidden).toBe(false);
   });
 
-  it('displays persisted rootFolderId, Open in Drive link, drive.file move/rename note, and creates/switches folders', async () => {
+  it('saves, validates, and resets customWebAuthClientId inside Advanced & Self-hosting', async () => {
+    const root = loadOptionsDom();
+    const mock = createMockOptionsRuntime({
+      authStatus: { oauthConfigured: false, authenticated: false },
+      manifestOAuthConfigured: false,
+    });
+
+    controller = await mountOptions(root, { runtime: mock.runtime });
+
+    const advancedSection =
+      root.querySelector<HTMLDetailsElement>('#advanced-section')!;
+    const customForm = root.querySelector<HTMLFormElement>('#custom-client-form')!;
+    const customInput = root.querySelector<HTMLInputElement>(
+      '#custom-client-id-input',
+    )!;
+    const resetBtn = root.querySelector<HTMLButtonElement>(
+      '#reset-custom-client-btn',
+    )!;
+    const customFeedback = root.querySelector<HTMLElement>(
+      '#custom-client-feedback',
+    )!;
+    const customPill = root.querySelector<HTMLElement>('#custom-client-pill')!;
+    const advancedBadge = root.querySelector<HTMLElement>('#advanced-custom-badge')!;
+    const statusText = root.querySelector<HTMLElement>('#auth-status-text')!;
+    const signInBtn = root.querySelector<HTMLButtonElement>('#sign-in-btn')!;
+    const callout = root.querySelector<HTMLElement>('#oauth-unconfigured-callout')!;
+
+    expect(advancedSection.open).toBe(true);
+    expect(resetBtn.disabled).toBe(true);
+    expect(customPill.hidden).toBe(true);
+    expect(advancedBadge.hidden).toBe(true);
+
+    // Rejects empty value and client secrets without sending UPDATE_SETTINGS
+    customInput.value = '   ';
+    customForm.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    expect(customFeedback.dataset.tone).toBe('error');
+    expect(mock.sentMessages.some((m) => m.type === 'UPDATE_SETTINGS')).toBe(false);
+
+    customInput.value = 'GOCSPX-secret-value';
+    customForm.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    expect(customFeedback.dataset.tone).toBe('error');
+    expect(customFeedback.textContent).toContain('Client Secret');
+    expect(mock.sentMessages.some((m) => m.type === 'UPDATE_SETTINGS')).toBe(false);
+
+    // Saving a valid BYO Web OAuth Client ID unlocks OAuth and shows custom pill
+    const byoClientId = '9999999999-byo.apps.googleusercontent.com';
+    customInput.value = `  ${byoClientId}  `;
+    customForm.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await vi.waitFor(() => expect(statusText.textContent).toBe('Not connected'));
+    expect(mock.sentMessages).toContainEqual({
+      type: 'UPDATE_SETTINGS',
+      patch: { customWebAuthClientId: byoClientId },
+    });
+    expect(controller.getSettings().customWebAuthClientId).toBe(byoClientId);
+    expect(callout.hidden).toBe(true);
+    expect(signInBtn.disabled).toBe(false);
+    expect(customPill.hidden).toBe(false);
+    expect(advancedBadge.hidden).toBe(false);
+    expect(resetBtn.disabled).toBe(false);
+    expect(advancedSection.open).toBe(true);
+    expect(customFeedback.dataset.tone).toBe('success');
+
+    // Clicking "Use built-in" clears customWebAuthClientId and hides custom pills
+    resetBtn.click();
+    await vi.waitFor(() => expect(statusText.textContent).toBe('Setup required'));
+    expect(mock.sentMessages).toContainEqual({
+      type: 'UPDATE_SETTINGS',
+      patch: { customWebAuthClientId: null },
+    });
+    expect(controller.getSettings().customWebAuthClientId).toBeNull();
+    expect(customInput.value).toBe('');
+    expect(customPill.hidden).toBe(true);
+    expect(advancedBadge.hidden).toBe(true);
+    expect(resetBtn.disabled).toBe(true);
+  });
+
+  it('displays persisted rootFolderId, Open in Drive link, moving/renaming note, and creates/switches folders', async () => {
     const root = loadOptionsDom();
     const mock = createMockOptionsRuntime({
       settings: {
@@ -243,7 +378,7 @@ describe('Options UI', () => {
 
     expect(folderNameInput.value).toBe('WebClips');
     expect(openLink.hidden).toBe(true);
-    expect(note.textContent).toContain('drive.file');
+    expect(note.textContent).toContain('Google Drive ID');
     expect(note.textContent).toContain('move or rename');
 
     // First creation uses forceNew: false
@@ -277,7 +412,7 @@ describe('Options UI', () => {
     });
   });
 
-  it('persists default tags and frontmatter preferences via UPDATE_SETTINGS', async () => {
+  it('persists default tags and frontmatter preferences via UPDATE_SETTINGS without touching customWebAuthClientId', async () => {
     const root = loadOptionsDom();
     const mock = createMockOptionsRuntime({
       settings: {
@@ -285,6 +420,7 @@ describe('Options UI', () => {
         rootFolderName: 'WebClips',
         rootFolderId: 'existing-root-1',
         defaultTags: ['web-clip'],
+        customWebAuthClientId: '1234567890-keep.apps.googleusercontent.com',
         frontmatter: {
           includeAuthor: true,
           includePublished: true,
@@ -292,6 +428,12 @@ describe('Options UI', () => {
           includeImages: true,
           includeWarnings: true,
         },
+      },
+      authStatus: {
+        oauthConfigured: true,
+        authenticated: true,
+        authMode: 'custom-client',
+        usingCustomClientId: true,
       },
     });
 
@@ -341,6 +483,9 @@ describe('Options UI', () => {
     ]);
     expect(controller.getSettings().frontmatter.includeAuthor).toBe(false);
     expect(controller.getSettings().frontmatter.includeWarnings).toBe(false);
+    expect(controller.getSettings().customWebAuthClientId).toBe(
+      '1234567890-keep.apps.googleusercontent.com',
+    );
   });
 
   it('leaves stickyTags untouched when saving defaultTags and explains sticky Popup tags', async () => {
@@ -417,10 +562,10 @@ describe('Options UI', () => {
         'Please sign in before creating a folder.',
       ),
     );
-    expect(statusText.textContent).toBe('Signed out');
+    expect(statusText.textContent).toBe('Not connected');
   });
 
-  it('displays Extension ID and OAuth Redirect URI when exposed by the extension runtime', async () => {
+  it('houses technical diagnostics (OAuth Scope, Extension ID, Redirect URI) inside Advanced & Self-hosting', async () => {
     const root = loadOptionsDom();
     const mock = createMockOptionsRuntime({
       authStatus: { oauthConfigured: false, authenticated: false },
@@ -433,11 +578,20 @@ describe('Options UI', () => {
 
     controller = await mountOptions(root, { runtime: mock.runtime });
 
-    const extMeta = root.querySelector<HTMLElement>('#extension-id-meta')!;
-    const extVal = root.querySelector<HTMLElement>('#extension-id-value')!;
-    const redirectMeta = root.querySelector<HTMLElement>('#oauth-redirect-uri-meta')!;
-    const redirectVal = root.querySelector<HTMLElement>('#oauth-redirect-uri-value')!;
+    const advancedSection =
+      root.querySelector<HTMLDetailsElement>('#advanced-section')!;
+    const extMeta = advancedSection.querySelector<HTMLElement>('#extension-id-meta')!;
+    const extVal = advancedSection.querySelector<HTMLElement>('#extension-id-value')!;
+    const redirectMeta = advancedSection.querySelector<HTMLElement>(
+      '#oauth-redirect-uri-meta',
+    )!;
+    const redirectVal = advancedSection.querySelector<HTMLElement>(
+      '#oauth-redirect-uri-value',
+    )!;
 
+    expect(advancedSection.textContent).toContain(
+      'https://www.googleapis.com/auth/drive.file',
+    );
     expect(extMeta.hidden).toBe(false);
     expect(extVal.textContent).toBe('lliikkoebahbliapkdchhdahfodpcach');
     expect(redirectMeta.hidden).toBe(false);

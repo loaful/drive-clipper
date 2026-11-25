@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Drive Clipper — Settings</title>
+    <title>OKF Clipper Settings</title>
     <link rel="stylesheet" href="options.css" />
   </head>
   <body>
@@ -18,9 +18,9 @@
             <rect x="8.2" y="14" width="6.8" height="1.5" rx="0.75" fill="#94a3b8" />
           </svg>
           <div>
-            <h1 class="page-title">Drive Clipper Settings</h1>
+            <h1 class="page-title">OKF Clipper Settings</h1>
             <p class="page-subtitle">
-              Manage Google Drive authentication, root folder tracking, default tags, and Markdown frontmatter.
+              Connect Google Drive, choose your save folder, and customize tags and Markdown frontmatter.
             </p>
           </div>
         </div>
@@ -31,51 +31,36 @@
           <div>
             <h2 id="auth-heading" class="card-title">Google Drive Account</h2>
             <p class="card-description">
-              Authenticates through <code>chrome.identity</code> using only the minimal
-              <code>drive.file</code> scope.
+              Uploads go directly from your browser to your Google Drive. This extension can only access the folder and clips it creates — never your other Drive files.
             </p>
           </div>
-          <span id="auth-status-badge" class="status-pill status-pill--neutral" data-status="loading">
-            <span class="status-dot" aria-hidden="true"></span>
-            <span id="auth-status-text">Checking...</span>
-          </span>
+          <div class="header-badges">
+            <span id="custom-client-pill" class="status-pill status-pill--accent" hidden>
+              Custom OAuth client
+            </span>
+            <span id="auth-status-badge" class="status-pill status-pill--neutral" data-status="loading">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="auth-status-text">Checking...</span>
+            </span>
+          </div>
         </div>
 
         <div id="oauth-unconfigured-callout" class="callout callout--warn" hidden>
-          <p class="callout-title">Google OAuth Client ID is not configured</p>
+          <p class="callout-title">Google OAuth setup required</p>
           <p class="callout-body">
-            This unpacked build still has the placeholder <code>client_id</code>. Copy
-            <code>config.local.example.json</code> to <code>config.local.json</code>, add your Google OAuth
-            Client ID (<strong>Chrome Extension</strong> type for Chrome Sync, or <strong>Web application</strong>
-            type with the Redirect URI below for Chromium browsers without Chrome sign-in), run
-            <code>npm run build</code>, and reload the extension in <code>chrome://extensions</code>.
+            This local build does not include a Google OAuth Client ID yet. Paste your own Google Cloud Web Application Client ID in <strong>Advanced &amp; Self-hosting</strong> below, or add credentials to <code>config.local.json</code> and rebuild.
           </p>
-        </div>
-
-        <div class="auth-meta-row">
-          <div class="meta-item">
-            <span class="meta-label">OAuth Scope</span>
-            <code class="meta-code">https://www.googleapis.com/auth/drive.file</code>
-          </div>
-          <div id="extension-id-meta" class="meta-item" hidden>
-            <span class="meta-label">Extension ID</span>
-            <code id="extension-id-value" class="meta-code"></code>
-          </div>
-          <div id="oauth-redirect-uri-meta" class="meta-item" hidden>
-            <span class="meta-label">OAuth Redirect URI (Web App Client)</span>
-            <code id="oauth-redirect-uri-value" class="meta-code"></code>
-          </div>
         </div>
 
         <div class="button-row">
           <button type="button" id="sign-in-btn" class="btn btn--primary" hidden>
-            Sign in with Google
+            Connect Google Drive
           </button>
           <button type="button" id="sign-out-btn" class="btn btn--secondary" hidden>
             Sign out
           </button>
           <button type="button" id="reauth-btn" class="btn btn--ghost" hidden>
-            Sign out &amp; Re-auth
+            Reconnect
           </button>
         </div>
 
@@ -85,12 +70,9 @@
       <section class="card" aria-labelledby="folder-heading">
         <div class="card-header">
           <div>
-            <h2 id="folder-heading" class="card-title">Root Folder</h2>
+            <h2 id="folder-heading" class="card-title">Save Folder</h2>
             <p class="card-description">
-              Every clipped page creates a dated subfolder
-              (<code>YYYY-MM-DD-&lt;source&gt;-&lt;slug&gt;</code>) with a matching
-              <code>&lt;folder&gt;.md</code> file inside this extension-owned OKF v0.2 Drive folder
-              (alongside auto-updated <code>index.md</code> and <code>log.md</code>).
+              Each clipped page creates a dated subfolder with Markdown and local images inside this Google Drive folder, alongside an index and clip log.
             </p>
           </div>
         </div>
@@ -115,7 +97,7 @@
 
           <div class="folder-id-panel">
             <div class="folder-id-info">
-              <span class="meta-label">Persisted Root Folder ID</span>
+              <span class="meta-label">Save Folder ID</span>
               <code id="root-folder-id-value" class="folder-id-code" data-testid="root-folder-id">
                 Not created yet
               </code>
@@ -139,10 +121,7 @@
         <div class="callout callout--info" id="drive-file-note">
           <p class="callout-title">Moving or renaming your folder in Google Drive</p>
           <p class="callout-body">
-            Because Google Drive tracks folders by ID under the <code>drive.file</code> scope, you can freely
-            move or rename <strong>WebClips</strong> anywhere inside Google Drive without breaking future
-            clips. Use <strong>Create / Switch Folder</strong> only if you want to start saving into a brand
-            new extension-owned folder.
+            OKF Clipper tracks your save folder by its Google Drive ID, so you can freely move or rename <strong>WebClips</strong> anywhere in Google Drive without breaking future clips. Use <strong>Create / Switch Folder</strong> only if you want to start saving into a brand-new folder.
           </p>
         </div>
 
@@ -152,9 +131,9 @@
       <form id="preferences-form" class="card" aria-labelledby="preferences-heading" novalidate>
         <div class="card-header">
           <div>
-            <h2 id="preferences-heading" class="card-title">Default Tags &amp; Frontmatter</h2>
+            <h2 id="preferences-heading" class="card-title">Tags &amp; Frontmatter</h2>
             <p class="card-description">
-              Choose default tags seeded into each clip and which metadata fields appear in YAML frontmatter.
+              Set default tags for new clips and choose which metadata fields appear in YAML frontmatter.
             </p>
           </div>
         </div>
@@ -232,6 +211,75 @@
           </button>
         </div>
       </form>
+
+      <details id="advanced-section" class="card advanced-card">
+        <summary class="advanced-summary">
+          <span class="advanced-summary-main">
+            <svg class="advanced-chevron" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+              <path stroke-linecap="round" stroke-linejoin="round" d="m6 4 4 4-4 4" />
+            </svg>
+            <span class="advanced-summary-copy">
+              <span class="card-title">Advanced &amp; Self-hosting</span>
+              <span class="card-description">
+                Bring your own Google Cloud OAuth Client ID and inspect extension diagnostics.
+              </span>
+            </span>
+          </span>
+          <span id="advanced-custom-badge" class="status-pill status-pill--accent" hidden>
+            Custom client active
+          </span>
+        </summary>
+
+        <div class="advanced-body">
+          <form id="custom-client-form" class="advanced-subsection" novalidate>
+            <div class="field">
+              <label for="custom-client-id-input" class="field-label">
+                Custom Web OAuth Client ID (BYO GCP Project)
+              </label>
+              <p class="field-help">
+                Connect your own free, unbilled Google Cloud <strong>Web application</strong> OAuth Client ID at runtime without rebuilding the extension. Add the OAuth Redirect URI shown below under Authorized redirect URIs in Google Cloud Console.
+              </p>
+              <input
+                id="custom-client-id-input"
+                type="text"
+                class="text-input text-input--mono"
+                placeholder="1234567890-xxxx.apps.googleusercontent.com"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+
+            <div class="button-row">
+              <button type="submit" id="save-custom-client-btn" class="btn btn--secondary">
+                Save custom client
+              </button>
+              <button type="button" id="reset-custom-client-btn" class="btn btn--ghost">
+                Use built-in
+              </button>
+            </div>
+
+            <p id="custom-client-feedback" class="feedback" hidden aria-live="polite"></p>
+          </form>
+
+          <div class="advanced-subsection advanced-diagnostics">
+            <h3 class="subsection-title">Technical diagnostics</h3>
+            <div class="auth-meta-row">
+              <div class="meta-item">
+                <span class="meta-label">OAuth Scope</span>
+                <code class="meta-code">https://www.googleapis.com/auth/drive.file</code>
+              </div>
+              <div id="extension-id-meta" class="meta-item" hidden>
+                <span class="meta-label">Extension ID</span>
+                <code id="extension-id-value" class="meta-code"></code>
+              </div>
+              <div id="oauth-redirect-uri-meta" class="meta-item" hidden>
+                <span class="meta-label">OAuth Redirect URI</span>
+                <code id="oauth-redirect-uri-value" class="meta-code"></code>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
     </main>
 
     <script src="options.js" defer></script>

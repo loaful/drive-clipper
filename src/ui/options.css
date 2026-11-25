@@ -168,6 +168,14 @@ code {
 }
 
 /* Status pills */
+.header-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -180,6 +188,13 @@ code {
   border: 1px solid var(--border);
   background: var(--surface-subtle);
   color: var(--text-secondary);
+}
+
+.status-pill--accent {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 550;
 }
 
 .status-dot {
@@ -333,6 +348,11 @@ code {
 .text-input:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.text-input--mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
 }
 
 .folder-id-panel {
@@ -617,4 +637,86 @@ code {
 
 .feedback[data-tone="error"] {
   color: var(--danger);
+}
+
+/* Collapsible Advanced & Self-hosting drawer */
+.advanced-card {
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.advanced-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 18px 22px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.14s ease;
+}
+
+.advanced-summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-summary:hover {
+  background: var(--surface-subtle);
+}
+
+.advanced-summary:focus-visible {
+  outline: none;
+  box-shadow: inset var(--focus-ring);
+}
+
+.advanced-summary-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.advanced-chevron {
+  flex: none;
+  margin-top: 3px;
+  color: var(--text-muted);
+  transition: transform 0.16s ease;
+}
+
+.advanced-card[open] .advanced-chevron {
+  transform: rotate(90deg);
+}
+
+.advanced-summary-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 18px 22px 22px;
+  border-top: 1px solid var(--border);
+}
+
+.advanced-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.advanced-diagnostics {
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.subsection-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
 }

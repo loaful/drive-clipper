@@ -188,7 +188,7 @@ function formatFriendlyErrorMessage(
   code?: BackgroundErrorCode,
 ): string {
   if (code === 'OAUTH_NOT_CONFIGURED') {
-    return 'Configure your Google OAuth Client ID in config.local.json, rebuild, and reload the extension.';
+    return 'Open Settings to add a Custom Web OAuth Client ID or finish local OAuth setup.';
   }
   if (code === 'AUTH_REQUIRED') {
     return 'Sign in to Google Drive before clipping this page.';
@@ -197,6 +197,18 @@ function formatFriendlyErrorMessage(
     return 'Chrome blocks extensions from reading internal browser pages. Switch to an http:// or https:// tab.';
   }
   return rawMessage || 'An unexpected error occurred while clipping this page.';
+}
+
+function formatConsumerAuthError(rawMessage: string | undefined): string {
+  const trimmed = rawMessage?.trim() ?? '';
+  if (trimmed.length === 0) {
+    return '';
+  }
+  // Never surface internal local-dev setup file names to regular signed-out users.
+  if (/config\.local\.json|chrome\.identity|drive\.file/i.test(trimmed)) {
+    return 'Sign-in did not complete. Please try connecting Google Drive again.';
+  }
+  return trimmed;
 }
 
 function computeProgressPercent(
@@ -355,11 +367,13 @@ export async function mountPopup(
     '#open-options-header-btn',
   );
   const onboardingBanner = queryRequired<HTMLElement>(root, '#onboarding-banner');
-  const bannerTitle = queryRequired<HTMLParagraphElement>(root, '#banner-title');
+  const bannerHero = queryRequired<HTMLDivElement>(root, '#banner-hero');
+  const bannerTitle = queryRequired<HTMLElement>(root, '#banner-title');
   const bannerDescription = queryRequired<HTMLParagraphElement>(
     root,
     '#banner-description',
   );
+  const bannerActions = queryRequired<HTMLDivElement>(root, '#banner-actions');
   const bannerSignInBtn = queryRequired<HTMLButtonElement>(
     root,
     '#banner-signin-btn',
@@ -368,6 +382,7 @@ export async function mountPopup(
     root,
     '#banner-options-btn',
   );
+  const bannerError = queryRequired<HTMLParagraphElement>(root, '#banner-error');
 
   const form = queryRequired<HTMLFormElement>(root, '#clip-form');
   const titleInput = queryRequired<HTMLInputElement>(root, '#title-input');
@@ -427,6 +442,10 @@ export async function mountPopup(
   );
   const clipQueueList = queryRequired<HTMLUListElement>(root, '#clip-queue-list');
 
+  const recentClipsSection = queryRequired<HTMLDetailsElement>(
+    root,
+    '#recent-clips-section',
+  );
   const recentClipsCount = queryRequired<HTMLSpanElement>(
     root,
     '#recent-clips-count',
@@ -453,6 +472,7 @@ export async function mountPopup(
   let jobsPushVersion = 0;
   let bannerState: PopupBannerState = { kind: 'none' };
   let clipJobs: ClipJob[] = [];
+  let recentClipsTotal = 0;
   let submitError: { message: string; code?: BackgroundErrorCode } | null = null;
   const lastKnownJobStatuses = new Map<string, ClipJobStatus>();
   const expandedWarningJobIds = new Set<string>();
@@ -513,6 +533,12 @@ export async function mountPopup(
     folderPreview.textContent = relativePath;
     folderPreview.title = fullPath;
     folderPreviewRow.title = fullPath;
+  };
+
+  const syncRecentClipsVisibility = (): void => {
+    const isOnboardingFocused =
+      bannerState.kind === 'signed-out' || bannerState.kind === 'oauth-unconfigured';
+    recentClipsSection.hidden = isOnboardingFocused && recentClipsTotal === 0;
   };
 
   const renderSubmitError = (): void => {
@@ -581,6 +607,7 @@ export async function mountPopup(
       runtime.getManifestOAuthConfigured(),
     );
     const authenticated = Boolean(oauthConfigured && authStatus?.authenticated);
+    const rootFolder = settings.rootFolderName.trim() || 'WebClips';
 
     authPill.classList.remove(
       'status-pill--neutral',
@@ -602,44 +629,71 @@ export async function mountPopup(
     }
 
     bannerState = computeBannerState();
-    onboardingBanner.classList.remove('banner--info', 'banner--neutral');
+    onboardingBanner.classList.remove(
+      'banner--welcome',
+      'banner--setup',
+      'banner--neutral',
+    );
+
+    const hideClipForm =
+      bannerState.kind === 'signed-out' ||
+      bannerState.kind === 'oauth-unconfigured';
+    form.hidden = hideClipForm;
 
     switch (bannerState.kind) {
       case 'none':
         onboardingBanner.hidden = true;
+        bannerHero.hidden = true;
+        bannerActions.hidden = true;
+        bannerError.hidden = true;
+        bannerError.textContent = '';
         break;
       case 'oauth-unconfigured':
         onboardingBanner.hidden = false;
-        bannerTitle.textContent = 'Finish Google OAuth setup first';
+        onboardingBanner.classList.add('banner--setup');
+        bannerHero.hidden = true;
+        bannerTitle.textContent = 'Set up Google OAuth to get started';
         bannerDescription.textContent =
-          'This build still uses the placeholder OAuth Client ID. Add your Client ID in config.local.json, rebuild, and open Options for setup steps.';
+          'Open Settings to paste a Custom Web OAuth Client ID under Advanced, or configure config.local.json for a local unpacked build.';
+        bannerActions.hidden = false;
         bannerSignInBtn.hidden = true;
         bannerOptionsBtn.hidden = false;
-        bannerOptionsBtn.textContent = 'Open Options';
+        bannerOptionsBtn.textContent = 'Open Settings';
+        bannerError.hidden = true;
+        bannerError.textContent = '';
         break;
-      case 'signed-out':
+      case 'signed-out': {
         onboardingBanner.hidden = false;
-        onboardingBanner.classList.add('banner--info');
-        bannerTitle.textContent = 'Connect your Google Drive';
-        bannerDescription.textContent =
-          bannerState.message ||
-          'Sign in with Google to save pages to your WebClips folder using the minimal drive.file scope.';
+        onboardingBanner.classList.add('banner--welcome');
+        bannerHero.hidden = false;
+        bannerTitle.textContent = 'Connect Google Drive';
+        bannerDescription.textContent = `Clip any web page as clean Markdown with local images into your own ${rootFolder}/ folder. No third-party servers — this extension can only access files it creates.`;
+        bannerActions.hidden = false;
         bannerSignInBtn.hidden = false;
         bannerSignInBtn.disabled = isSigningIn;
         bannerSignInBtn.textContent = isSigningIn
-          ? 'Signing in...'
-          : 'Sign in with Google';
-        bannerOptionsBtn.hidden = false;
-        bannerOptionsBtn.textContent = 'Options';
+          ? 'Connecting...'
+          : 'Connect Google Drive';
+        bannerOptionsBtn.hidden = true;
+        const inlineError = !submitError
+          ? formatConsumerAuthError(bannerState.message)
+          : '';
+        bannerError.hidden = inlineError.length === 0;
+        bannerError.textContent = inlineError;
         break;
+      }
       case 'unsupported-page':
         onboardingBanner.hidden = false;
         onboardingBanner.classList.add('banner--neutral');
+        bannerHero.hidden = true;
         bannerTitle.textContent = 'This browser page cannot be clipped';
         bannerDescription.textContent =
           'Open an http:// or https:// web page to clip its content to Google Drive.';
+        bannerActions.hidden = true;
         bannerSignInBtn.hidden = true;
         bannerOptionsBtn.hidden = true;
+        bannerError.hidden = true;
+        bannerError.textContent = '';
         break;
     }
 
@@ -670,6 +724,7 @@ export async function mountPopup(
       clipSubmitHint.textContent = '';
     }
 
+    syncRecentClipsVisibility();
     renderModeSwitch();
     renderSubmitError();
   };
@@ -830,12 +885,14 @@ export async function mountPopup(
 
   const renderHistory = (items: readonly ClipHistoryItem[]): void => {
     const visibleItems = items.slice(0, MAX_RECENT_CLIPS);
+    recentClipsTotal = visibleItems.length;
     recentClipsCount.textContent = String(visibleItems.length);
     recentClipsList.replaceChildren();
 
     if (visibleItems.length === 0) {
       recentClipsEmpty.hidden = false;
       recentClipsList.hidden = true;
+      syncRecentClipsVisibility();
       return;
     }
 
@@ -889,6 +946,8 @@ export async function mountPopup(
       li.append(info, link);
       recentClipsList.append(li);
     }
+
+    syncRecentClipsVisibility();
   };
 
   const refreshHistory = async (): Promise<void> => {

@@ -8,6 +8,7 @@ import {
 import {
   createChromeRuntimeClient,
   createTagEditor,
+  isConfiguredOAuthClientId,
   resolveOAuthConfigured,
   type TagEditorController,
   type UiRuntimeClient,
@@ -53,6 +54,20 @@ function setFeedback(
   el.textContent = message;
 }
 
+function validateCustomClientIdInput(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return 'Enter a Google Cloud Web OAuth Client ID, or click "Use built-in" to clear it.';
+  }
+  if (/^GOCSPX-/i.test(trimmed)) {
+    return 'That looks like a Client Secret, not a Client ID. Paste only the Client ID ending in .apps.googleusercontent.com.';
+  }
+  if (/\s/.test(trimmed) || !isConfiguredOAuthClientId(trimmed)) {
+    return 'Enter a valid Google Cloud Web OAuth Client ID (for example, 1234567890-xxxx.apps.googleusercontent.com).';
+  }
+  return null;
+}
+
 export async function mountOptions(
   root: HTMLElement,
   options: OptionsMountOptions = {},
@@ -67,6 +82,10 @@ export async function mountOptions(
     root,
     '#auth-status-text',
   );
+  const customClientPill = queryRequired<HTMLSpanElement>(
+    root,
+    '#custom-client-pill',
+  );
   const oauthUnconfiguredCallout = queryRequired<HTMLDivElement>(
     root,
     '#oauth-unconfigured-callout',
@@ -77,14 +96,6 @@ export async function mountOptions(
   const authFeedback = queryRequired<HTMLParagraphElement>(
     root,
     '#auth-feedback',
-  );
-  const extensionIdMeta = root.querySelector<HTMLDivElement>('#extension-id-meta');
-  const extensionIdValue = root.querySelector<HTMLElement>('#extension-id-value');
-  const oauthRedirectUriMeta = root.querySelector<HTMLDivElement>(
-    '#oauth-redirect-uri-meta',
-  );
-  const oauthRedirectUriValue = root.querySelector<HTMLElement>(
-    '#oauth-redirect-uri-value',
   );
 
   const rootFolderNameInput = queryRequired<HTMLInputElement>(
@@ -149,6 +160,43 @@ export async function mountOptions(
     '#preferences-feedback',
   );
 
+  const advancedSection = queryRequired<HTMLDetailsElement>(
+    root,
+    '#advanced-section',
+  );
+  const advancedCustomBadge = queryRequired<HTMLSpanElement>(
+    root,
+    '#advanced-custom-badge',
+  );
+  const customClientForm = queryRequired<HTMLFormElement>(
+    root,
+    '#custom-client-form',
+  );
+  const customClientIdInput = queryRequired<HTMLInputElement>(
+    root,
+    '#custom-client-id-input',
+  );
+  const saveCustomClientBtn = queryRequired<HTMLButtonElement>(
+    root,
+    '#save-custom-client-btn',
+  );
+  const resetCustomClientBtn = queryRequired<HTMLButtonElement>(
+    root,
+    '#reset-custom-client-btn',
+  );
+  const customClientFeedback = queryRequired<HTMLParagraphElement>(
+    root,
+    '#custom-client-feedback',
+  );
+  const extensionIdMeta = root.querySelector<HTMLDivElement>('#extension-id-meta');
+  const extensionIdValue = root.querySelector<HTMLElement>('#extension-id-value');
+  const oauthRedirectUriMeta = root.querySelector<HTMLDivElement>(
+    '#oauth-redirect-uri-meta',
+  );
+  const oauthRedirectUriValue = root.querySelector<HTMLElement>(
+    '#oauth-redirect-uri-value',
+  );
+
   let settings: ExtensionSettings = {
     ...DEFAULT_EXTENSION_SETTINGS,
     frontmatter: { ...DEFAULT_EXTENSION_SETTINGS.frontmatter },
@@ -157,12 +205,25 @@ export async function mountOptions(
   let busyAuth = false;
   let busyFolder = false;
   let busySave = false;
+  let busyCustomClient = false;
 
   const tagEditor: TagEditorController = createTagEditor({
     container: defaultTagsContainer,
     input: defaultTagsInput,
     initialTags: settings.defaultTags,
   });
+
+  const renderCustomClientControls = (): void => {
+    const hasSavedCustomClient = Boolean(settings.customWebAuthClientId);
+    const usingCustomClient = Boolean(
+      authStatus?.usingCustomClientId || hasSavedCustomClient,
+    );
+    customClientPill.hidden = !usingCustomClient;
+    advancedCustomBadge.hidden = !usingCustomClient;
+    customClientIdInput.disabled = busyCustomClient;
+    saveCustomClientBtn.disabled = busyCustomClient;
+    resetCustomClientBtn.disabled = busyCustomClient || !hasSavedCustomClient;
+  };
 
   const renderAuth = (): void => {
     const oauthConfigured = resolveOAuthConfigured(
@@ -180,12 +241,14 @@ export async function mountOptions(
     if (!oauthConfigured) {
       authStatusBadge.classList.add('status-pill--warn');
       authStatusBadge.dataset.status = 'unconfigured';
-      authStatusText.textContent = 'OAuth setup required';
+      authStatusText.textContent = 'Setup required';
       oauthUnconfiguredCallout.hidden = false;
       signInBtn.hidden = false;
       signInBtn.disabled = true;
       signOutBtn.hidden = true;
       reauthBtn.hidden = true;
+      // Auto-open Advanced for developers running an unconfigured unpacked build.
+      advancedSection.open = true;
     } else if (authenticated) {
       authStatusBadge.classList.add('status-pill--ok');
       authStatusBadge.dataset.status = 'connected';
@@ -199,7 +262,7 @@ export async function mountOptions(
     } else {
       authStatusBadge.classList.add('status-pill--warn');
       authStatusBadge.dataset.status = 'signed-out';
-      authStatusText.textContent = 'Signed out';
+      authStatusText.textContent = 'Not connected';
       oauthUnconfiguredCallout.hidden = true;
       signInBtn.hidden = false;
       signInBtn.disabled = busyAuth;
@@ -208,6 +271,7 @@ export async function mountOptions(
     }
 
     createSwitchFolderBtn.disabled = busyFolder || !oauthConfigured;
+    renderCustomClientControls();
   };
 
   const renderSettings = (): void => {
@@ -231,6 +295,32 @@ export async function mountOptions(
     fmIncludeImages.checked = settings.frontmatter.includeImages;
     fmIncludeWarnings.checked = settings.frontmatter.includeWarnings;
     savePreferencesBtn.disabled = busySave;
+
+    customClientIdInput.value = settings.customWebAuthClientId ?? '';
+    renderCustomClientControls();
+  };
+
+  const refreshAuthStatus = async (): Promise<void> => {
+    const authRes = await runtime.sendMessage({ type: 'GET_AUTH_STATUS' });
+
+    if (authRes.ok) {
+      authStatus = authRes.data;
+      if (authRes.data.error) {
+        setFeedback(authFeedback, authRes.data.error, 'error');
+      } else {
+        setFeedback(authFeedback, '');
+      }
+    } else if (authRes.code === 'OAUTH_NOT_CONFIGURED') {
+      authStatus = { oauthConfigured: false, authenticated: false };
+      setFeedback(authFeedback, '');
+    } else {
+      authStatus = {
+        oauthConfigured: runtime.getManifestOAuthConfigured() ?? false,
+        authenticated: false,
+        error: authRes.error,
+      };
+      setFeedback(authFeedback, authRes.error, 'error');
+    }
   };
 
   const refresh = async (): Promise<void> => {
@@ -278,7 +368,7 @@ export async function mountOptions(
       return;
     }
     busyAuth = true;
-    setFeedback(authFeedback, 'Signing in to Google Drive...');
+    setFeedback(authFeedback, 'Connecting to Google Drive...');
     renderAuth();
 
     const response = await runtime.sendMessage({ type: 'SIGN_IN' });
@@ -287,7 +377,7 @@ export async function mountOptions(
     if (response.ok) {
       authStatus = response.data;
       if (response.data.authenticated) {
-        setFeedback(authFeedback, 'Signed in to Google Drive.', 'success');
+        setFeedback(authFeedback, 'Connected to Google Drive.', 'success');
       } else {
         setFeedback(
           authFeedback,
@@ -318,7 +408,7 @@ export async function mountOptions(
 
     if (response.ok) {
       authStatus = response.data;
-      setFeedback(authFeedback, 'Signed out and cleared cached token.', 'success');
+      setFeedback(authFeedback, 'Signed out.', 'success');
     } else {
       setFeedback(authFeedback, response.error, 'error');
     }
@@ -331,7 +421,7 @@ export async function mountOptions(
       return;
     }
     busyAuth = true;
-    setFeedback(authFeedback, 'Clearing token and re-authenticating...');
+    setFeedback(authFeedback, 'Reconnecting to Google Drive...');
     renderAuth();
 
     const signOutRes = await runtime.sendMessage({ type: 'SIGN_OUT' });
@@ -348,15 +438,11 @@ export async function mountOptions(
     if (signInRes.ok) {
       authStatus = signInRes.data;
       if (signInRes.data.authenticated) {
-        setFeedback(
-          authFeedback,
-          'Re-authenticated with Google Drive.',
-          'success',
-        );
+        setFeedback(authFeedback, 'Reconnected to Google Drive.', 'success');
       } else {
         setFeedback(
           authFeedback,
-          signInRes.data.error || 'Re-authentication did not complete.',
+          signInRes.data.error || 'Reconnect did not complete.',
           'error',
         );
       }
@@ -374,7 +460,11 @@ export async function mountOptions(
 
     const folderName = rootFolderNameInput.value.trim();
     if (folderName.length === 0) {
-      setFeedback(folderFeedback, 'Enter a folder name before creating or switching.', 'error');
+      setFeedback(
+        folderFeedback,
+        'Enter a folder name before creating or switching.',
+        'error',
+      );
       rootFolderNameInput.focus();
       return;
     }
@@ -412,6 +502,7 @@ export async function mountOptions(
     } else {
       if (response.code === 'AUTH_REQUIRED') {
         authStatus = {
+          ...(authStatus ?? { oauthConfigured: true }),
           oauthConfigured: true,
           authenticated: false,
           error: response.error,
@@ -474,6 +565,103 @@ export async function mountOptions(
     }
   };
 
+  const handleSaveCustomClient = async (event: SubmitEvent): Promise<void> => {
+    event.preventDefault();
+    if (busyCustomClient) {
+      return;
+    }
+
+    const validationError = validateCustomClientIdInput(customClientIdInput.value);
+    if (validationError) {
+      setFeedback(customClientFeedback, validationError, 'error');
+      customClientIdInput.focus();
+      return;
+    }
+
+    const nextClientId = customClientIdInput.value.trim();
+    busyCustomClient = true;
+    renderCustomClientControls();
+    setFeedback(customClientFeedback, 'Saving custom OAuth client...');
+
+    const response = await runtime.sendMessage({
+      type: 'UPDATE_SETTINGS',
+      patch: {
+        customWebAuthClientId: nextClientId,
+      },
+    });
+
+    busyCustomClient = false;
+
+    if (response.ok) {
+      settings = {
+        ...settings,
+        ...response.data,
+        frontmatter: {
+          ...settings.frontmatter,
+          ...response.data.frontmatter,
+        },
+      };
+      await refreshAuthStatus();
+      renderAuth();
+      renderSettings();
+      setFeedback(
+        customClientFeedback,
+        'Custom OAuth client saved. Click "Connect Google Drive" above to sign in with it.',
+        'success',
+      );
+    } else {
+      renderCustomClientControls();
+      setFeedback(customClientFeedback, response.error, 'error');
+    }
+  };
+
+  const handleResetCustomClient = async (): Promise<void> => {
+    if (busyCustomClient || !settings.customWebAuthClientId) {
+      return;
+    }
+
+    busyCustomClient = true;
+    renderCustomClientControls();
+    setFeedback(customClientFeedback, 'Switching back to built-in OAuth client...');
+
+    const response = await runtime.sendMessage({
+      type: 'UPDATE_SETTINGS',
+      patch: {
+        customWebAuthClientId: null,
+      },
+    });
+
+    busyCustomClient = false;
+
+    if (response.ok) {
+      settings = {
+        ...settings,
+        ...response.data,
+        frontmatter: {
+          ...settings.frontmatter,
+          ...response.data.frontmatter,
+        },
+      };
+      await refreshAuthStatus();
+      renderAuth();
+      renderSettings();
+      const oauthConfigured = resolveOAuthConfigured(
+        authStatus,
+        runtime.getManifestOAuthConfigured(),
+      );
+      setFeedback(
+        customClientFeedback,
+        oauthConfigured
+          ? 'Switched back to the built-in OAuth client.'
+          : 'Cleared custom OAuth client. No built-in OAuth client is configured in this build.',
+        'success',
+      );
+    } else {
+      renderCustomClientControls();
+      setFeedback(customClientFeedback, response.error, 'error');
+    }
+  };
+
   const renderIdentityMetadata = (): void => {
     const info = runtime.getExtensionIdentityInfo?.();
     if (extensionIdMeta && extensionIdValue) {
@@ -501,6 +689,8 @@ export async function mountOptions(
   reauthBtn.addEventListener('click', handleReauth);
   createSwitchFolderBtn.addEventListener('click', handleCreateOrSwitchFolder);
   preferencesForm.addEventListener('submit', handleSavePreferences);
+  customClientForm.addEventListener('submit', handleSaveCustomClient);
+  resetCustomClientBtn.addEventListener('click', handleResetCustomClient);
 
   await refresh();
 
@@ -523,6 +713,8 @@ export async function mountOptions(
         handleCreateOrSwitchFolder,
       );
       preferencesForm.removeEventListener('submit', handleSavePreferences);
+      customClientForm.removeEventListener('submit', handleSaveCustomClient);
+      resetCustomClientBtn.removeEventListener('click', handleResetCustomClient);
     },
   };
 }
